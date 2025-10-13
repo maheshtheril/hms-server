@@ -1,9 +1,8 @@
+// src/types.ts
 import type { Request } from "express";
 
-/**
- * Session row from DB
- */
-export interface Session {
+/** Session row from DB (set by your auth middleware, NOT express-session) */
+export interface AuthSession {
   sid: string;
   user_id: string;
   tenant_id?: string | null;
@@ -11,16 +10,12 @@ export interface Session {
   last_seen?: Date;
 }
 
-/**
- * Extend Express Request to carry session (populated by requireAuth).
- */
-export interface AuthedRequest extends Request {
-  session: Session;
-}
+/** Express Request + your own session payload */
+export type AuthedRequest = Request & {
+  session: AuthSession;
+};
 
-/**
- * User row from app_user table (minimal shape).
- */
+/** User row from app_user table (minimal shape). */
 export interface AppUser {
   id: string;
   email: string;

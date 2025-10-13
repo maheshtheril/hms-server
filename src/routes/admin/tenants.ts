@@ -8,6 +8,14 @@ import { enqueueSeedJob } from "../../services/seeder";
 
 const router = Router();
 
+// choose a single origin source; fallback to localhost
+const RAW_ORIGIN =
+  process.env.APP_ORIGIN ||
+  process.env.NEXT_PUBLIC_APP_ORIGIN ||
+  process.env.FRONTEND_URL ||
+  "http://localhost:3000";
+const ORIGIN = RAW_ORIGIN.replace(/\/+$/, "");
+
 router.post("/", async (req, res) => {
   const { org, name, email, password } = req.body || {};
   if (!org || !name || !email || !password) {
@@ -45,7 +53,7 @@ router.post("/", async (req, res) => {
     await enqueueSeedJob({ tenantId });
 
     // email verification
-    const token = uuid(); // store in verify_tokens (tenant_id,user_id,token,expires_at)
+    const token = uuid();
     await client.query(
       `INSERT INTO verify_tokens (tenant_id, user_id, token, expires_at)
        VALUES ($1,$2,$3, now() + interval '2 day')`,
@@ -53,7 +61,10 @@ router.post("/", async (req, res) => {
     );
     await client.query("COMMIT");
 
-    await sendVerifyEmail({ to: email, token }); // link to /verify?token=...
+    // Build verify URL for the email template
+    const verifyUrl = `${ORIGIN}/verify?token=${encodeURIComponent(token)}`;
+
+    await sendVerifyEmail({ to: email, name, verifyUrl }); // ✅ pass verifyUrl
 
     return res.json({ ok: true });
   } catch (e) {
