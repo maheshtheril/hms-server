@@ -10,7 +10,6 @@ const isProd = process.env.NODE_ENV === "production";
 // Require DATABASE_URL in production (never hard-code secrets in code)
 const connectionString = process.env.DATABASE_URL || (isProd ? "" : undefined);
 if (isProd && !connectionString) {
-    // Fail fast if missing in prod
     throw new Error("DATABASE_URL is required in production");
 }
 // SSL on Render/Postgres; disabled locally
@@ -20,7 +19,6 @@ const ssl = connectionString && !/localhost|127\.0\.0\.1/i.test(connectionString
 exports.pool = new pg_1.Pool({
     connectionString,
     ssl,
-    // Sensible defaults for Render
     max: Number(process.env.PG_POOL_MAX || 20),
     idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT || 30_000),
     connectionTimeoutMillis: Number(process.env.PG_CONN_TIMEOUT || 10_000),
@@ -41,6 +39,7 @@ exports.pool
         hint: err?.hint,
     });
 });
+// ✅ Constrain T to QueryResultRow so pg typings are satisfied
 async function query(text, params) {
     return exports.pool.query(text, params);
 }

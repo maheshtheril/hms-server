@@ -587,7 +587,8 @@ router.post("/leads/:id/move", requireSession, async (req: any, res: any, next: 
           `select id, name, pipeline_id from public.pipeline_stage ${where} limit 1`,
           params
         );
-        if (q.rowCount > 0) return q.rows[0];
+        if ((q?.rowCount ?? 0) > 0) return q.rows[0];
+
       }
       { // by name
         const where = hasTenant ? "where lower(name) = lower($1) and tenant_id = $2" : "where lower(name) = lower($1)";
@@ -596,7 +597,8 @@ router.post("/leads/:id/move", requireSession, async (req: any, res: any, next: 
           `select id, name, pipeline_id from public.pipeline_stage ${where} limit 1`,
           params
         );
-        if (q.rowCount > 0) return q.rows[0];
+        if ((q?.rowCount ?? 0) > 0) return q.rows[0];
+
       }
       return null;
     }
@@ -850,7 +852,7 @@ router.get("/stages", requireSession, async (req: any, res: any, next: any) => {
           `,
           [tenantId]
         );
-        if (q.rowCount > 0) return res.json({ stages: q.rows });
+        if ((q?.rowCount ?? 0) > 0) return res.json({ stages: q.rows });
       } catch (e: any) {
         if (e?.code === "42703") {
           const cols = await cx.query(
@@ -878,7 +880,8 @@ router.get("/stages", requireSession, async (req: any, res: any, next: any) => {
             `,
             params
           );
-          if (q2.rowCount > 0) return res.json({ stages: q2.rows });
+          if ((q2?.rowCount ?? 0) > 0) return res.json({ stages: q2.rows });
+
         } else {
           throw e;
         }
@@ -928,7 +931,8 @@ router.get("/stages", requireSession, async (req: any, res: any, next: any) => {
         `,
         [tenantId]
       );
-      if (s.rowCount > 0) return res.json({ stages: s.rows });
+      if ((s?.rowCount ?? 0) > 0) return res.json({ stages: s.rows });
+
     } catch (e: any) {
       if (e?.code !== "42P01") throw e;
     }

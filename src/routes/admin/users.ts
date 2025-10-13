@@ -102,7 +102,8 @@ router.post("/", async (req: any, res: any, next: any) => {
       );
       if (companies.rowCount === 1) {
         finalCompanyId = companies.rows[0].id as string;
-      } else if (companies.rowCount > 1) {
+      } else if ((companies?.rowCount ?? 0) > 1) {
+
         await cx.query("ROLLBACK");
         return res.status(400).json({ message: "company_required" });
       } else {

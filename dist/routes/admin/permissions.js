@@ -151,7 +151,7 @@ router.delete("/:code", async (req, res, next) => {
     try {
         const code = sanitizeCode(req.params.code);
         const used = await db_1.pool.query(`SELECT 1 FROM role_permission WHERE permission_code=$1 LIMIT 1`, [code]);
-        if (used.rowCount > 0) {
+        if ((used?.rowCount ?? 0) > 0) {
             return res.status(409).json({ error: "Permission is assigned to at least one role; unassign before deleting." });
         }
         const r = await db_1.pool.query(`DELETE FROM permission WHERE code=$1`, [code]);

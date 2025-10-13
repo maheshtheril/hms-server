@@ -515,14 +515,14 @@ router.post("/leads/:id/move", requireSession, async (req, res, next) => {
                 const where = hasTenant ? "where id::text = $1 and tenant_id = $2" : "where id::text = $1";
                 const params = hasTenant ? [key, tenantId] : [key];
                 const q = await cx.query(`select id, name, pipeline_id from public.pipeline_stage ${where} limit 1`, params);
-                if (q.rowCount > 0)
+                if ((q?.rowCount ?? 0) > 0)
                     return q.rows[0];
             }
             { // by name
                 const where = hasTenant ? "where lower(name) = lower($1) and tenant_id = $2" : "where lower(name) = lower($1)";
                 const params = hasTenant ? [key, tenantId] : [key];
                 const q = await cx.query(`select id, name, pipeline_id from public.pipeline_stage ${where} limit 1`, params);
-                if (q.rowCount > 0)
+                if ((q?.rowCount ?? 0) > 0)
                     return q.rows[0];
             }
             return null;
@@ -780,7 +780,7 @@ router.get("/stages", requireSession, async (req, res, next) => {
            where tenant_id = $1
            order by coalesce(order_index, 9999), name
           `, [tenantId]);
-                if (q.rowCount > 0)
+                if ((q?.rowCount ?? 0) > 0)
                     return res.json({ stages: q.rows });
             }
             catch (e) {
@@ -803,7 +803,7 @@ router.get("/stages", requireSession, async (req, res, next) => {
               ${where}
              order by ${orderBy}
             `, params);
-                    if (q2.rowCount > 0)
+                    if ((q2?.rowCount ?? 0) > 0)
                         return res.json({ stages: q2.rows });
                 }
                 else {
@@ -847,7 +847,7 @@ router.get("/stages", requireSession, async (req, res, next) => {
          where tenant_id = $1
          order by ${orderBy}
         `, [tenantId]);
-            if (s.rowCount > 0)
+            if ((s?.rowCount ?? 0) > 0)
                 return res.json({ stages: s.rows });
         }
         catch (e) {
