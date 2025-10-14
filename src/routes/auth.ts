@@ -70,5 +70,43 @@ router.get("/session", async (req, res) => {
 
   res.json({ user: rows[0] || null });
 });
+// GET /auth/me — used by the web app after login
+router.get("/me", async (req, res) => {
+  const cookieName = process.env.COOKIE_NAME_SID || "sid";
+  const sid = req.cookies?.[cookieName];
+  if (!sid) return res.json({ user: null, roles: [] });
+
+  const { rows } = await q(
+    `SELECT s.sid,
+            u.id          AS user_id,
+            u.email,
+            u.name,
+            u.is_admin,
+            u.tenant_id,
+            u.company_id
+       FROM sessions s
+       JOIN app_user u ON u.id = s.user_id
+      WHERE s.sid = $1
+      LIMIT 1`,
+    [sid]
+  );
+
+  const row = rows[0];
+  if (!row) return res.json({ user: null, roles: [] });
+
+  const roles = row.is_admin ? ["Admin"] : [];
+  res.json({
+    user: {
+      id: row.user_id,
+      email: row.email,
+      name: row.name,
+      roles,
+      role_codes: roles,
+      tenant_id: row.tenant_id,
+      company_id: row.company_id,
+    },
+    roles,
+  });
+});
 
 export default router;
