@@ -40,7 +40,7 @@ app.use(
       // Allow server-to-server/SSR (no Origin) and approved origins
       if (!origin) return cb(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      // Don’t throw; fail with not allowed
+      // Soft-fail CORS (no error thrown), request just won't get CORS headers
       return cb(null, false);
     },
     credentials: true,
@@ -49,7 +49,7 @@ app.use(
   })
 );
 
-// Preflight fast-path
+// Preflight fast-path (helpful when backend is called directly)
 app.options("*", (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "");
   res.setHeader("Vary", "Origin");
@@ -62,8 +62,10 @@ app.options("*", (req, res) => {
   return res.sendStatus(200);
 });
 
-app.use(express.json({ limit: "10mb" }));
+/* ───────────────────────────── Parsers BEFORE routes ───────────────────────────── */
 app.use(cookieParser());
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 /* ───────────────────────────── Health ───────────────────────────── */
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
@@ -76,7 +78,9 @@ app.use(
 );
 
 /* ───────────────────────────── Auth + Core APIs ───────────────────────────── */
-app.use("/auth", auth); // note: NOT under /api
+// Note: auth is NOT under /api by design (web rewrite maps /api/auth → /auth)
+app.use("/auth", auth);
+
 app.use("/api", me);
 app.use("/api", kpis);
 app.use("/api", leads);
