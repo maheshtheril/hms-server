@@ -1,64 +1,73 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.provisionTenantRBAC = provisionTenantRBAC;
-const crypto_1 = require("crypto");
-async function provisionTenantRBAC(pool, tenantId, ownerUserId) {
-    await pool.query("BEGIN");
-    try {
-        /* 1) Ensure base roles for this tenant */
-        const roles = [
-            { name: "Owner", code: "owner" },
-            { name: "Admin", code: "admin" },
-            { name: "User", code: "user" },
-        ];
-        const roleIds = {};
-        for (const r of roles) {
-            const { rows } = await pool.query(`INSERT INTO roles (id, tenant_id, name, code, is_system, created_at)
-         VALUES ($1, $2, $3, $4, true, now())
-         ON CONFLICT (tenant_id, code) DO UPDATE
-           SET name = EXCLUDED.name
-         RETURNING id`, [(0, crypto_1.randomUUID)(), tenantId, r.name, r.code]);
-            roleIds[r.code] = rows[0].id;
-        }
-        /* 2) Attach Owner role to ownerUserId */
-        await pool.query(`INSERT INTO user_roles (tenant_id, user_id, role_id, created_at)
-       VALUES ($1, $2, $3, now())
-       ON CONFLICT (tenant_id, user_id, role_id) DO NOTHING`, [tenantId, ownerUserId, roleIds.owner]);
-        /* 3) Copy ALL menu templates into tenant_menus (no module filter!) */
-        const { rows: menuRows } = await pool.query(`SELECT id AS menu_id, sort_order
-         FROM menu_templates
-        ORDER BY sort_order NULLS LAST, id`);
-        for (const m of menuRows) {
-            await pool.query(`INSERT INTO tenant_menus (tenant_id, menu_id, sort_order, is_enabled, created_at)
-         VALUES ($1, $2, $3, true, now())
-         ON CONFLICT (tenant_id, menu_id) DO UPDATE
-           SET is_enabled = EXCLUDED.is_enabled,
-               sort_order = COALESCE(EXCLUDED.sort_order, tenant_menus.sort_order)`, [tenantId, m.menu_id, m.sort_order ?? null]);
-        }
-        /* 4) Grant Owner every permission any menu requires */
-        const { rows: permCodes } = await pool.query(`SELECT DISTINCT permission_code
-         FROM menu_templates
-        WHERE permission_code IS NOT NULL`);
-        // Upsert permission records by code (global/shared)
-        const codeToPermId = {};
-        for (const { permission_code } of permCodes) {
-            const code = String(permission_code);
-            const { rows } = await pool.query(`INSERT INTO permissions (id, code, name, created_at)
-         VALUES ($1, $2, $2, now())
-         ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name
-         RETURNING id`, [(0, crypto_1.randomUUID)(), code]);
-            codeToPermId[code] = rows[0].id;
-        }
-        // Attach all permissions to Owner role in this tenant
-        for (const code of Object.keys(codeToPermId)) {
-            await pool.query(`INSERT INTO role_permissions (tenant_id, role_id, permission_id, created_at)
-         VALUES ($1, $2, $3, now())
-         ON CONFLICT (tenant_id, role_id, permission_id) DO NOTHING`, [tenantId, roleIds.owner, codeToPermId[code]]);
-        }
-        await pool.query("COMMIT");
+/**
+ * Ensures per-tenant roles exist in public.role and maps the owner user in public.user_role.
+ * Uses YOUR schema exactly:
+ *   - role(id, tenant_id, key, name, permissions, created_at)
+ *   - user_role(id, user_id, role_id, tenant_id, assigned_at)
+ *   - role_permission(role_id, permission_code, tenant_id, is_granted, created_at)
+ *   - permission(code, name, description, ...)
+ */
+async function provisionTenantRBAC(cx, params) {
+    const { tenantId, ownerUserId } = params;
+    // 1) Ensure core roles per tenant (owner, admin, member)
+    const rolesToEnsure = [
+        { key: "owner", name: "Owner" },
+        { key: "admin", name: "Admin" },
+        { key: "member", name: "Member" },
+    ];
+    // Create if missing, return id
+    async function ensureRole(key, name) {
+        const { rows } = await cx.query(`
+      WITH ins AS (
+        INSERT INTO public.role (tenant_id, key, name, permissions)
+        SELECT $1::uuid, $2::text, $3::text, '{}'::text[]
+        WHERE NOT EXISTS (
+          SELECT 1 FROM public.role r WHERE r.tenant_id = $1 AND r.key = $2
+        )
+        RETURNING id
+      )
+      SELECT id FROM ins
+      UNION ALL
+      SELECT r.id FROM public.role r WHERE r.tenant_id = $1 AND r.key = $2
+      LIMIT 1
+      `, [tenantId, key, name]);
+        if (!rows[0]?.id)
+            throw new Error(`ensureRole failed for key=${key}`);
+        return rows[0].id;
     }
-    catch (e) {
-        await pool.query("ROLLBACK");
-        throw e;
+    const roleIds = {};
+    for (const r of rolesToEnsure) {
+        roleIds[r.key] = await ensureRole(r.key, r.name);
+    }
+    // 2) Map OWNER to the new user in user_role (unique on (tenant_id, user_id, role_id))
+    await cx.query(`
+    INSERT INTO public.user_role (user_id, role_id, tenant_id)
+    VALUES ($1::uuid, $2::uuid, $3::uuid)
+    ON CONFLICT (tenant_id, user_id, role_id) DO NOTHING
+    `, [ownerUserId, roleIds["owner"], tenantId]);
+    // 3) (Optional) Attach default permissions to roles if you already have permission codes seeded.
+    //    This block is SAFE: it only inserts codes that exist in public.permission.
+    //    If you don't want any assumptions, you can remove this whole section.
+    // Example minimal defaults: owner gets everything you mark later; leave empty for now.
+    // const ownerPerms: string[] = []; // fill with your codes if desired
+    // await grantPerms(roleIds["owner"], ownerPerms);
+    // Helper to grant permissions safely (idempotent)
+    async function grantPerms(roleId, permCodes) {
+        if (!permCodes.length)
+            return;
+        // Only keep permission codes that exist
+        const { rows: valid } = await cx.query(`SELECT code FROM public.permission WHERE code = ANY($1::text[])`, [permCodes]);
+        const codes = valid.map(v => v.code);
+        if (!codes.length)
+            return;
+        // Bulk insert ON CONFLICT DO NOTHING
+        await cx.query(`
+      INSERT INTO public.role_permission (role_id, permission_code, tenant_id, is_granted)
+      SELECT $1::uuid, pcode, $2::uuid, TRUE
+      FROM unnest($3::text[]) AS t(pcode)
+      ON CONFLICT (role_id, permission_code) DO NOTHING
+      `, [roleId, tenantId, codes]);
     }
 }
