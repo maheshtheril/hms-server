@@ -14,7 +14,7 @@ const PASSWORD_POLICY = {
   requireUpper: true,
   requireLower: true,
   requireDigit: true,
-  requireSymbol: true,
+  requireSymbol: true,  
   symbolRegex: /[^A-Za-z0-9]/,
 };
 
@@ -81,7 +81,7 @@ router.post("/", async (req, res) => {
   } = req.body || {};
 
   const tenant_name = String(tenantName || org || "").trim();
-  const company_name = String(companyName || company || "").trim();
+  const company_name = String(companyName || company || tenant_name || "").trim();
   const user_name = String(name || "").trim();
   const email_lc = String(email || "").trim().toLowerCase();
 
