@@ -4,17 +4,18 @@ import { randomUUID } from "crypto";
 import bcrypt from "bcryptjs";
 import { pool } from "../db";
 import { provisionTenantRBAC } from "../services/provisionTenant";
+import type { PoolClient } from "pg";
 
 const router = Router();
 
-/* ───────────────── Password policy (matches your needs) ───────────────── */
+/* ───────────────── Password policy ───────────────── */
 const PASSWORD_POLICY = {
   minLength: 12,
   maxLength: 128,
   requireUpper: true,
   requireLower: true,
   requireDigit: true,
-  requireSymbol: true,  
+  requireSymbol: true,
   symbolRegex: /[^A-Za-z0-9]/,
 };
 
@@ -35,7 +36,7 @@ function slugify(s: string) {
   return s.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
 }
 
-async function listColumns(cx: any, table: string): Promise<Set<string>> {
+async function listColumns(cx: PoolClient, table: string): Promise<Set<string>> {
   const r = await cx.query(
     `SELECT LOWER(column_name) AS column_name
        FROM information_schema.columns
@@ -61,13 +62,9 @@ function buildInsert(tableQ: string, colsAvail: Set<string>, wanted: Record<stri
   return { text: `INSERT INTO ${tableQ} (${cols.join(",")}) VALUES (${ph.join(",")})`, values: vals };
 }
 
-/* ───────────────── SIGNUP: tenant + company(from form) + owner user ─────────────────
+/* ───────────────── SIGNUP: tenant + company + owner user ─────────────────
  * Body (strings):
- *   org            → tenant.name       (alias: tenantName)
- *   company        → company.name      (alias: companyName)
- *   name           → app_user.name
- *   email          → app_user.email
- *   password       → app_user.password (bcrypt hash)
+ *   org, tenantName, company, companyName, name, email, password
  */
 router.post("/", async (req, res) => {
   const {
@@ -115,7 +112,7 @@ router.post("/", async (req, res) => {
   const now = new Date();
   const baseSlug = slugify(tenant_name) || `org-${tenantId.slice(0, 8)}`;
 
-  const cx = await pool.connect();
+  const cx: PoolClient = await pool.connect();
   let began = false;
 
   try {
@@ -125,27 +122,24 @@ router.post("/", async (req, res) => {
     const userCols    = await listColumns(cx, "app_user");
     const mapCols     = await listColumns(cx, "user_companies").catch(() => new Set<string>());
 
-    // REQUIRED columns per your schema
-    // tenant: id, slug, name
+    // REQUIRED columns
     for (const c of ["id", "slug", "name"]) {
       if (!tenantCols.has(c)) {
         return res.status(500).json({ ok: false, error: "schema_mismatch", hint: `tenant.${c} missing` });
       }
     }
-    // company: id, tenant_id, name
     for (const c of ["id", "tenant_id", "name"]) {
       if (!companyCols.has(c)) {
         return res.status(500).json({ ok: false, error: "schema_mismatch", hint: `company.${c} missing` });
       }
     }
-    // app_user: id, tenant_id, email (name is nullable in your DDL but we provide it)
     for (const c of ["id", "tenant_id", "email"]) {
       if (!userCols.has(c)) {
         return res.status(500).json({ ok: false, error: "schema_mismatch", hint: `app_user.${c} missing` });
       }
     }
 
-    // pre-check existing email (even if not unique in schema)
+    // pre-check existing email
     const e = await cx.query(`SELECT id FROM public.app_user WHERE email=$1 LIMIT 1`, [email_lc]);
     if (e.rowCount) {
       return res.status(409).json({ ok: false, error: "email_exists", user_id: e.rows[0].id });
@@ -162,10 +156,7 @@ router.post("/", async (req, res) => {
       slug: baseSlug,
       name: tenant_name,
       created_at: now,
-      // metadata exists in your schema; set only if you want defaults
-      // metadata: {},
     };
-    // handle slug uniqueness by retrying with suffix
     let insertedTenant = false;
     for (let i = 0; i < 8 && !insertedTenant; i++) {
       const candidate = i === 0 ? tenantWanted : { ...tenantWanted, slug: `${baseSlug}-${i + 1}` };
@@ -174,18 +165,18 @@ router.post("/", async (req, res) => {
         await cx.query(ins.text, ins.values);
         insertedTenant = true;
       } catch (err: any) {
-        if (err?.code === "23505") continue;
+        if (err?.code === "23505") continue; // unique violation on slug -> try next
         throw err;
       }
     }
     if (!insertedTenant) throw new Error("Could not create unique tenant.slug after retries");
 
-    /* ─ Company (from signup company name) ─ */
+    /* ─ Company ─ */
     const companyWanted: Record<string, any> = {
       id: companyId,
       tenant_id: tenantId,
       name: company_name,
-      enabled: true,        // your schema has "enabled", not is_active
+      enabled: true,        // kept if column exists; buildInsert filters safely
       created_at: now,
     };
     const companyIns = buildInsert("public.company", companyCols, companyWanted);
@@ -197,13 +188,12 @@ router.post("/", async (req, res) => {
       tenant_id: tenantId,
       email: email_lc,
       name: user_name,
-      password: passwordHash,            // your schema uses "password"
-      is_admin: true,                    // optional, but useful for first user
-      is_tenant_admin: true,             // optional per your schema
+      password: passwordHash,      // your schema uses "password"
+      is_admin: true,              // optional flags in your schema
+      is_tenant_admin: true,
       is_active: true,
       created_at: now,
     };
-    // Set company_id if column exists
     if (userCols.has("company_id")) userWanted["company_id"] = companyId;
 
     const userIns = buildInsert("public.app_user", userCols, userWanted);
@@ -229,12 +219,18 @@ router.post("/", async (req, res) => {
     await cx.query("COMMIT");
     began = false;
 
-    // Non-blocking RBAC provision
-    try { await provisionTenantRBAC(pool, tenantId, userId); } catch (e) { console.error("[tenant-signup] RBAC", e); }
+    // ─ RBAC provision (non-blocking), pass the SAME client to satisfy PoolClient type
+    try {
+      await provisionTenantRBAC(cx, { tenantId, ownerUserId: userId });
+    } catch (e) {
+      console.error("[tenant-signup] RBAC", e);
+    }
 
     return res.status(201).json({ ok: true, tenantId, companyId, userId });
   } catch (err: any) {
-    if (began) { try { await cx.query("ROLLBACK"); } catch {} }
+    if (began) {
+      try { await cx.query("ROLLBACK"); } catch {}
+    }
     console.error("[tenant-signup] error:", {
       message: err?.message, code: err?.code, detail: err?.detail, constraint: err?.constraint
     });
