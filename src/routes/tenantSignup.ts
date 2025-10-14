@@ -1,4 +1,3 @@
-// server/src/routes/tenantSignup.ts
 import { Router } from "express";
 import { randomUUID } from "crypto";
 import bcrypt from "bcryptjs";
@@ -16,13 +15,14 @@ function slugify(s: string) {
     .slice(0, 60);
 }
 
-/** Return a set of column names for a table */
-async function listColumns(table: string): Promise<Set<string>> {
-  const r = await pool.query(
+/** Return a set of column names for a table (uses the current client/connection) */
+async function listColumns(cx: any, table: string): Promise<Set<string>> {
+  // If you use multiple schemas, consider adding AND table_schema='public'
+  const r = await cx.query(
     `SELECT column_name FROM information_schema.columns WHERE table_name = $1`,
     [table]
   );
-  return new Set(r.rows.map((x) => String(x.column_name)));
+  return new Set(r.rows.map((x: any) => String(x.column_name)));
 }
 
 /** Build an INSERT that only uses existing columns */
@@ -69,12 +69,14 @@ router.post("/", async (req, res) => {
   const now = new Date();
   const baseSlug = slugify(org) || `org-${tenantId.slice(0, 8)}`;
 
+  // Use a single connection for the entire transaction
+  const cx = await pool.connect();
   try {
-    // Discover schema
-    const tenantCols = await listColumns("tenant");
-    const companyCols = await listColumns("company");
-    const userCols = await listColumns("app_user");
-    const mapCols = await listColumns("user_companies").catch(() => new Set<string>());
+    // Discover schema using the same connection
+    const tenantCols = await listColumns(cx, "tenant");
+    const companyCols = await listColumns(cx, "company");
+    const userCols = await listColumns(cx, "app_user");
+    const mapCols = await listColumns(cx, "user_companies").catch(() => new Set<string>());
 
     // Required columns sanity
     for (const [t, cols, reqs] of [
@@ -84,6 +86,7 @@ router.post("/", async (req, res) => {
     ] as const) {
       for (const c of reqs) {
         if (!cols.has(c)) {
+          cx.release();
           return res.status(500).json({ ok: false, error: `Schema mismatch: ${t}.${c} missing` });
         }
       }
@@ -94,13 +97,14 @@ router.post("/", async (req, res) => {
     const hasPassword = userCols.has("password");
     const passwordHash = await bcrypt.hash(password, 10);
     if (!hasPasswordHash && !hasPassword) {
+      cx.release();
       return res.status(500).json({
         ok: false,
         error: "Schema mismatch: need app_user.password_hash or app_user.password",
       });
     }
 
-    await pool.query("BEGIN");
+    await cx.query("BEGIN");
 
     // 1) TENANT — include slug if present, and seed meta.modules_enabled if meta exists
     const tenantWantedBase: Record<string, any> = {
@@ -113,7 +117,6 @@ router.post("/", async (req, res) => {
     // Prepare meta if column exists
     if (tenantCols.has("meta")) {
       tenantWantedBase["meta"] = {
-        // You can trim this list if you want partial enablement by default
         modules_enabled: ["crm", "hr", "accounts", "inventory", "projects", "reports"],
       };
     }
@@ -125,12 +128,12 @@ router.post("/", async (req, res) => {
         const tenantWanted = { ...tenantWantedBase, slug };
         const ins = buildInsert("tenant", tenantCols, tenantWanted);
         try {
-          await pool.query(ins.text, ins.values);
+          await cx.query(ins.text, ins.values);
           success = true;
         } catch (e: any) {
           // 23505 = unique violation (likely slug unique)
           if (e?.code === "23505") {
-            slug = `${baseSlug}-${(i + 2)}`; // try new slug
+            slug = `${baseSlug}-${i + 2}`; // try new slug
             continue;
           }
           throw e; // other errors bubble up
@@ -143,7 +146,7 @@ router.post("/", async (req, res) => {
       // No slug column in table → just insert without slug
       const tenantWanted = { ...tenantWantedBase };
       const ins = buildInsert("tenant", tenantCols, tenantWanted);
-      await pool.query(ins.text, ins.values);
+      await cx.query(ins.text, ins.values);
     }
 
     // 2) COMPANY (default)
@@ -155,7 +158,7 @@ router.post("/", async (req, res) => {
       created_at: now,
     };
     const compIns = buildInsert("company", companyCols, companyWanted);
-    await pool.query(compIns.text, compIns.values);
+    await cx.query(compIns.text, compIns.values);
 
     // 3) APP USER (owner, make admin if columns exist)
     const userWanted: Record<string, any> = {
@@ -176,7 +179,7 @@ router.post("/", async (req, res) => {
     else userWanted["password"] = passwordHash;
 
     const userIns = buildInsert("app_user", userCols, userWanted);
-    await pool.query(userIns.text, userIns.values);
+    await cx.query(userIns.text, userIns.values);
 
     // 4) USER ↔ COMPANY mapping (optional)
     if (mapCols.size > 0) {
@@ -189,13 +192,13 @@ router.post("/", async (req, res) => {
       };
       const mapIns = buildInsert("user_companies", mapCols, mapWanted);
       try {
-        await pool.query(mapIns.text, mapIns.values);
+        await cx.query(mapIns.text, mapIns.values);
       } catch (e: any) {
         if (e?.code !== "23505") throw e; // ignore unique violation if any
       }
     }
 
-    await pool.query("COMMIT");
+    await cx.query("COMMIT");
 
     // 5) RBAC provisioning (best-effort; won’t block signup)
     try {
@@ -205,9 +208,13 @@ router.post("/", async (req, res) => {
       // do not throw — signup already committed
     }
 
-    return res.json({ ok: true, tenantId, companyId, userId });
+    cx.release();
+    return res.status(201).json({ ok: true, tenantId, companyId, userId });
   } catch (err: any) {
-    try { await pool.query("ROLLBACK"); } catch {}
+    try {
+      await cx.query("ROLLBACK");
+    } catch {}
+    cx.release();
     console.error("[tenant-signup] error:", err);
     if (process.env.NODE_ENV !== "production") {
       const payload: any = { ok: false, error: err?.message || "Signup failed" };
