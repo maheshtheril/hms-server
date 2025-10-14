@@ -6,6 +6,57 @@ import { provisionTenantRBAC } from "../services/provisionTenant"; // ⬅️ sta
 
 const router = Router();
 
+/* ─────────────── Password policy section ─────────────── */
+const PASSWORD_POLICY = {
+  minLength: 12,
+  maxLength: 128,
+  requireUpper: true,
+  requireLower: true,
+  requireDigit: true,
+  requireSymbol: true,
+  banned: new Set([
+    "abc123", "123456", "123456789", "password", "qwerty", "letmein", "admin", "welcome",
+  ]),
+  symbolRegex: /[^A-Za-z0-9]/,
+};
+
+function checkPassword(pw: string): { ok: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  if (typeof pw !== "string" || !pw.trim()) {
+    reasons.push("Password is required.");
+    return { ok: false, reasons };
+  }
+  if (pw.length < PASSWORD_POLICY.minLength) {
+    reasons.push(`Minimum ${PASSWORD_POLICY.minLength} characters.`);
+  }
+  if (pw.length > PASSWORD_POLICY.maxLength) {
+    reasons.push(`Maximum ${PASSWORD_POLICY.maxLength} characters.`);
+  }
+  if (PASSWORD_POLICY.banned.has(pw.toLowerCase())) {
+    reasons.push("Too common / unsafe password.");
+  }
+  if (PASSWORD_POLICY.requireUpper && !/[A-Z]/.test(pw)) {
+    reasons.push("Include at least one uppercase letter (A–Z).");
+  }
+  if (PASSWORD_POLICY.requireLower && !/[a-z]/.test(pw)) {
+    reasons.push("Include at least one lowercase letter (a–z).");
+  }
+  if (PASSWORD_POLICY.requireDigit && !/[0-9]/.test(pw)) {
+    reasons.push("Include at least one number (0–9).");
+  }
+  if (PASSWORD_POLICY.requireSymbol && !PASSWORD_POLICY.symbolRegex.test(pw)) {
+    reasons.push("Include at least one symbol (e.g., !@#$%^&*).");
+  }
+  if (/(.)\1\1/.test(pw)) {
+    reasons.push("Avoid 3 or more repeated characters in a row.");
+  }
+  if (/(0123|1234|2345|3456|4567|5678|6789|abcd|bcde|cdef|qwerty)/i.test(pw)) {
+    reasons.push("Avoid simple sequences like '1234' or 'abcd'.");
+  }
+  return { ok: reasons.length === 0, reasons };
+}
+
+/* ─────────────── Utility helpers ─────────────── */
 function slugify(s: string) {
   return s
     .toLowerCase()
@@ -15,9 +66,7 @@ function slugify(s: string) {
     .slice(0, 60);
 }
 
-/** Return a set of column names for a table (uses the current client/connection) */
 async function listColumns(cx: any, table: string): Promise<Set<string>> {
-  // If you use multiple schemas, consider adding AND table_schema='public'
   const r = await cx.query(
     `SELECT column_name FROM information_schema.columns WHERE table_name = $1`,
     [table]
@@ -25,12 +74,7 @@ async function listColumns(cx: any, table: string): Promise<Set<string>> {
   return new Set(r.rows.map((x: any) => String(x.column_name)));
 }
 
-/** Build an INSERT that only uses existing columns */
-function buildInsert(
-  table: string,
-  colsAvail: Set<string>,
-  wanted: Record<string, any>
-) {
+function buildInsert(table: string, colsAvail: Set<string>, wanted: Record<string, any>) {
   const cols: string[] = [];
   const vals: any[] = [];
   const placeholders: string[] = [];
@@ -42,17 +86,18 @@ function buildInsert(
       placeholders.push(`$${i++}`);
     }
   }
-  if (cols.length === 0) {
-    throw new Error(`No matching columns to insert for table ${table}`);
-  }
+  if (cols.length === 0) throw new Error(`No matching columns to insert for table ${table}`);
   const text = `INSERT INTO ${table} (${cols.join(", ")}) VALUES (${placeholders.join(
     ", "
   )}) RETURNING ${colsAvail.has("id") ? "id" : cols[0]}`;
   return { text, values: vals };
 }
 
+/* ─────────────── Main route ─────────────── */
 router.post("/", async (req, res) => {
   const { org, name, email, password } = req.body || {};
+
+  // Basic presence check
   if (
     typeof org !== "string" || !org.trim() ||
     typeof name !== "string" || !name.trim() ||
@@ -62,6 +107,23 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ ok: false, error: "Missing or invalid fields" });
   }
 
+  // ✅ Password strength validation
+  const pwCheck = checkPassword(password);
+  if (!pwCheck.ok) {
+    return res.status(400).json({
+      ok: false,
+      error: "weak_password",
+      reasons: pwCheck.reasons,
+      requirements: {
+        minLength: PASSWORD_POLICY.minLength,
+        requireUpper: PASSWORD_POLICY.requireUpper,
+        requireLower: PASSWORD_POLICY.requireLower,
+        requireDigit: PASSWORD_POLICY.requireDigit,
+        requireSymbol: PASSWORD_POLICY.requireSymbol,
+      },
+    });
+  }
+
   const emailLc = email.trim().toLowerCase();
   const tenantId = randomUUID();
   const companyId = randomUUID();
@@ -69,18 +131,16 @@ router.post("/", async (req, res) => {
   const now = new Date();
   const baseSlug = slugify(org) || `org-${tenantId.slice(0, 8)}`;
 
-  // Use a single connection for the entire transaction
   const cx = await pool.connect();
   try {
-    // Discover schema using the same connection
     const tenantCols = await listColumns(cx, "tenant");
     const companyCols = await listColumns(cx, "company");
     const userCols = await listColumns(cx, "app_user");
     const mapCols = await listColumns(cx, "user_companies").catch(() => new Set<string>());
 
-    // Required columns sanity
+    // Schema sanity
     for (const [t, cols, reqs] of [
-      ["tenant", tenantCols, ["id", "name"]], // slug handled below if present & NOT NULL
+      ["tenant", tenantCols, ["id", "name"]],
       ["company", companyCols, ["id", "tenant_id", "name"]],
       ["app_user", userCols, ["id", "tenant_id", "name", "email"]],
     ] as const) {
@@ -92,10 +152,9 @@ router.post("/", async (req, res) => {
       }
     }
 
-    // Determine password column
+    // Password field check + hash
     const hasPasswordHash = userCols.has("password_hash");
     const hasPassword = userCols.has("password");
-    const passwordHash = await bcrypt.hash(password, 10);
     if (!hasPasswordHash && !hasPassword) {
       cx.release();
       return res.status(500).json({
@@ -103,18 +162,17 @@ router.post("/", async (req, res) => {
         error: "Schema mismatch: need app_user.password_hash or app_user.password",
       });
     }
+    const passwordHash = await bcrypt.hash(password, 10);
 
     await cx.query("BEGIN");
 
-    // 1) TENANT — include slug if present, and seed meta.modules_enabled if meta exists
+    /* ─ Tenant ─ */
     const tenantWantedBase: Record<string, any> = {
       id: tenantId,
       name: org.trim(),
       is_active: true,
       created_at: now,
     };
-
-    // Prepare meta if column exists
     if (tenantCols.has("meta")) {
       tenantWantedBase["meta"] = {
         modules_enabled: ["crm", "hr", "accounts", "inventory", "projects", "reports"],
@@ -131,25 +189,20 @@ router.post("/", async (req, res) => {
           await cx.query(ins.text, ins.values);
           success = true;
         } catch (e: any) {
-          // 23505 = unique violation (likely slug unique)
           if (e?.code === "23505") {
-            slug = `${baseSlug}-${i + 2}`; // try new slug
+            slug = `${baseSlug}-${i + 2}`;
             continue;
           }
-          throw e; // other errors bubble up
+          throw e;
         }
       }
-      if (!success) {
-        throw new Error("Could not create unique tenant slug after retries");
-      }
+      if (!success) throw new Error("Could not create unique tenant slug after retries");
     } else {
-      // No slug column in table → just insert without slug
-      const tenantWanted = { ...tenantWantedBase };
-      const ins = buildInsert("tenant", tenantCols, tenantWanted);
+      const ins = buildInsert("tenant", tenantCols, tenantWantedBase);
       await cx.query(ins.text, ins.values);
     }
 
-    // 2) COMPANY (default)
+    /* ─ Company ─ */
     const companyWanted: Record<string, any> = {
       id: companyId,
       tenant_id: tenantId,
@@ -160,7 +213,7 @@ router.post("/", async (req, res) => {
     const compIns = buildInsert("company", companyCols, companyWanted);
     await cx.query(compIns.text, compIns.values);
 
-    // 3) APP USER (owner, make admin if columns exist)
+    /* ─ User ─ */
     const userWanted: Record<string, any> = {
       id: userId,
       tenant_id: tenantId,
@@ -170,18 +223,15 @@ router.post("/", async (req, res) => {
       is_active: true,
       created_at: now,
     };
-
-    // Grant admin flags for the first user when those columns exist
     if (userCols.has("is_admin")) userWanted["is_admin"] = true;
     if (userCols.has("is_tenant_admin")) userWanted["is_tenant_admin"] = true;
-
     if (hasPasswordHash) userWanted["password_hash"] = passwordHash;
     else userWanted["password"] = passwordHash;
 
     const userIns = buildInsert("app_user", userCols, userWanted);
     await cx.query(userIns.text, userIns.values);
 
-    // 4) USER ↔ COMPANY mapping (optional)
+    /* ─ User ↔ Company mapping ─ */
     if (mapCols.size > 0) {
       const mapWanted: Record<string, any> = {
         tenant_id: tenantId,
@@ -194,18 +244,17 @@ router.post("/", async (req, res) => {
       try {
         await cx.query(mapIns.text, mapIns.values);
       } catch (e: any) {
-        if (e?.code !== "23505") throw e; // ignore unique violation if any
+        if (e?.code !== "23505") throw e;
       }
     }
 
     await cx.query("COMMIT");
 
-    // 5) RBAC provisioning (best-effort; won’t block signup)
+    /* ─ RBAC provision ─ */
     try {
       await provisionTenantRBAC(pool, tenantId, userId);
     } catch (e) {
       console.error("[tenant-signup] RBAC provision error:", e);
-      // do not throw — signup already committed
     }
 
     cx.release();
