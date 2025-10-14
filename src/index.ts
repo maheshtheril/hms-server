@@ -66,6 +66,8 @@ app.options("*", (req, res) => {
 app.use(cookieParser());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+/* ───────────────────────────── Request logger ───────────────────────────── */
 app.use((req, _res, next) => {
   console.log(`[IN] ${req.method} ${req.path}`);
   next();
@@ -80,6 +82,14 @@ app.use(
   "/uploads",
   express.static(path.join(process.cwd(), "uploads"), { maxAge: "1h", index: false })
 );
+
+/* ───────────────────────────── PROBE endpoint ─────────────────────────────
+   Use this to confirm rewrites/proxy/body parsing end-to-end.
+   POST /api/leads/__probe → 200 with echoed body.
+-------------------------------------------------------------------------- */
+app.post("/api/leads/__probe", (req, res) => {
+  res.status(200).json({ ok: true, where: "probe", body: req.body ?? null });
+});
 
 /* ───────────────────────────── Auth + Core APIs ───────────────────────────── */
 // Note: auth is NOT under /api by design (web rewrite maps /api/auth → /auth)
