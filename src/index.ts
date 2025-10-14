@@ -66,6 +66,10 @@ app.options("*", (req, res) => {
 app.use(cookieParser());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+app.use((req, _res, next) => {
+  console.log(`[IN] ${req.method} ${req.path}`);
+  next();
+});
 
 /* ───────────────────────────── Health ───────────────────────────── */
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
