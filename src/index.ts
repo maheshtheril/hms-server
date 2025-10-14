@@ -22,7 +22,7 @@ import adminPermissionsRouter from "./routes/admin/permissions";
 import auditLogs from "./routes/audit-logs";
 import schedulerRouter from "./routes/scheduler";
 import adminCompaniesRouter from "./routes/admin/companies";
-import tenantSignup from "./routes/tenant-signup";   // ✅ kebab-case, matches file on Render
+import tenantSignup from "./routes/tenant-signup"; // ✅ kebab-case file
 import uploadsRouter from "./routes/uploads";
 
 /* ───────────────────────────── Express init ───────────────────────────── */
@@ -32,21 +32,35 @@ app.set("trust proxy", 1); // required for secure cookies on Render
 /* ───────────────────────────── CORS ───────────────────────────── */
 // APP_ORIGIN may be comma-separated: "https://site1.com,http://localhost:3000"
 const rawOrigins = (process.env.APP_ORIGIN || "http://localhost:3000").split(",");
-const ORIGINS = rawOrigins.map((s) => s.trim()).filter(Boolean);
+const ALLOWED_ORIGINS = rawOrigins.map((s) => s.trim()).filter(Boolean);
 
 app.use(
   cors({
     origin: (origin, cb) => {
-      // Allow SSR/no-origin and known origins
+      // Allow server-to-server/SSR (no Origin) and approved origins
       if (!origin) return cb(null, true);
-      if (ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS not allowed: " + origin));
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      // Don’t throw; fail with not allowed
+      return cb(null, false);
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Accept", "X-Requested-With", "Authorization"],
   })
 );
+
+// Preflight fast-path
+app.options("*", (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "");
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Accept, X-Requested-With, Authorization"
+  );
+  return res.sendStatus(200);
+});
 
 app.use(express.json({ limit: "10mb" }));
 app.use(cookieParser());
@@ -62,7 +76,7 @@ app.use(
 );
 
 /* ───────────────────────────── Auth + Core APIs ───────────────────────────── */
-app.use("/auth", auth); // note: not under /api
+app.use("/auth", auth); // note: NOT under /api
 app.use("/api", me);
 app.use("/api", kpis);
 app.use("/api", leads);
@@ -80,7 +94,7 @@ app.use("/api/admin/custom-fields", adminCustomFieldsRouter);
 /* ───────────────────────────── Uploads, Tenants, Scheduler ───────────────────────────── */
 app.use("/api/uploads", uploadsRouter);
 app.use("/api/tenants", tenantsRouter);
-app.use("/api/tenant-signup", tenantSignup); // POST / → tenant signup
+app.use("/api/tenant-signup", tenantSignup); // POST /
 app.use("/api/audit-logs", auditLogs);
 app.use("/api/scheduler", schedulerRouter);
 
@@ -125,10 +139,10 @@ app.use(
 );
 
 /* ───────────────────────────── Start server ───────────────────────────── */
-const PORT = Number(process.env.PORT || 4000);
+const PORT = Number(process.env.PORT || 4000); // Render injects a dynamic PORT (e.g., 10000)
 app.listen(PORT, "0.0.0.0", () => {
   console.log("🚀 Server running from", process.cwd());
   console.log(`✅ Listening on port ${PORT}`);
   console.log(`NODE_ENV=${process.env.NODE_ENV}`);
-  console.log(`APP_ORIGIN=${ORIGINS.join(",")}`);
+  console.log(`APP_ORIGIN=${ALLOWED_ORIGINS.join(",")}`);
 });
