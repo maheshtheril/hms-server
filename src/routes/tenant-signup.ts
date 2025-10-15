@@ -1,3 +1,4 @@
+// src/routes/tenant-signup.ts
 import { Router } from "express";
 import { randomUUID } from "crypto";
 import bcrypt from "bcryptjs";
@@ -215,11 +216,11 @@ router.post("/", async (req, res) => {
       }
     }
 
+    // ─ RBAC bootstrap within the SAME transaction ─
+    await provisionTenantRBAC(cx, { tenantId, ownerUserId: userId });
+
     await cx.query("COMMIT");
     began = false;
-
-    // RBAC bootstrap: grant OWNER all permissions immediately
-    await provisionTenantRBAC(pool, { tenantId, ownerUserId: userId });
 
     return res.status(201).json({ ok: true, tenantId, companyId, userId });
   } catch (err: any) {
