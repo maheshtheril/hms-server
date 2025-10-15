@@ -1,7 +1,7 @@
 // server/src/routes/admin/custom-fields.ts
 import { Router } from "express";
 import { pool } from "../../db";
-import cookie from "cookie";
+import * as cookie from "cookie";
 
 const router = Router();
 

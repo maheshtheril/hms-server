@@ -1,6 +1,6 @@
 // server/src/middleware/requireSession.ts
 import type { Request, Response, NextFunction, RequestHandler } from "express";
-import cookie from "cookie";
+import * as cookie from "cookie";
 import { pool } from "../db";
 import { findSessionBySid, touchSession } from "../services/sessionService";
 

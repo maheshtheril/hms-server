@@ -1,5 +1,5 @@
 import { Router } from "express";
-import cookie from "cookie";
+import * as cookie from "cookie";
 import { pool } from "../db";
 import { findSessionBySid, touchSession } from "../services/sessionService";
 
