@@ -1,28 +1,19 @@
 // server/src/services/provisionTenant.ts
 import { PoolClient } from "pg";
 
-/**
- * Ensures per-tenant roles exist in public.role and maps the owner user in public.user_role.
- * Uses YOUR schema exactly:
- *   - role(id, tenant_id, key, name, permissions, created_at)
- *   - user_role(id, user_id, role_id, tenant_id, assigned_at)
- *   - role_permission(role_id, permission_code, tenant_id, is_granted, created_at)
- *   - permission(code, name, description, ...)
- */
 export async function provisionTenantRBAC(
   cx: PoolClient,
   params: { tenantId: string; ownerUserId: string }
 ) {
   const { tenantId, ownerUserId } = params;
 
-  // 1) Ensure core roles per tenant (owner, admin, member)
+  // 1) Ensure roles (you already have this)
   const rolesToEnsure: Array<{ key: string; name: string }> = [
     { key: "owner", name: "Owner" },
     { key: "admin", name: "Admin" },
     { key: "member", name: "Member" },
   ];
 
-  // Create if missing, return id
   async function ensureRole(key: string, name: string): Promise<string> {
     const { rows } = await cx.query<{ id: string }>(
       `
@@ -50,7 +41,7 @@ export async function provisionTenantRBAC(
     roleIds[r.key] = await ensureRole(r.key, r.name);
   }
 
-  // 2) Map OWNER to the new user in user_role (unique on (tenant_id, user_id, role_id))
+  // 2) Map OWNER to the user (you already have this)
   await cx.query(
     `
     INSERT INTO public.user_role (user_id, role_id, tenant_id)
@@ -60,18 +51,11 @@ export async function provisionTenantRBAC(
     [ownerUserId, roleIds["owner"], tenantId]
   );
 
-  // 3) (Optional) Attach default permissions to roles if you already have permission codes seeded.
-  //    This block is SAFE: it only inserts codes that exist in public.permission.
-  //    If you don't want any assumptions, you can remove this whole section.
-
-  // Example minimal defaults: owner gets everything you mark later; leave empty for now.
-  // const ownerPerms: string[] = []; // fill with your codes if desired
-  // await grantPerms(roleIds["owner"], ownerPerms);
-
-  // Helper to grant permissions safely (idempotent)
+  // ---------- ✅ ADD THIS: helper to grant permissions ----------
   async function grantPerms(roleId: string, permCodes: string[]) {
     if (!permCodes.length) return;
-    // Only keep permission codes that exist
+
+    // keep only valid permission codes present in public.permission
     const { rows: valid } = await cx.query<{ code: string }>(
       `SELECT code FROM public.permission WHERE code = ANY($1::text[])`,
       [permCodes]
@@ -79,7 +63,6 @@ export async function provisionTenantRBAC(
     const codes = valid.map(v => v.code);
     if (!codes.length) return;
 
-    // Bulk insert ON CONFLICT DO NOTHING
     await cx.query(
       `
       INSERT INTO public.role_permission (role_id, permission_code, tenant_id, is_granted)
@@ -90,4 +73,24 @@ export async function provisionTenantRBAC(
       [roleId, tenantId, codes]
     );
   }
+
+  // ---------- ✅ ADD THIS: give OWNER every permission ----------
+  // Option A: literally every permission in your catalog
+  const { rows: allPerms } = await cx.query<{ code: string }>(
+    `SELECT code FROM public.permission`
+  );
+  await grantPerms(roleIds["owner"], allPerms.map(p => p.code));
+
+  // Option B (alternative): a curated superset
+  // await grantPerms(roleIds["owner"], ["*", "crm:*", "rbac:*", "settings:*"]);
+
+  // ---------- ✅ ADD THIS: flip admin flags so /auth/me is truthy ----------
+  await cx.query(
+    `UPDATE public.app_user
+        SET is_admin = TRUE,
+            is_tenant_admin = TRUE,
+            is_active = TRUE
+      WHERE id = $1`,
+    [ownerUserId]
+  );
 }

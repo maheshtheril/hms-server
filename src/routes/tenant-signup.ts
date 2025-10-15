@@ -1,4 +1,3 @@
-// server/src/routes/tenant-signup.ts
 import { Router } from "express";
 import { randomUUID } from "crypto";
 import bcrypt from "bcryptjs";
@@ -165,7 +164,7 @@ router.post("/", async (req, res) => {
         await cx.query(ins.text, ins.values);
         insertedTenant = true;
       } catch (err: any) {
-        if (err?.code === "23505") continue; // unique violation on slug -> try next
+        if (err?.code === "23505") continue; // slug unique violation → try next
         throw err;
       }
     }
@@ -176,7 +175,7 @@ router.post("/", async (req, res) => {
       id: companyId,
       tenant_id: tenantId,
       name: company_name,
-      enabled: true,        // kept if column exists; buildInsert filters safely
+      enabled: true,        // safe: buildInsert filters
       created_at: now,
     };
     const companyIns = buildInsert("public.company", companyCols, companyWanted);
@@ -188,8 +187,8 @@ router.post("/", async (req, res) => {
       tenant_id: tenantId,
       email: email_lc,
       name: user_name,
-      password: passwordHash,      // your schema uses "password"
-      is_admin: true,              // optional flags in your schema
+      password: passwordHash,      // column is "password"
+      is_admin: true,
       is_tenant_admin: true,
       is_active: true,
       created_at: now,
@@ -212,19 +211,15 @@ router.post("/", async (req, res) => {
       try {
         await cx.query(mapIns.text, mapIns.values);
       } catch (err: any) {
-        if (err?.code !== "23505") throw err; // ignore duplicate default
+        if (err?.code !== "23505") throw err; // ignore duplicate
       }
     }
 
     await cx.query("COMMIT");
     began = false;
 
-    // ─ RBAC provision (non-blocking), pass the SAME client to satisfy PoolClient type
-    try {
-      await provisionTenantRBAC(cx, { tenantId, ownerUserId: userId });
-    } catch (e) {
-      console.error("[tenant-signup] RBAC", e);
-    }
+    // RBAC bootstrap: grant OWNER all permissions immediately
+    await provisionTenantRBAC(pool, { tenantId, ownerUserId: userId });
 
     return res.status(201).json({ ok: true, tenantId, companyId, userId });
   } catch (err: any) {
