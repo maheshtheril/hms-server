@@ -15,7 +15,14 @@ async function requireSession(req: any, res: any, next: any) {
     const sess = await findSessionBySid(sid);
     if (!sess) return res.status(401).json({ error: "invalid_session" });
 
-    req.session = { sid: sess.sid, user_id: sess.user_id, tenant_id: sess.tenant_id };
+    // include company_id if your session has it
+    req.session = {
+      sid: sess.sid,
+      user_id: sess.user_id,
+      tenant_id: sess.tenant_id,
+      company_id: sess.company_id ?? null,
+    };
+
     touchSession(sid).catch(() => {});
     next();
   } catch (e) {
@@ -115,10 +122,10 @@ async function fetchUserRoleTokens(cx: any, tenantId: string, userId: string): P
     if (hasGP && hasP && hasUG) {
       const { rows } = await cx.query(
         `SELECT COALESCE(NULLIF(TRIM(p.code), ''), NULLIF(TRIM(p.name), '')) AS t
-         FROM public.user_groups ug
-         JOIN public.group_permissions gp ON gp.group_id = ug.group_id
+         FROM public.user_groups u
+         JOIN public.group_permissions gp ON gp.group_id = u.group_id
          JOIN public.permissions p ON p.id = gp.permission_id
-         WHERE ug.tenant_id = $1 AND ug.user_id = $2`,
+         WHERE u.tenant_id = $1 AND u.user_id = $2`,
         [tenantId, userId]
       );
       rows.forEach((r: any) => r?.t && tokens.add(String(r.t)));
@@ -129,13 +136,24 @@ async function fetchUserRoleTokens(cx: any, tenantId: string, userId: string): P
 }
 
 function isAdminLikeToken(s: string) {
-  // “admin”, “administrator”, “owner”, “sysadmin”, “root”, or permission codes like “admin.*”
+  // admin / owner / sysadmin / root and permission namespaces like admin.*
   return /(admin|owner|administrator|sys\s*admin|sysadmin|root)/i.test(s) || /^admin(\.|:|_)/i.test(s);
 }
+function isTenantAdminLikeToken(s: string) {
+  // tenant/company admins or managers
+  return /(tenant[_\s-]*admin|company[_\s-]*admin|manager)/i.test(s);
+}
 
-router.get("/kpis", requireSession, async (req: any, res: any, next: any) => {
+/* 
+  GET /api/kpis
+  Decides scope on the server:
+    - admin / tenant-admin → totals ("all")
+    - others (e.g., sales) → mine
+*/
+router.get("/kpis", requireSession, async (req: any, res: any) => {
   const tenantId = req.session?.tenant_id;
   const userId = req.session?.user_id;
+  const companyId = req.session?.company_id ?? null;
   if (!tenantId) return res.status(400).json({ error: "tenant_id_missing_in_session" });
   if (!userId) return res.status(400).json({ error: "user_id_missing_in_session" });
 
@@ -144,23 +162,22 @@ router.get("/kpis", requireSession, async (req: any, res: any, next: any) => {
     await cx.query("BEGIN");
     await cx.query(`SELECT set_config('app.tenant_id', $1::text, true)`, [String(tenantId)]);
     await cx.query(`SELECT set_config('app.user_id', $1::text, true)`, [String(userId)]);
+    if (companyId) {
+      await cx.query(`SELECT set_config('app.company_id', $1::text, true)`, [String(companyId)]);
+    }
 
-    // Determine if user is admin-like
+    // Determine role class
     const tokens = await fetchUserRoleTokens(cx, tenantId, userId);
-    const isAdmin = tokens.some(isAdminLikeToken);
+    const isAdmin = tokens.some(isAdminLikeToken) || tokens.some(isTenantAdminLikeToken);
 
-    // Query params
-    const scope = String(req.query.scope ?? "").toLowerCase(); // "all" | "mine" | ""
-    const mineParam = String(req.query.mine ?? "").toLowerCase();
-    const mineRequested = mineParam === "1" || mineParam === "true" || scope === "mine";
-    // If admin: honor request; if not: force mine
-    const mine = isAdmin ? mineRequested : true;
+    // Enforce scope server-side (ignore client query params)
+    const mine = !isAdmin; // admin/tenant-admin → totals; others → mine
+    const scope = mine ? "mine" : "all";
 
-    // ── Detect table + columns (prefer plural if both exist) ──
+    // ── Detect table (prefer plural) ──
     const hasLeads = await tableExists(cx, "public", "leads");
     const hasLead = await tableExists(cx, "public", "lead");
 
-    // Optional manual override for debugging: /api/kpis?table=leads or ?table=lead
     const tableOverride = String(req.query.table ?? "").toLowerCase().trim();
     let table: "public.leads" | "public.lead";
     let bare: "leads" | "lead";
@@ -173,92 +190,85 @@ router.get("/kpis", requireSession, async (req: any, res: any, next: any) => {
       bare = "lead";
     } else if (hasLeads) {
       table = "public.leads";
-      bare = "leads"; // ✅ prefer plural
+      bare = "leads";
     } else if (hasLead) {
       table = "public.lead";
       bare = "lead";
     } else {
-      throw new Error("No table named public.leads or public.lead");
+      // No table? Return safe zeros
+      await cx.query("ROLLBACK");
+      return res.json({
+        scope,
+        open_leads: 0,
+        open_leads_count: 0,
+        todays_followups: 0,
+        followups_today: 0,
+        open_leads_trend: "+0%",
+        error: "no_leads_table",
+      });
     }
 
-    // Sanity count for the chosen table (current tenant)
+    // Optional: sanity count for tenant rows
     const { rows: sanity } = await cx.query(
       `SELECT COUNT(*)::int AS c FROM ${table} l WHERE l.tenant_id = $1`,
       [tenantId]
     );
-    let chosenCount = sanity?.[0]?.c ?? 0;
+    const tenantCount = sanity?.[0]?.c ?? 0;
 
-    // Auto-fallback across lead/leads if the chosen has 0 rows but the other exists
-    if (chosenCount === 0) {
-      if (table === "public.leads" && hasLead) {
-        const { rows: s2 } = await cx.query(
-          `SELECT COUNT(*)::int AS c FROM public.lead l WHERE l.tenant_id = $1`,
-          [tenantId]
-        );
-        const c2 = s2?.[0]?.c ?? 0;
-        if (c2 > 0) {
-          table = "public.lead";
-          bare = "lead";
-          chosenCount = c2;
-        }
-      } else if (table === "public.lead" && hasLeads) {
-        const { rows: s2 } = await cx.query(
-          `SELECT COUNT(*)::int AS c FROM public.leads l WHERE l.tenant_id = $1`,
-          [tenantId]
-        );
-        const c2 = s2?.[0]?.c ?? 0;
-        if (c2 > 0) {
-          table = "public.leads";
-          bare = "leads";
-          chosenCount = c2;
-        }
-      }
-    }
-
-    // Detect follow-up column (follow_up_date | followup_date | meta->>'follow_up_date')
+    // Detect columns we may use
     const hasFollowUpDate = await columnExists(cx, "public", bare, "follow_up_date");
     const hasFollowupDate = !hasFollowUpDate && (await columnExists(cx, "public", bare, "followup_date"));
+    const hasAssigned = await columnExists(cx, "public", bare, "assigned_user_id");
+    const hasOwner = await columnExists(cx, "public", bare, "owner_id");
+    const hasCreatedBy = await columnExists(cx, "public", bare, "created_by");
+    const hasCompanyId = await columnExists(cx, "public", bare, "company_id");
+
     const followExpr = hasFollowUpDate
       ? `l."follow_up_date"`
       : hasFollowupDate
       ? `l."followup_date"`
       : `NULLIF(l.meta->>'follow_up_date','')::timestamptz`;
 
-    // Detect user-relations for scoping (assigned_user_id | owner_id | created_by)
-    const hasAssigned = await columnExists(cx, "public", bare, "assigned_user_id");
-    const hasOwner = await columnExists(cx, "public", bare, "owner_id");
-    const hasCreatedBy = await columnExists(cx, "public", bare, "created_by");
+    // Build WHERE fragments
+    let where = `l.tenant_id = $1`;
+    const params: any[] = [tenantId];
 
-    // Build mineClause respecting whichever user relations exist
-    let mineClause = "";
+    if (hasCompanyId && companyId) {
+      where += ` AND l.company_id = $${params.length + 1}`;
+      params.push(companyId);
+    }
+
+    // ownership filter for "mine"
     if (mine && (hasAssigned || hasOwner || hasCreatedBy)) {
       if (hasAssigned && hasOwner && hasCreatedBy) {
-        mineClause = ` AND ($2 IN (l.assigned_user_id, l.owner_id, l.created_by)) `;
+        where += ` AND $${params.length + 1} IN (l.assigned_user_id, l.owner_id, l.created_by)`;
+        params.push(userId);
       } else if (hasAssigned && hasOwner) {
-        mineClause = ` AND ($2 IN (l.assigned_user_id, l.owner_id)) `;
+        where += ` AND $${params.length + 1} IN (l.assigned_user_id, l.owner_id)`;
+        params.push(userId);
       } else if (hasAssigned) {
-        mineClause = ` AND (l.assigned_user_id = $2) `;
+        where += ` AND l.assigned_user_id = $${params.length + 1}`;
+        params.push(userId);
       } else if (hasOwner) {
-        mineClause = ` AND (l.owner_id = $2) `;
+        where += ` AND l.owner_id = $${params.length + 1}`;
+        params.push(userId);
       } else {
-        mineClause = ` AND (l.created_by = $2) `;
+        where += ` AND l.created_by = $${params.length + 1}`;
+        params.push(userId);
       }
     }
 
-    // Treat statuses beginning with "closed" (closed, closed-won, closed_lost) as non-open
+    // "Open" status (treat closed* as non-open)
     const openStatusPredicate = `
       COALESCE(NULLIF(TRIM(lower(l.status)), ''), 'open') !~ '^(closed|closed[-_ ]?(won|lost))$'
     `;
 
     const sql = `
       WITH base AS (
-        SELECT
-          l.id,
-          ${followExpr} AS fup
+        SELECT l.id, ${followExpr} AS fup
         FROM ${table} l
-        WHERE l.tenant_id = $1
+        WHERE ${where}
           AND ${openStatusPredicate}
-          ${mineClause}
       )
       SELECT
         COUNT(*)::int AS open_leads,
@@ -272,19 +282,19 @@ router.get("/kpis", requireSession, async (req: any, res: any, next: any) => {
       FROM base;
     `;
 
-    const params = mine && (hasAssigned || hasOwner || hasCreatedBy) ? [tenantId, userId] : [tenantId];
     const { rows } = await cx.query(sql, params);
     const row = rows?.[0] ?? { open_leads: 0, todays_followups: 0 };
 
     await cx.query("COMMIT");
 
     console.log(
-      `[kpis] table=${table} tenantRows=${chosenCount} scope=${mine ? "mine" : "all"} isAdmin=${isAdmin} tokens=${JSON.stringify(
+      `[kpis] table=${table} tenantRows=${tenantCount} scope=${scope} tokens=${JSON.stringify(
         tokens
       )} open=${row.open_leads} today=${row.todays_followups}`
     );
 
     return res.json({
+      scope,
       open_leads_count: row.open_leads,
       open_leads: row.open_leads,
       todays_followups: row.todays_followups,
@@ -295,7 +305,17 @@ router.get("/kpis", requireSession, async (req: any, res: any, next: any) => {
     try {
       await cx.query("ROLLBACK");
     } catch {}
-    next(err);
+    console.error("KPIs error:", err);
+    // Return safe zeros so the UI never crashes
+    return res.json({
+      scope: "mine",
+      open_leads_count: 0,
+      open_leads: 0,
+      todays_followups: 0,
+      followups_today: 0,
+      open_leads_trend: "+0%",
+      error: "kpis_failed",
+    });
   } finally {
     cx.release();
   }
