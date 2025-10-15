@@ -7,7 +7,7 @@ export async function provisionTenantRBAC(
 ) {
   const { tenantId, ownerUserId } = params;
 
-  // 1) Ensure roles (you already have this)
+  // 1) Ensure roles
   const rolesToEnsure: Array<{ key: string; name: string }> = [
     { key: "owner", name: "Owner" },
     { key: "admin", name: "Admin" },
@@ -41,7 +41,7 @@ export async function provisionTenantRBAC(
     roleIds[r.key] = await ensureRole(r.key, r.name);
   }
 
-  // 2) Map OWNER to the user (you already have this)
+  // 2) Map OWNER to the user
   await cx.query(
     `
     INSERT INTO public.user_role (user_id, role_id, tenant_id)
@@ -51,7 +51,7 @@ export async function provisionTenantRBAC(
     [ownerUserId, roleIds["owner"], tenantId]
   );
 
-  // ---------- ✅ ADD THIS: helper to grant permissions ----------
+  // Helper to grant permissions safely (idempotent)
   async function grantPerms(roleId: string, permCodes: string[]) {
     if (!permCodes.length) return;
 
@@ -74,17 +74,13 @@ export async function provisionTenantRBAC(
     );
   }
 
-  // ---------- ✅ ADD THIS: give OWNER every permission ----------
-  // Option A: literally every permission in your catalog
+  // 3) Give OWNER every permission in catalog
   const { rows: allPerms } = await cx.query<{ code: string }>(
     `SELECT code FROM public.permission`
   );
   await grantPerms(roleIds["owner"], allPerms.map(p => p.code));
 
-  // Option B (alternative): a curated superset
-  // await grantPerms(roleIds["owner"], ["*", "crm:*", "rbac:*", "settings:*"]);
-
-  // ---------- ✅ ADD THIS: flip admin flags so /auth/me is truthy ----------
+  // 4) Flip flags so /auth/me is truthy and Sidebar shows Admin
   await cx.query(
     `UPDATE public.app_user
         SET is_admin = TRUE,
