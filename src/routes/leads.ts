@@ -308,35 +308,10 @@ router.post("/leads", requireSession, async (req: any, res: any, next: any) => {
     const finalName: string = String(lead_name || name || title || "").trim();
     if (!finalName) return res.status(400).json({ error: "lead_name_required" });
 
-    // ─── TEMP SAFE MOCK BEGIN ────────────────────────────────────────────────
-    // Remove this block once DB is confirmed working in production.
-    return res.status(201).json({
-      ok: true,
-      mock: true,
-      lead: {
-        id: "mock-" + Date.now(),
-        name: finalName,
-        email: email ?? null,
-        phone: (phone_e164 || phone) ?? null,
-        company_id: company_id ?? (req.session?.company_id ?? null),
-        owner_id: owner_id ?? assigned_user_id ?? req.session?.user_id ?? null,
-        pipeline_id: pipeline_id ?? null,
-        stage_id: stage_id ?? null,
-        source_id: source_id ?? null,
-        status: "new",
-        estimated_value: estimated_value ?? null,
-        probability: probability ?? null,
-        tags: Array.isArray(tags) ? tags : [],
-        meta: meta && typeof meta === "object" ? meta : {},
-        created_by: req.session?.user_id ?? null,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      },
-    });
-    // ─── TEMP SAFE MOCK END ─────────────────────────────────────────────────
+    
 
     // The real DB insert (uncomment after removing the mock above)
-    /*
+    
     const tenantId = req.session?.tenant_id as string | null;
     const userId   = req.session?.user_id as string | null;
     if (!tenantId || !userId) return res.status(400).json({ error: "tenant_id_missing_in_session" });
@@ -451,7 +426,7 @@ router.post("/leads", requireSession, async (req: any, res: any, next: any) => {
     } finally {
       cx.release();
     }
-    */
+    
   } catch (err) {
     next(err);
   }
