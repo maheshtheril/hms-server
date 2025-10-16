@@ -1,23 +1,27 @@
-// lib/cookies.ts
 import type { Response } from "express";
 
-export function setCookie(res: Response, name: string, value: string) {
-  // Only set Domain when explicitly provided; otherwise let it default to host.
-  const domain = process.env.COOKIE_DOMAIN?.trim() || undefined;
+const COOKIE_NAME = process.env.COOKIE_NAME_SID || "sid";
 
-  res.cookie(name, value, {
+/**
+ * In production, DO NOT set a Domain unless explicitly provided by env.
+ * Let it default to the current host (threegbackend.onrender.com).
+ */
+export function setCookie(res: Response, name: string, value: string) {
+  const domain = process.env.COOKIE_DOMAIN?.trim() || undefined; // <- no default
+  res.cookie(name || COOKIE_NAME, value, {
     httpOnly: true,
-    secure: true,          // Render uses HTTPS
-    sameSite: "none",      // cross-site allowed
-    path: "/",             // must cover /auth/me
-    ...(domain ? { domain } : {}), // <-- remove Domain=localhost in prod
-    maxAge: 30 * 24 * 3600 * 1000,
+    secure: true,        // Render is HTTPS
+    sameSite: "none",    // cross-site cookies for your web app
+    path: "/",
+    // only include domain if explicitly set (NOT localhost!)
+    ...(domain ? { domain } : {}),
+    maxAge: 30 * 24 * 3600 * 1000, // 30 days
   });
 }
 
 export function clearCookie(res: Response, name: string) {
   const domain = process.env.COOKIE_DOMAIN?.trim() || undefined;
-  res.clearCookie(name, {
+  res.clearCookie(name || COOKIE_NAME, {
     httpOnly: true,
     secure: true,
     sameSite: "none",
