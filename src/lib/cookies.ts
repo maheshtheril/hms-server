@@ -1,18 +1,27 @@
+// lib/cookies.ts
 import type { Response } from "express";
 
-const secure = process.env.NODE_ENV !== "development";
-const base = {
-  httpOnly: true,
-  sameSite: "none" as const, // required for cross-site cookies
-  secure,                    // Secure flag in non-dev
-  path: "/",
-  domain: process.env.COOKIE_DOMAIN,
-};
+export function setCookie(res: Response, name: string, value: string) {
+  // Only set Domain when explicitly provided; otherwise let it default to host.
+  const domain = process.env.COOKIE_DOMAIN?.trim() || undefined;
 
-export function setCookie(res: Response, name: string, val: string) {
-  res.cookie(name, val, base);
+  res.cookie(name, value, {
+    httpOnly: true,
+    secure: true,          // Render uses HTTPS
+    sameSite: "none",      // cross-site allowed
+    path: "/",             // must cover /auth/me
+    ...(domain ? { domain } : {}), // <-- remove Domain=localhost in prod
+    maxAge: 30 * 24 * 3600 * 1000,
+  });
 }
 
 export function clearCookie(res: Response, name: string) {
-  res.clearCookie(name, base);
+  const domain = process.env.COOKIE_DOMAIN?.trim() || undefined;
+  res.clearCookie(name, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "none",
+    path: "/",
+    ...(domain ? { domain } : {}),
+  });
 }
