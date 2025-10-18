@@ -1,5 +1,4 @@
-// routes/leads.ts  (PASTE-OVER REPLACEMENT)
-
+// routes/leads.ts  (PASTE-OVER REPLACEMENT)  -- NOTIFY-injected version (patched)
 import * as cookie from "cookie";
 import { Router } from "express";
 import { pool } from "../db";
@@ -114,6 +113,14 @@ router.post("/leads/:id/restore", requireSession, async (req: any, res: any, nex
     );
 
     await cx.query("COMMIT");
+
+    // notify after commit
+    try {
+      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "restored" })]);
+    } catch (notifyErr) {
+      console.error("NOTIFY leads_changed failed:", notifyErr);
+    }
+
     if (upd.rowCount === 0) return res.status(404).json({ error: "not_found" });
     return res.json({ ok: true, id: upd.rows[0].id });
   } catch (err) {
@@ -155,6 +162,14 @@ router.delete("/leads/:id", requireSession, async (req: any, res: any, next: any
     );
 
     await cx.query("COMMIT");
+
+    // notify after commit
+    try {
+      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "deleted" })]);
+    } catch (notifyErr) {
+      console.error("NOTIFY leads_changed failed:", notifyErr);
+    }
+
     if (upd.rowCount === 0) return res.status(404).json({ error: "not_found_or_already_deleted" });
     return res.status(204).end();
   } catch (err) {
@@ -167,11 +182,12 @@ router.delete("/leads/:id", requireSession, async (req: any, res: any, next: any
 
 /* ────────────────────────────────────────────────────────────────────────────
    GET /api/leads  (include_deleted/only_deleted, owner filter)
+   RETURNS { items, total, page, pageSize } for frontend compatibility
 ──────────────────────────────────────────────────────────────────────────── */
 router.get("/leads", requireSession, async (req: any, res: any, next: any) => {
   const tenantId = req.session?.tenant_id as string | null;
   const userId   = req.session?.user_id as string | null;
-  if (!tenantId || !userId) return res.status(400).json({ error: "tenant_id_missing_in_session" });
+  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
 
   const truthy = (v: any) => ["1","true","yes","on"].includes(String(v ?? "").toLowerCase());
   const includeDeleted = truthy(req.query.include_deleted);
@@ -182,11 +198,16 @@ router.get("/leads", requireSession, async (req: any, res: any, next: any) => {
     ? "and (meta->>'deleted_at') is not null"
     : (includeDeleted ? "" : "and (meta->>'deleted_at') is null");
 
+  // pagination support (optional, default: return all but prefer page)
+  const page = Math.max(1, Number(req.query.page || 1));
+  const pageSize = Math.min(200, Math.max(1, Number(req.query.pageSize || 100))); // limit pageSize to 200
+  const offset = (page - 1) * pageSize;
+
   const cx = await pool.connect();
   try {
-    await setAppContext(cx, tenantId!, userId!, req.session?.company_id);
+    await setAppContext(cx, tenantId, userId, req.session?.company_id);
 
-    const flags = await getAdminFlags(cx, tenantId!, userId!);
+    const flags = await getAdminFlags(cx, tenantId, userId);
     const isAdminish = flags.isPlatformAdmin || flags.isTenantAdmin || flags.isAdmin;
     const effectiveOwner = isAdminish ? ownerParam : (ownerParam || userId);
 
@@ -212,10 +233,22 @@ router.get("/leads", requireSession, async (req: any, res: any, next: any) => {
       params.push(effectiveOwner);
       sql += ` and owner_id = $${params.length}\n`;
     }
-    sql += ` order by created_at desc`;
+    // apply pagination
+    sql += ` order by created_at desc LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(pageSize, offset);
 
     const result = await cx.query(sql, params);
-    res.json({ leads: result.rows });
+
+    // count total (simple approach: separate count)
+    const countQ = await cx.query(
+      `select count(1) as cnt from public.lead where tenant_id = $1 ${deletedWhere}` + (effectiveOwner ? ` and owner_id = $2` : ""),
+      effectiveOwner ? [tenantId, effectiveOwner] : [tenantId]
+    );
+    const total = Number((countQ.rows?.[0]?.cnt) ?? result.rowCount);
+
+    const items = result.rows;
+
+    return res.json({ items, total, page, pageSize });
   } catch (err) {
     next(err);
   } finally {
@@ -230,11 +263,11 @@ router.get("/leads/:id", requireSession, async (req: any, res: any, next: any) =
   const tenantId = req.session?.tenant_id as string | null;
   const userId   = req.session?.user_id as string | null;
   const leadId   = req.params.id as string;
-  if (!tenantId || !userId) return res.status(400).json({ error: "tenant_id_missing_in_session" });
+  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
 
   const cx = await pool.connect();
   try {
-    await setAppContext(cx, tenantId!, userId!, req.session?.company_id);
+    await setAppContext(cx, tenantId, userId, req.session?.company_id);
 
     const leadQ = await cx.query(
       `
@@ -285,7 +318,7 @@ router.get("/leads/:id", requireSession, async (req: any, res: any, next: any) =
 
 /* ────────────────────────────────────────────────────────────────────────────
    POST /api/leads  (CREATE) → prefers session company id
-   TEMP: crash-proof short-circuit to stop 502 in prod (remove the marked block)
+   TEMP: replaced hardcoded company id with env var DEFAULT_COMPANY_ID
 ──────────────────────────────────────────────────────────────────────────── */
 router.post("/leads", requireSession, async (req: any, res: any, next: any) => {
   const {
@@ -308,13 +341,9 @@ router.post("/leads", requireSession, async (req: any, res: any, next: any) => {
     const finalName: string = String(lead_name || name || title || "").trim();
     if (!finalName) return res.status(400).json({ error: "lead_name_required" });
 
-    
-
-    // The real DB insert (uncomment after removing the mock above)
-    
     const tenantId = req.session?.tenant_id as string | null;
     const userId   = req.session?.user_id as string | null;
-    if (!tenantId || !userId) return res.status(400).json({ error: "tenant_id_missing_in_session" });
+    if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
 
     const estVal =
       estimated_value === undefined || estimated_value === null || estimated_value === ""
@@ -356,9 +385,9 @@ router.post("/leads", requireSession, async (req: any, res: any, next: any) => {
         finalCompanyId = await resolveDefaultCompanyId(cx, tenantId, userId);
       }
 
-      // OPTIONAL TEMP OVERRIDE (remove when company-switcher is live)
-      if (!finalCompanyId) {
-        finalCompanyId = "af3b367a-d61c-4748-9536-3fe94fe2d247";
+      // REPLACED HARD-CODE: use env var if you absolutely must fallback in dev
+      if (!finalCompanyId && process.env.DEFAULT_COMPANY_ID) {
+        finalCompanyId = String(process.env.DEFAULT_COMPANY_ID);
       }
 
       if (!finalCompanyId) {
@@ -416,6 +445,15 @@ router.post("/leads", requireSession, async (req: any, res: any, next: any) => {
       );
 
       await cx.query("COMMIT");
+
+      // notify after commit
+      try {
+        const createdId = ins.rows?.[0]?.id ?? null;
+        await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: createdId, action: "created" })]);
+      } catch (notifyErr) {
+        console.error("NOTIFY leads_changed failed:", notifyErr);
+      }
+
       res.status(201).json({ lead: ins.rows[0] });
     } catch (err: any) {
       try { await cx.query("ROLLBACK"); } catch {}
@@ -426,7 +464,7 @@ router.post("/leads", requireSession, async (req: any, res: any, next: any) => {
     } finally {
       cx.release();
     }
-    
+
   } catch (err) {
     next(err);
   }
@@ -439,7 +477,7 @@ router.patch("/leads/:id", requireSession, async (req: any, res: any, next: any)
   const tenantId = req.session?.tenant_id as string | null;
   const userId   = req.session?.user_id as string | null;
   const leadId   = req.params.id as string;
-  if (!tenantId || !userId) return res.status(400).json({ error: "tenant_id_missing_in_session" });
+  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
 
   const {
     name, email, phone, phone_e164, status, stage,
@@ -451,7 +489,7 @@ router.patch("/leads/:id", requireSession, async (req: any, res: any, next: any)
   const cx = await pool.connect();
   try {
     await cx.query("BEGIN");
-    await setAppContext(cx, tenantId!, userId!, req.session?.company_id);
+    await setAppContext(cx, tenantId, userId, req.session?.company_id);
 
     const upd = await cx.query(
       `
@@ -504,6 +542,14 @@ router.patch("/leads/:id", requireSession, async (req: any, res: any, next: any)
     );
 
     await cx.query("COMMIT");
+
+    // notify after commit
+    try {
+      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "updated" })]);
+    } catch (notifyErr) {
+      console.error("NOTIFY leads_changed failed:", notifyErr);
+    }
+
     if (upd.rowCount === 0) return res.status(404).json({ error: "not_found" });
     res.json({ lead: upd.rows[0] });
   } catch (err) {
@@ -522,7 +568,7 @@ router.post("/leads/:id/move", requireSession, async (req: any, res: any, next: 
   const userId   = req.session?.user_id as string | null;
   const leadId   = req.params.id as string;
   const { stage_id, stage } = req.body || {};
-  if (!tenantId || !userId) return res.status(400).json({ error: "tenant_id_missing_in_session" });
+  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
   if (!stage_id && (!stage || !String(stage).trim())) {
     return res.status(400).json({ error: "stage_or_stage_id_required" });
   }
@@ -534,7 +580,7 @@ router.post("/leads/:id/move", requireSession, async (req: any, res: any, next: 
   const cx = await pool.connect();
   try {
     await cx.query("BEGIN");
-    await setAppContext(cx, tenantId!, userId!, req.session?.company_id);
+    await setAppContext(cx, tenantId, userId, req.session?.company_id);
 
     let newStageName:  string | null = null;
     let newStageId:    string | null = null;
@@ -616,6 +662,14 @@ router.post("/leads/:id/move", requireSession, async (req: any, res: any, next: 
     );
 
     await cx.query("COMMIT");
+
+    // notify after commit
+    try {
+      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "moved" })]);
+    } catch (notifyErr) {
+      console.error("NOTIFY leads_changed failed:", notifyErr);
+    }
+
     if (upd.rowCount === 0) return res.status(404).json({ error: "not_found" });
     res.json({ lead: upd.rows[0] });
   } catch (err) {
@@ -648,6 +702,14 @@ router.post("/leads/:id/notes", requireSession, async (req: any, res: any, next:
       `,
       [tenantId, leadId, String(body), userId]
     );
+
+    // notify about notes added (helps dashboards that care)
+    try {
+      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "note_added" })]);
+    } catch (notifyErr) {
+      console.error("NOTIFY leads_changed failed:", notifyErr);
+    }
+
     res.status(201).json({ note: ins.rows[0] });
   } catch (err) {
     next(err);
@@ -675,6 +737,13 @@ router.post("/leads/:id/tasks", requireSession, async (req: any, res: any, next:
       `,
       [tenantId, leadId, String(title), due_date || null, userId]
     );
+
+    // notify about task created (scheduler / KPI watchers)
+    try {
+      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "task_created" })]);
+    } catch (notifyErr) {
+      console.error("NOTIFY leads_changed failed:", notifyErr);
+    }
 
     res.status(201).json({ task: ins.rows[0] });
   } catch (err) {
@@ -712,6 +781,14 @@ router.patch("/leads/:id/tasks/:taskId", requireSession, async (req: any, res: a
     );
 
     if (upd.rowCount === 0) return res.status(404).json({ error: "not_found" });
+
+    // notify about task status change
+    try {
+      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, task_id: taskId, action: "task_updated", task_status: status })]);
+    } catch (notifyErr) {
+      console.error("NOTIFY leads_changed failed:", notifyErr);
+    }
+
     res.json({ task: upd.rows[0] });
   } catch (err) {
     next(err);
@@ -753,6 +830,14 @@ router.post("/leads/:id/close", requireSession, async (req: any, res: any, next:
     );
 
     if (upd.rowCount === 0) return res.status(404).json({ error: "not_found" });
+
+    // notify after successful close
+    try {
+      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "closed", outcome })]);
+    } catch (notifyErr) {
+      console.error("NOTIFY leads_changed failed:", notifyErr);
+    }
+
     res.json({ lead: upd.rows[0] });
   } catch (err) {
     next(err);
@@ -765,7 +850,7 @@ router.post("/leads/:id/reopen", requireSession, async (req: any, res: any, next
   const tenantId = req.session?.tenant_id as string | null;
   const userId   = req.session?.user_id as string | null;
   const leadId   = req.params.id as string;
-  if (!tenantId || !userId) return res.status(400).json({ error: "tenant_id_missing_in_session" });
+  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
 
   const cx = await pool.connect();
   try {
@@ -788,6 +873,14 @@ router.post("/leads/:id/reopen", requireSession, async (req: any, res: any, next
     );
 
     if (upd.rowCount === 0) return res.status(404).json({ error: "not_found" });
+
+    // notify reopen
+    try {
+      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "reopened" })]);
+    } catch (notifyErr) {
+      console.error("NOTIFY leads_changed failed:", notifyErr);
+    }
+
     res.json({ lead: upd.rows[0] });
   } catch (err) {
     next(err);
@@ -802,7 +895,7 @@ router.post("/leads/:id/reopen", requireSession, async (req: any, res: any, next
 router.get("/stages", requireSession, async (req: any, res: any, next: any) => {
   const tenantId = req.session?.tenant_id as string | null;
   const userId   = req.session?.user_id as string | null;
-  if (!tenantId || !userId) return res.status(400).json({ error: "tenant_id_missing_in_session" });
+  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
 
   const cx = await pool.connect();
   try {
@@ -1004,9 +1097,10 @@ router.get("/scheduler/leads", requireSession, async (req: any, res: any, next: 
 
 /* ────────────────────────────────────────────────────────────────────────────
    Custom Fields Upsert
+   (protected)
 ──────────────────────────────────────────────────────────────────────────── */
 // ✅ PUT /api/leads/:leadId/custom-fields/:definitionId
-router.put("/:leadId/custom-fields/:definitionId", async (req: any, res) => {
+router.put("/:leadId/custom-fields/:definitionId", requireSession, async (req: any, res: any) => {
   try {
     const tenantId = String(req.session?.tenant_id || "").trim();
     const userId = String(req.session?.user_id || "").trim();
@@ -1071,6 +1165,14 @@ router.put("/:leadId/custom-fields/:definitionId", async (req: any, res) => {
     ];
 
     const { rows } = await pool.query(sql, params);
+
+    // optional: notify that a custom field changed (helps realtime dashboards)
+    try {
+      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "custom_field_upsert" })]);
+    } catch (notifyErr) {
+      console.error("NOTIFY leads_changed failed:", notifyErr);
+    }
+
     return res.json({ ok: true, data: rows[0] });
   } catch (err: any) {
     console.error("[custom-field upsert] error:", err);
