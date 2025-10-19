@@ -439,7 +439,7 @@ router.get("/kpis", requireSession, async (req: any, res: any) => {
     await cx.query(`SELECT set_config('app.tenant_id', $1::text, true)`, [String(tenantId)]);
     await cx.query(`SELECT set_config('app.user_id', $1::text, true)`, [String(userId)]);
     if (companyId) {
-      await cx.query(`SELECT set_config('app.company_id', $1::text, true)`, [String(companyId)]);
+      await cx.query("SELECT set_config('app.company_id', $1::text, true)", [String(companyId)]);
     }
 
     const result = await computeKpis(cx, tenantId, userId, companyId, String(req.query.table ?? ""));
@@ -492,7 +492,7 @@ router.get("/events/kpis", requireSession, async (req: any, res: any) => {
     await cxInit.query("BEGIN");
     await cxInit.query(`SELECT set_config('app.tenant_id', $1::text, true)`, [String(tenantId)]);
     await cxInit.query(`SELECT set_config('app.user_id', $1::text, true)`, [String(userId)]);
-    if (companyId) await cxInit.query("SELECT set_config('app.company_id', $1::text, true)`, [String(companyId)]);
+    if (companyId) await cxInit.query("SELECT set_config('app.company_id', $1::text, true)", [String(companyId)]);
     const initial = await computeKpis(cxInit, tenantId, userId, companyId, String(req.query.table ?? ""));
     await cxInit.query("COMMIT");
     sendEvent("kpis", initial);
@@ -526,7 +526,7 @@ router.get("/events/kpis", requireSession, async (req: any, res: any) => {
         await cx2.query("BEGIN");
         await cx2.query(`SELECT set_config('app.tenant_id', $1::text, true)`, [String(tenantId)]);
         await cx2.query(`SELECT set_config('app.user_id', $1::text, true)`, [String(userId)]);
-        if (companyId) await cx2.query(`SELECT set_config('app.company_id', $1::text, true)`, [String(companyId)]);
+        if (companyId) await cx2.query("SELECT set_config('app.company_id', $1::text, true)", [String(companyId)]);
         const k = await computeKpis(cx2, tenantId, userId, companyId, String(req.query.table ?? ""));
         await cx2.query("COMMIT");
         sendEvent("kpis", k);
