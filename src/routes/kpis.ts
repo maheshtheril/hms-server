@@ -193,7 +193,7 @@ async function computeKpis(
     };
   }
 
-  const sanityQ = await cx.query(`SELECT COUNT(*)::int AS c FROM ${table} l WHERE l.tenant_id = $1`, [tenantId]);
+  const sanityQ = await cx.query(`SELECT COUNT(*)::int AS c FROM ${table} l WHERE l.tenant_id = $1::uuid`, [tenantId]);
   const tenantCount = sanityQ?.rows?.[0]?.c ?? 0;
 
   const hasFollowUpDate = await columnExists(cx, "public", bare, "follow_up_date");
@@ -244,7 +244,7 @@ async function computeKpis(
     directDateExpr = `l."followup_date"`;
   }
 
-  let where = `l.tenant_id = $1`;
+  let where = `l.tenant_id = $1::uuid`;
   const params: any[] = [tenantId];
 
   if (hasCompanyId && companyId) {
@@ -322,7 +322,7 @@ async function computeKpis(
   // This counts followups across the tenant (and company if provided), ignoring owner/scope/open filters.
   let todaysFollowupsAll = 0;
   try {
-    let tenantWhere = `l.tenant_id = $1`;
+    let tenantWhere = `l.tenant_id = $1::uuid`;
     const tenantParams: any[] = [tenantId];
 
     if (hasCompanyId && companyId) {
@@ -425,7 +425,7 @@ async function computeKpis(
 /**
  * GET /kpis
  */
-router.get("/kpis", requireSession, async (req: any, res: any) => {
+router.get("/kpis", requireSession, async (req: any, res: any, next: any) => {
   const tenantId = req.session?.tenant_id;
   const userId = req.session?.user_id;
   const companyId = req.session?.company_id ?? null;
