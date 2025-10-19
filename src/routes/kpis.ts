@@ -1,10 +1,19 @@
-import { Router } from "express";
+// routes/kpis.ts  (FULL - drop-in replacement)
+// Provides: GET /kpis and SSE /events/kpis with robust role discovery, schema-adaptive KPIs,
+// IST timezone handling, and safe requireSession (company override via header/cookie).
 import * as cookie from "cookie";
+import { Router } from "express";
 import { pool } from "../db";
 import { findSessionBySid, touchSession } from "../services/sessionService";
 
 const router = Router();
+console.log("[kpis.ts] LOADED FROM", __filename);
 
+/* ────────────────────────────────────────────────────────────────────────────
+   Auth middleware → puts tenant_id, user_id, company_id on req.session
+   Accepts optional company switch via header `x-company-id` or cookie `cid`.
+   Logs touchSession errors instead of swallowing.
+──────────────────────────────────────────────────────────────────────────── */
 async function requireSession(req: any, res: any, next: any) {
   try {
     const cookies = cookie.parse(req.headers.cookie || "");
@@ -14,14 +23,16 @@ async function requireSession(req: any, res: any, next: any) {
     const sess = await findSessionBySid(sid);
     if (!sess) return res.status(401).json({ error: "invalid_session" });
 
+    const headerCompany = (req.headers["x-company-id"] as string | undefined)?.trim();
+    const cookieCompany = (cookies.cid as string | undefined)?.trim();
+
     req.session = {
       sid: sess.sid,
       user_id: sess.user_id,
       tenant_id: sess.tenant_id,
-      company_id: sess.company_id ?? null,
+      company_id: (headerCompany || cookieCompany || (sess as any).company_id || null) || null,
     };
 
-    // don't silently swallow touch errors — log them
     touchSession(sid).catch((err: any) => console.error("touchSession error:", err));
     next();
   } catch (e) {
@@ -31,6 +42,9 @@ async function requireSession(req: any, res: any, next: any) {
 
 const IST_TZ = "Asia/Kolkata";
 
+/* ────────────────────────────────────────────────────────────────────────────
+   Small helpers for introspecting DB schema
+──────────────────────────────────────────────────────────────────────────── */
 async function tableExists(cx: any, schema: string, name: string): Promise<boolean> {
   const q = await cx.query(
     `SELECT 1 FROM information_schema.tables WHERE table_schema=$1 AND table_name=$2 LIMIT 1`,
@@ -47,6 +61,10 @@ async function columnExists(cx: any, schema: string, table: string, col: string)
   return q.rowCount > 0;
 }
 
+/* ────────────────────────────────────────────────────────────────────────────
+   Role discovery across multiple possible auth schemas (user_roles, role_users,
+   app_user, users, groups, permissions). Returns array of token strings.
+──────────────────────────────────────────────────────────────────────────── */
 async function fetchUserRoleTokens(cx: any, tenantId: string, userId: string): Promise<string[]> {
   const tokens = new Set<string>();
   try {
@@ -58,7 +76,9 @@ async function fetchUserRoleTokens(cx: any, tenantId: string, userId: string): P
       [tenantId, userId]
     );
     rows.forEach((r: any) => r?.t && tokens.add(String(r.t)));
-  } catch {}
+  } catch (e) {
+    void e;
+  }
 
   try {
     const { rows } = await cx.query(
@@ -69,7 +89,9 @@ async function fetchUserRoleTokens(cx: any, tenantId: string, userId: string): P
       [tenantId, userId]
     );
     rows.forEach((r: any) => r?.t && tokens.add(String(r.t)));
-  } catch {}
+  } catch (e) {
+    void e;
+  }
 
   try {
     const hasAppUser = await tableExists(cx, "public", "app_user");
@@ -88,7 +110,9 @@ async function fetchUserRoleTokens(cx: any, tenantId: string, userId: string): P
         if (r.is_tenant_admin === true) tokens.add("tenant_admin");
       }
     }
-  } catch {}
+  } catch (e) {
+    void e;
+  }
 
   try {
     const hasUsers = await tableExists(cx, "public", "users");
@@ -108,7 +132,9 @@ async function fetchUserRoleTokens(cx: any, tenantId: string, userId: string): P
         if (r.is_admin === true) tokens.add("admin");
       }
     }
-  } catch {}
+  } catch (e) {
+    void e;
+  }
 
   try {
     const hasUG = await tableExists(cx, "public", "user_groups");
@@ -123,10 +149,11 @@ async function fetchUserRoleTokens(cx: any, tenantId: string, userId: string): P
       );
       rows.forEach((r: any) => r?.t && tokens.add(String(r.t)));
     }
-  } catch {}
+  } catch (e) {
+    void e;
+  }
 
   try {
-    // avoid redeclaring hasUG — use distinct names for checks
     const hasGP = await tableExists(cx, "public", "group_permissions");
     const hasP = await tableExists(cx, "public", "permissions");
     const hasUG2 = await tableExists(cx, "public", "user_groups");
@@ -141,7 +168,9 @@ async function fetchUserRoleTokens(cx: any, tenantId: string, userId: string): P
       );
       rows.forEach((r: any) => r?.t && tokens.add(String(r.t)));
     }
-  } catch {}
+  } catch (e) {
+    void e;
+  }
 
   return Array.from(tokens).map((s) => s?.toString?.() ?? "").filter(Boolean);
 }
@@ -153,11 +182,61 @@ function isTenantAdminLikeToken(s: string) {
   return /(tenant[_\s-]*admin|company[_\s-]*admin|manager)/i.test(s);
 }
 
-/**
- * computeKpis
- * - Reusable function that computes KPI object for given tenant/user/company
- * - Returns same shape as /kpis route JSON
- */
+/* ────────────────────────────────────────────────────────────────────────────
+   getAdminFlags - helper kept for compatibility with other code that expects
+   explicit isPlatformAdmin/isTenantAdmin/isAdmin booleans.
+──────────────────────────────────────────────────────────────────────────── */
+async function getAdminFlags(cx: any, tenantId: string, userId: string) {
+  try {
+    const q = await cx.query(
+      `select
+         coalesce(is_platform_admin, false) as is_platform_admin,
+         coalesce(is_tenant_admin,  false) as is_tenant_admin,
+         coalesce(is_admin,         false) as is_admin
+       from public.app_user
+      where id = $1 and tenant_id = $2
+      limit 1`,
+      [userId, tenantId]
+    );
+    const r = q.rows[0] || {};
+    return {
+      isPlatformAdmin: !!r.is_platform_admin,
+      isTenantAdmin:   !!r.is_tenant_admin,
+      isAdmin:         !!r.is_admin,
+    };
+  } catch {
+    return { isPlatformAdmin: false, isTenantAdmin: false, isAdmin: false };
+  }
+}
+
+/* setAppContext — sets Postgres application GUCs for tenant/user/company */
+async function setAppContext(cx: any, tenantId: string, userId: string, companyId?: string | null) {
+  await cx.query(`select set_config('app.tenant_id', $1::text, true)`, [tenantId]);
+  await cx.query(`select set_config('app.user_id',   $1::text, true)`, [userId]);
+  if (companyId) {
+    await cx.query(`select set_config('app.company_id', $1::text, true)`, [companyId]);
+  }
+}
+
+/* Resolve default company if none provided in session */
+async function resolveDefaultCompanyId(cx: any, tenantId: string, userId: string) {
+  const u = await cx.query(
+    `select company_id from public.app_user where id = $1 and tenant_id = $2 limit 1`,
+    [userId, tenantId]
+  );
+  if (u.rows[0]?.company_id) return u.rows[0].company_id as string;
+
+  const companies = await cx.query(`select id from public.company where tenant_id = $1`, [tenantId]);
+  if (companies.rowCount === 1) return companies.rows[0].id as string;
+
+  return null;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+   computeKpis - the main flexible KPI computation routine.
+   - Adapts to table name variants (lead/leads), many follow-up locations,
+     JSON containers, and chooses scope based on discovered role tokens.
+──────────────────────────────────────────────────────────────────────────── */
 async function computeKpis(
   cx: any,
   tenantId: string,
@@ -167,7 +246,7 @@ async function computeKpis(
 ) {
   const IST = IST_TZ;
 
-  // determine which table exists
+  // choose table
   const hasLead = await tableExists(cx, "public", "lead");
   const hasLeads = await tableExists(cx, "public", "leads");
 
@@ -193,22 +272,19 @@ async function computeKpis(
     };
   }
 
-  // tenant total count (cast tenant to uuid to avoid uuid=text errors)
+  // tenant count
   const sanityQ = await cx.query(`SELECT COUNT(*)::int AS c FROM ${table} l WHERE l.tenant_id = $1::uuid`, [tenantId]);
   const tenantCount = sanityQ?.rows?.[0]?.c ?? 0;
 
   const hasFollowUpDate = await columnExists(cx, "public", bare, "follow_up_date");
   const hasFollowupDate = !hasFollowUpDate && (await columnExists(cx, "public", bare, "followup_date"));
 
-  // ───────────────────────────────────────────────────────────────
-  // Enhanced: check all JSON containers (meta, metadata, custom_data)
+  // JSON meta candidates
   const metaCandidates: string[] = [];
   if (await columnExists(cx, "public", bare, "meta")) metaCandidates.push("l.meta");
   if (await columnExists(cx, "public", bare, "metadata")) metaCandidates.push("l.metadata");
   if (await columnExists(cx, "public", bare, "custom_data")) metaCandidates.push("l.custom_data");
 
-  // Build a unified rawMetaExpr that coalesces follow-up date fields from all
-  // present JSON columns and common key names. This produces a TEXT value (or NULL).
   let rawMetaExpr: string | null = null;
   if (metaCandidates.length > 0) {
     const keys = [
@@ -234,18 +310,14 @@ async function computeKpis(
   const hasCreatedBy = await columnExists(cx, "public", bare, "created_by");
   const hasCompanyId = await columnExists(cx, "public", bare, "company_id");
 
-  // Build follow-up extraction pieces:
-  // - directDateExpr: date value from direct column (if present)
-  // - rawMetaExpr: raw text extracted from meta (if present)
   let directDateExpr: string | null = null;
-
   if (hasFollowUpDate) {
     directDateExpr = `l."follow_up_date"`;
   } else if (hasFollowupDate) {
     directDateExpr = `l."followup_date"`;
   }
 
-  // base where & params (use tenant param as uuid)
+  // base where and params
   let where = `l.tenant_id = $1::uuid`;
   const params: any[] = [tenantId];
 
@@ -254,7 +326,7 @@ async function computeKpis(
     params.push(companyId);
   }
 
-  // determine scope (mine/all) using roles
+  // determine scope using tokens
   let mine = true;
   try {
     const tokens = await fetchUserRoleTokens(cx, tenantId, userId);
@@ -264,7 +336,7 @@ async function computeKpis(
     mine = true;
   }
 
-  // Ownership filter: prefer owner_id, then created_by, otherwise no per-user filter
+  // if mine, filter by owner or created_by if present
   if (mine) {
     if (hasOwner) {
       where += ` AND COALESCE(l.owner_id::text,'') = $${params.length + 1}::text`;
@@ -275,14 +347,12 @@ async function computeKpis(
     }
   }
 
-  // Build open/closed predicate — only reference columns that exist.
   let openPredicate = `true`;
   if (hasStatus) {
     openPredicate = `COALESCE(NULLIF(TRIM(lower(l.status)), ''), 'open') !~ '^(closed|closed[-_ ]?(won|lost))$'`;
   } else if (hasStage) {
     openPredicate = `COALESCE(NULLIF(TRIM(lower(l.stage)), ''), 'new') !~ '^(won|lost)$'`;
   } else if (rawMetaExpr) {
-    // if we have JSON meta containers, check for a 'close' flag inside them
     const closeChecks: string[] = [];
     if (await columnExists(cx, "public", bare, "meta")) closeChecks.push(`(l.meta -> 'close') IS NULL`);
     if (await columnExists(cx, "public", bare, "metadata")) closeChecks.push(`(l.metadata -> 'close') IS NULL`);
@@ -293,11 +363,9 @@ async function computeKpis(
     openPredicate = `true`;
   }
 
-  // today text in IST
   const todayTextExpr = `to_char((NOW() AT TIME ZONE '${IST}')::date, 'YYYY-MM-DD')`;
 
-  // build fup_date_text expression used in queries
-  // priority: direct column -> rawMetaExpr coalesced text -> NULL
+  // build fup_date_text
   let fupDateTextExpr: string;
   if (directDateExpr) {
     fupDateTextExpr = `(CASE WHEN (${directDateExpr}) IS NOT NULL THEN to_char((${directDateExpr})::date,'YYYY-MM-DD') ELSE NULL END)`;
@@ -309,7 +377,6 @@ async function computeKpis(
       ELSE NULL
     END)`;
   } else {
-    // As a fallback, try explicit JSON accessors (if present) — helps in some schema variations
     const explicitParts: string[] = [];
     if (await columnExists(cx, "public", bare, "meta")) {
       explicitParts.push(`l.meta ->> 'follow_up_date'`, `l.meta ->> 'followup_date'`);
@@ -327,11 +394,9 @@ async function computeKpis(
     }
   }
 
-  // ------------------ Tenant-wide today's followups (UNFILTERED) ------------------
-  // Counts followups across the tenant (and company if provided), ignoring owner/scope/open filters.
+  // tenant-wide followups (unfiltered)
   let todaysFollowupsAll = 0;
   try {
-    // tenantWhere: cast tenant to uuid to avoid uuid=text operator error
     let tenantWhere = `l.tenant_id = $1::uuid`;
     const tenantParams: any[] = [tenantId];
 
@@ -356,9 +421,8 @@ async function computeKpis(
     console.error("Failed to compute tenant-wide todays followups:", e);
     todaysFollowupsAll = 0;
   }
-  // -------------------------------------------------------------------------------
 
-  // now compute scoped open leads + scoped today's followups (not used for dashboard but returned)
+  // scoped open leads + scoped followups
   const sql = `
     WITH base AS (
       SELECT l.id, ${fupDateTextExpr} AS fup_date_text
@@ -377,7 +441,9 @@ async function computeKpis(
   try {
     console.log("[kpis SQL]", sql.replace(/\s+/g, " ").trim());
     console.log("[kpis PARAMS]", params);
-  } catch (e) {}
+  } catch (e) {
+    void e;
+  }
 
   let rows;
   try {
@@ -412,12 +478,10 @@ async function computeKpis(
 
   const row = rows?.[0] ?? { open_leads: 0, todays_followups: 0 };
 
-  // Return object — use tenant-wide count for dashboard's today followups as requested
   return {
     scope: mine ? "mine" : "all",
     open_leads_count: row.open_leads,
     open_leads: row.open_leads,
-    // Dashboard: tenant-wide today's followups (unfiltered by owner/scope)
     todays_followups: todaysFollowupsAll,
     followups_today: todaysFollowupsAll,
     open_leads_trend: "+0%",
@@ -425,9 +489,9 @@ async function computeKpis(
   };
 }
 
-/**
- * GET /kpis
- */
+/* ────────────────────────────────────────────────────────────────────────────
+   GET /kpis
+──────────────────────────────────────────────────────────────────────────── */
 router.get("/kpis", requireSession, async (req: any, res: any) => {
   const tenantId = req.session?.tenant_id;
   const userId = req.session?.user_id;
@@ -438,7 +502,6 @@ router.get("/kpis", requireSession, async (req: any, res: any) => {
 
   const cx = await pool.connect();
   try {
-    // avoid a long transaction here
     await cx.query(`SELECT set_config('app.tenant_id', $1::text, true)`, [String(tenantId)]);
     await cx.query(`SELECT set_config('app.user_id', $1::text, true)`, [String(userId)]);
     if (companyId) {
@@ -468,9 +531,9 @@ router.get("/kpis", requireSession, async (req: any, res: any) => {
   }
 });
 
-/**
- * SSE: GET /events/kpis
- */
+/* ────────────────────────────────────────────────────────────────────────────
+   SSE: GET /events/kpis  (Server-Sent Events)
+──────────────────────────────────────────────────────────────────────────── */
 router.get("/events/kpis", requireSession, async (req: any, res: any) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -485,7 +548,9 @@ router.get("/events/kpis", requireSession, async (req: any, res: any) => {
     try {
       res.write(`event: ${eventName}\n`);
       res.write(`data: ${JSON.stringify(data)}\n\n`);
-    } catch (e) {}
+    } catch (e) {
+      void e;
+    }
   }
 
   // initial KPIs
@@ -560,7 +625,9 @@ router.get("/events/kpis", requireSession, async (req: any, res: any) => {
   const keepAlive = setInterval(() => {
     try {
       res.write(": keep-alive\n\n");
-    } catch (e) {}
+    } catch (e) {
+      void e;
+    }
   }, 20000);
 
   req.on("close", async () => {
@@ -570,13 +637,19 @@ router.get("/events/kpis", requireSession, async (req: any, res: any) => {
         client.removeListener("notification", onNotification);
         await client.query("UNLISTEN leads_changed");
       }
-    } catch (e) {}
+    } catch (e) {
+      void e;
+    }
     try {
       client.release(true);
-    } catch (e) {}
+    } catch (e) {
+      void e;
+    }
     try {
       res.end();
-    } catch (e) {}
+    } catch (e) {
+      void e;
+    }
   });
 });
 
