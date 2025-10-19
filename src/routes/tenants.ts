@@ -1,3 +1,4 @@
+// server/src/routes/tenant.ts
 import { Router } from "express";
 import { q } from "../db";
 import { requireSession } from "../lib/session-mw";
@@ -5,7 +6,43 @@ import { ensurePlatform } from "../lib/rbac";
 
 const router = Router();
 
-/** List tenants */
+/**
+ * GET /
+ * Primary entry for GET /api/tenant
+ *
+ * Behavior:
+ * - If the requester is a normal tenant user -> return their current tenant { tenant: {...} }
+ * - If the requester is a platform admin -> call next() to fall through to the platform tenant list handler
+ *
+ * This keeps frontend fetch('/api/tenant') working for normal users and preserves your admin list API.
+ */
+router.get("/", requireSession, async (req, res, next) => {
+  const me = req.user;
+  try {
+    // If user is a platform admin, fall through to platform list handler
+    if (ensurePlatform(me)) return next();
+
+    // Derive tenant id from session user. Adjust field names if your session stores differently.
+    const tenantId = me?.tenant_id || me?.tenant?.id || null;
+    if (!tenantId) return res.status(404).json({ error: "tenant_not_found" });
+
+    const { rows } = await q(
+      `SELECT id, name, slug, domain, created_at
+       FROM tenant
+       WHERE id = $1 AND deleted_at IS NULL
+       LIMIT 1`,
+      [tenantId]
+    );
+
+    if (!rows[0]) return res.status(404).json({ error: "not_found" });
+    return res.json({ tenant: rows[0] });
+  } catch (err) {
+    console.error("GET /api/tenant (current tenant) error:", err);
+    return res.status(500).json({ error: "tenant_read_failed" });
+  }
+});
+
+/** List tenants (platform only) */
 router.get("/", requireSession, async (req, res) => {
   const me = req.user;
   if (!ensurePlatform(me)) return res.status(403).json({ error: "forbidden" });
@@ -20,11 +57,12 @@ router.get("/", requireSession, async (req, res) => {
     `);
     return res.json({ tenants: rows });
   } catch (e) {
+    console.error("GET /api/tenant list error:", e);
     return res.status(500).json({ error: "tenant_list_failed" });
   }
 });
 
-/** Get one tenant */
+/** Get one tenant (platform only) */
 router.get("/:id", requireSession, async (req, res) => {
   const me = req.user;
   if (!ensurePlatform(me)) return res.status(403).json({ error: "forbidden" });
@@ -39,12 +77,13 @@ router.get("/:id", requireSession, async (req, res) => {
     );
     if (!rows[0]) return res.status(404).json({ error: "not_found" });
     return res.json({ tenant: rows[0] });
-  } catch {
+  } catch (e) {
+    console.error("GET /api/tenant/:id error:", e);
     return res.status(500).json({ error: "tenant_read_failed" });
   }
 });
 
-/** Create tenant */
+/** Create tenant (platform only) */
 router.post("/", requireSession, async (req, res) => {
   const me = req.user;
   if (!ensurePlatform(me)) return res.status(403).json({ error: "forbidden" });
@@ -126,11 +165,12 @@ router.post("/", requireSession, async (req, res) => {
     if (String(e?.message || "").includes("duplicate")) {
       return res.status(409).json({ error: "slug_exists" });
     }
+    console.error("POST /api/tenant error:", e);
     return res.status(500).json({ error: "tenant_create_failed" });
   }
 });
 
-/** Update tenant */
+/** Update tenant (platform only) */
 router.patch("/:id", requireSession, async (req, res) => {
   const me = req.user;
   if (!ensurePlatform(me)) return res.status(403).json({ error: "forbidden" });
@@ -156,11 +196,12 @@ router.patch("/:id", requireSession, async (req, res) => {
     if (String(e?.message || "").includes("duplicate")) {
       return res.status(409).json({ error: "slug_exists" });
     }
+    console.error("PATCH /api/tenant/:id error:", e);
     return res.status(500).json({ error: "tenant_update_failed" });
   }
 });
 
-/** Delete tenant (soft delete) */
+/** Delete tenant (soft delete) (platform only) */
 router.delete("/:id", requireSession, async (req, res) => {
   const me = req.user;
   if (!ensurePlatform(me)) return res.status(403).json({ error: "forbidden" });
@@ -172,7 +213,8 @@ router.delete("/:id", requireSession, async (req, res) => {
     );
     if (!rowCount) return res.status(404).json({ error: "not_found" });
     return res.json({ ok: true });
-  } catch {
+  } catch (e) {
+    console.error("DELETE /api/tenant/:id error:", e);
     return res.status(500).json({ error: "tenant_delete_failed" });
   }
 });
