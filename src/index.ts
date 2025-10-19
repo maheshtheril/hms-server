@@ -25,7 +25,6 @@ import adminCompaniesRouter from "./routes/admin/companies";
 import tenantSignup from "./routes/tenant-signup"; // ✅ kebab-case file
 import uploadsRouter from "./routes/uploads";
 import checkEmail from "./routes/check-email";
-import activitiesRouter from "./routes/activities";
 
 
 /* ───────────────────────────── Express init ───────────────────────────── */
@@ -105,7 +104,7 @@ app.use("/api", kpis);
 app.use("/api", leads);
 app.use("/api", pipelines);
 app.use("/api", kanban);
-app.use("/api/activities", activitiesRouter);
+
 
 
 /* ───────────────────────────── Admin namespace ───────────────────────────── */
