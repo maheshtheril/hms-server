@@ -1,4 +1,3 @@
-// server/src/routes/kpis.ts
 import { Router } from "express";
 import * as cookie from "cookie";
 import { pool } from "../db";
@@ -126,10 +125,11 @@ async function fetchUserRoleTokens(cx: any, tenantId: string, userId: string): P
   } catch {}
 
   try {
+    // avoid redeclaring hasUG — use distinct names for checks
     const hasGP = await tableExists(cx, "public", "group_permissions");
     const hasP = await tableExists(cx, "public", "permissions");
-    const hasUG = await tableExists(cx, "public", "user_groups");
-    if (hasGP && hasP && hasUG) {
+    const hasUG2 = await tableExists(cx, "public", "user_groups");
+    if (hasGP && hasP && hasUG2) {
       const { rows } = await cx.query(
         `SELECT COALESCE(NULLIF(TRIM(p.code), ''), NULLIF(TRIM(p.name), '')) AS t
          FROM public.user_groups u
@@ -198,11 +198,33 @@ async function computeKpis(
   const hasFollowUpDate = await columnExists(cx, "public", bare, "follow_up_date");
   const hasFollowupDate = !hasFollowUpDate && (await columnExists(cx, "public", bare, "followup_date"));
 
-  // detect which meta-like column exists (meta, metadata, custom_data)
-  let metaCol: string | null = null;
-  if (await columnExists(cx, "public", bare, "meta")) metaCol = "meta";
-  else if (await columnExists(cx, "public", bare, "metadata")) metaCol = "metadata";
-  else if (await columnExists(cx, "public", bare, "custom_data")) metaCol = "custom_data";
+  // ───────────────────────────────────────────────────────────────
+  // Enhanced: check all JSON containers (meta, metadata, custom_data)
+  const metaCandidates: string[] = [];
+  if (await columnExists(cx, "public", bare, "meta")) metaCandidates.push("l.meta");
+  if (await columnExists(cx, "public", bare, "metadata")) metaCandidates.push("l.metadata");
+  if (await columnExists(cx, "public", bare, "custom_data")) metaCandidates.push("l.custom_data");
+
+  // Build a unified rawMetaExpr that coalesces follow-up date fields from all
+  // present JSON columns and common key names
+  let rawMetaExpr: string | null = null;
+  if (metaCandidates.length > 0) {
+    const keys = [
+      "follow_up_date",
+      "followup_date",
+      "followUpDate",
+      "followupDate",
+      "next_followup",
+      "reminder_at",
+    ];
+    const accessors: string[] = [];
+    for (const col of metaCandidates) {
+      for (const k of keys) {
+        accessors.push(`${col} ->> '${k}'`);
+      }
+    }
+    rawMetaExpr = `NULLIF(COALESCE(${accessors.join(", ")}), '')`;
+  }
 
   const hasStatus = await columnExists(cx, "public", bare, "status");
   const hasStage = await columnExists(cx, "public", bare, "stage");
@@ -214,20 +236,11 @@ async function computeKpis(
   // - directDateExpr: date value from direct column (if present)
   // - rawMetaExpr: raw text extracted from meta (if present)
   let directDateExpr: string | null = null;
-  let rawMetaExpr: string | null = null;
 
   if (hasFollowUpDate) {
     directDateExpr = `l."follow_up_date"`;
   } else if (hasFollowupDate) {
     directDateExpr = `l."followup_date"`;
-  } else if (metaCol) {
-    rawMetaExpr = `NULLIF(COALESCE(
-        l.${metaCol} ->> 'follow_up_date',
-        l.${metaCol} ->> 'followup_date',
-        l.${metaCol} ->> 'followUpDate',
-        l.${metaCol} ->> 'followupDate',
-        ''
-      ), '')`;
   }
 
   let where = `l.tenant_id = $1`;
@@ -265,8 +278,15 @@ async function computeKpis(
     openPredicate = `COALESCE(NULLIF(TRIM(lower(l.status)), ''), 'open') !~ '^(closed|closed[-_ ]?(won|lost))$'`;
   } else if (hasStage) {
     openPredicate = `COALESCE(NULLIF(TRIM(lower(l.stage)), ''), 'new') !~ '^(won|lost)$'`;
-  } else if (metaCol) {
-    openPredicate = `( (l.${metaCol} -> 'close') IS NULL )`;
+  } else if (rawMetaExpr) {
+    // if we have JSON meta containers, check for a 'close' flag inside them
+    // prefer meta->'close' if present in any JSON column; check generically:
+    const closeChecks: string[] = [];
+    if (await columnExists(cx, "public", bare, "meta")) closeChecks.push(`(l.meta -> 'close') IS NULL`);
+    if (await columnExists(cx, "public", bare, "metadata")) closeChecks.push(`(l.metadata -> 'close') IS NULL`);
+    if (await columnExists(cx, "public", bare, "custom_data")) closeChecks.push(`(l.custom_data -> 'close') IS NULL`);
+    if (closeChecks.length > 0) openPredicate = `(${closeChecks.join(" AND ")})`;
+    else openPredicate = `true`;
   } else {
     openPredicate = `true`;
   }
