@@ -41,17 +41,19 @@ const requireSession: RequestHandler = (req, res, next) => {
 
     // Prefer cookie-parser if present; fall back to manual parse
     const parsed =
-      (r as any).cookies ??
-      (r.headers?.cookie ? cookie.parse(r.headers.cookie) : {});
+      (r as any).cookies ?? (r.headers?.cookie ? cookie.parse(r.headers.cookie) : {});
 
     const sid =
-      parsed?.sid ||
-      parsed?.ssr_sid ||
-      parsed?.SESSION_ID ||
-      parsed?.session_id ||
-      null;
+      parsed?.sid || parsed?.ssr_sid || parsed?.SESSION_ID || parsed?.session_id || null;
 
     if (!sid) {
+      // Helpful debug log for missing cookie (useful for mobile / CORS issues)
+      console.warn(
+        "[requireSession] missing sid cookie. parsed cookies:",
+        parsed,
+        "origin:",
+        req.headers.origin
+      );
       res.status(401).json({ error: "unauthenticated" });
       return;
     }
@@ -67,9 +69,7 @@ const requireSession: RequestHandler = (req, res, next) => {
       user_id: String(s.user_id),
       tenant_id: String(s.tenant_id),
       active_company_id:
-        (s as any).active_company_id != null
-          ? String((s as any).active_company_id)
-          : null,
+        (s as any).active_company_id != null ? String((s as any).active_company_id) : null,
     };
 
     const tenantId = r.session.tenant_id;
@@ -171,10 +171,13 @@ const requireSession: RequestHandler = (req, res, next) => {
       r.company = { active_company_id: active ?? null };
       r.session.active_company_id = active ?? null;
 
+      // Use environment-aware cookie options so mobile / cross-origin works correctly
+      const isProd = process.env.NODE_ENV === "production";
       res.cookie("active_company_id", active ?? "", {
         httpOnly: true,
-        sameSite: "lax",
-        secure: process.env.NODE_ENV === "production",
+        sameSite: isProd ? "none" : "lax",
+        secure: isProd,
+        path: "/",
         maxAge: 30 * 24 * 60 * 60 * 1000,
       });
     } finally {
