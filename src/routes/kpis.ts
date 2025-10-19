@@ -193,6 +193,7 @@ async function computeKpis(
     };
   }
 
+  // tenant total count (cast tenant to uuid to avoid uuid=text errors)
   const sanityQ = await cx.query(`SELECT COUNT(*)::int AS c FROM ${table} l WHERE l.tenant_id = $1::uuid`, [tenantId]);
   const tenantCount = sanityQ?.rows?.[0]?.c ?? 0;
 
@@ -207,7 +208,7 @@ async function computeKpis(
   if (await columnExists(cx, "public", bare, "custom_data")) metaCandidates.push("l.custom_data");
 
   // Build a unified rawMetaExpr that coalesces follow-up date fields from all
-  // present JSON columns and common key names
+  // present JSON columns and common key names. This produces a TEXT value (or NULL).
   let rawMetaExpr: string | null = null;
   if (metaCandidates.length > 0) {
     const keys = [
@@ -244,6 +245,7 @@ async function computeKpis(
     directDateExpr = `l."followup_date"`;
   }
 
+  // base where & params (use tenant param as uuid)
   let where = `l.tenant_id = $1::uuid`;
   const params: any[] = [tenantId];
 
@@ -281,7 +283,6 @@ async function computeKpis(
     openPredicate = `COALESCE(NULLIF(TRIM(lower(l.stage)), ''), 'new') !~ '^(won|lost)$'`;
   } else if (rawMetaExpr) {
     // if we have JSON meta containers, check for a 'close' flag inside them
-    // prefer meta->'close' if present in any JSON column; check generically:
     const closeChecks: string[] = [];
     if (await columnExists(cx, "public", bare, "meta")) closeChecks.push(`(l.meta -> 'close') IS NULL`);
     if (await columnExists(cx, "public", bare, "metadata")) closeChecks.push(`(l.metadata -> 'close') IS NULL`);
@@ -292,20 +293,13 @@ async function computeKpis(
     openPredicate = `true`;
   }
 
-  //
-  // NEW approach: compute fup_date_text (YYYY-MM-DD) as TEXT for all branches,
-  // then compare fup_date_text = today_text (both TEXT) to avoid text=date errors.
-  //
+  // today text in IST
   const todayTextExpr = `to_char((NOW() AT TIME ZONE '${IST}')::date, 'YYYY-MM-DD')`;
 
-  // build fup_date_text expression:
-  // - if directDateExpr exists: to_char(directDateExpr::date,'YYYY-MM-DD')
-  // - else if rawMetaExpr matches YYYY-MM-DD -> use raw
-  // - else if rawMetaExpr matches ISO datetime prefix -> cast to timestamptz then to_char(...,'YYYY-MM-DD')
-  // - else NULL
+  // build fup_date_text expression used in queries
+  // priority: direct column -> rawMetaExpr coalesced text -> NULL
   let fupDateTextExpr: string;
   if (directDateExpr) {
-    // directDateExpr may be timestamp/date column — safe to cast to ::date then format
     fupDateTextExpr = `(CASE WHEN (${directDateExpr}) IS NOT NULL THEN to_char((${directDateExpr})::date,'YYYY-MM-DD') ELSE NULL END)`;
   } else if (rawMetaExpr) {
     fupDateTextExpr = `(CASE
@@ -315,13 +309,29 @@ async function computeKpis(
       ELSE NULL
     END)`;
   } else {
-    fupDateTextExpr = `NULL`;
+    // As a fallback, try explicit JSON accessors (if present) — helps in some schema variations
+    const explicitParts: string[] = [];
+    if (await columnExists(cx, "public", bare, "meta")) {
+      explicitParts.push(`l.meta ->> 'follow_up_date'`, `l.meta ->> 'followup_date'`);
+    }
+    if (await columnExists(cx, "public", bare, "metadata")) {
+      explicitParts.push(`l.metadata ->> 'follow_up_date'`, `l.metadata ->> 'followup_date'`);
+    }
+    if (await columnExists(cx, "public", bare, "custom_data")) {
+      explicitParts.push(`l.custom_data ->> 'follow_up_date'`, `l.custom_data ->> 'followup_date'`);
+    }
+    if (explicitParts.length > 0) {
+      fupDateTextExpr = `NULLIF(COALESCE(${explicitParts.join(", ")}), '')`;
+    } else {
+      fupDateTextExpr = `NULL`;
+    }
   }
 
   // ------------------ Tenant-wide today's followups (UNFILTERED) ------------------
-  // This counts followups across the tenant (and company if provided), ignoring owner/scope/open filters.
+  // Counts followups across the tenant (and company if provided), ignoring owner/scope/open filters.
   let todaysFollowupsAll = 0;
   try {
+    // tenantWhere: cast tenant to uuid to avoid uuid=text operator error
     let tenantWhere = `l.tenant_id = $1::uuid`;
     const tenantParams: any[] = [tenantId];
 
@@ -348,6 +358,7 @@ async function computeKpis(
   }
   // -------------------------------------------------------------------------------
 
+  // now compute scoped open leads + scoped today's followups (not used for dashboard but returned)
   const sql = `
     WITH base AS (
       SELECT l.id, ${fupDateTextExpr} AS fup_date_text
@@ -363,13 +374,11 @@ async function computeKpis(
     FROM base;
   `;
 
-  // debug logging so we can inspect SQL / params when errors occur
   try {
     console.log("[kpis SQL]", sql.replace(/\s+/g, " ").trim());
     console.log("[kpis PARAMS]", params);
   } catch (e) {}
 
-  // Run query with enhanced error logging that shows the SQL context at err.position
   let rows;
   try {
     const res = await cx.query(sql, params);
@@ -377,17 +386,11 @@ async function computeKpis(
   } catch (err: any) {
     try {
       console.error("KPIS QUERY ERROR:", err);
-
-      // Attempt to read position (Postgres returns it as a string 1-based)
       const posStr = err && err.position ? String(err.position) : null;
       const pos = posStr ? Math.max(0, parseInt(posStr, 10) - 1) : null;
-
-      // Compact the SQL for one-line logging
       const compactSql = String(sql).replace(/\s+/g, " ").trim();
-
       console.error("[kpis SQL compact]", compactSql);
       console.error("[kpis PARAMS]", params);
-
       if (pos !== null && !Number.isNaN(pos)) {
         const ctxRadius = 80;
         const start = Math.max(0, pos - ctxRadius);
@@ -404,17 +407,17 @@ async function computeKpis(
     } catch (logErr) {
       console.error("Failed to log SQL context:", logErr);
     }
-    // rethrow so outer try/catch still handles it and route returns error as before
     throw err;
   }
 
   const row = rows?.[0] ?? { open_leads: 0, todays_followups: 0 };
 
+  // Return object — use tenant-wide count for dashboard's today followups as requested
   return {
     scope: mine ? "mine" : "all",
     open_leads_count: row.open_leads,
     open_leads: row.open_leads,
-    // use tenant-wide count for dashboard's today followups
+    // Dashboard: tenant-wide today's followups (unfiltered by owner/scope)
     todays_followups: todaysFollowupsAll,
     followups_today: todaysFollowupsAll,
     open_leads_trend: "+0%",
@@ -425,7 +428,7 @@ async function computeKpis(
 /**
  * GET /kpis
  */
-router.get("/kpis", requireSession, async (req: any, res: any, next: any) => {
+router.get("/kpis", requireSession, async (req: any, res: any) => {
   const tenantId = req.session?.tenant_id;
   const userId = req.session?.user_id;
   const companyId = req.session?.company_id ?? null;
