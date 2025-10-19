@@ -285,6 +285,8 @@ async function computeKpis(
   if (await columnExists(cx, "public", bare, "metadata")) metaCandidates.push("l.metadata");
   if (await columnExists(cx, "public", bare, "custom_data")) metaCandidates.push("l.custom_data");
 
+  // Build a unified rawMetaExpr that coalesces follow-up date fields from all
+  // present JSON columns and common key names. This produces a TEXT value (or NULL).
   let rawMetaExpr: string | null = null;
   if (metaCandidates.length > 0) {
     const keys = [
@@ -303,6 +305,17 @@ async function computeKpis(
     }
     rawMetaExpr = `NULLIF(COALESCE(${accessors.join(", ")}), '')`;
   }
+
+  // Helper: build the same COALESCE(...) meta accessor expression used in the SQL snippets
+  function buildCoalesceMetaAccessors(availableCols: string[]) {
+    const keys = ["follow_up_date", "followup_date", "followUpDate", "followupDate", "next_followup", "reminder_at"];
+    const parts: string[] = [];
+    for (const col of availableCols) {
+      for (const k of keys) parts.push(`${col} ->> '${k}'`);
+    }
+    return parts.length ? `NULLIF(COALESCE(${parts.join(", ")}), '')` : null;
+  }
+  const coalesceExpr = buildCoalesceMetaAccessors(metaCandidates);
 
   const hasStatus = await columnExists(cx, "public", bare, "status");
   const hasStage = await columnExists(cx, "public", bare, "stage");
@@ -365,7 +378,7 @@ async function computeKpis(
 
   const todayTextExpr = `to_char((NOW() AT TIME ZONE '${IST}')::date, 'YYYY-MM-DD')`;
 
-  // build fup_date_text
+  // build fup_date_text (fallback path — kept for schemas that prefer direct column or earlier logic)
   let fupDateTextExpr: string;
   if (directDateExpr) {
     fupDateTextExpr = `(CASE WHEN (${directDateExpr}) IS NOT NULL THEN to_char((${directDateExpr})::date,'YYYY-MM-DD') ELSE NULL END)`;
@@ -394,36 +407,67 @@ async function computeKpis(
     }
   }
 
-  // tenant-wide followups (unfiltered)
+  // ------------------ Tenant-wide today's followups (UNFILTERED) ------------------
+  // If we have JSON meta columns, use the coalesceExpr approach; otherwise fall back to previous logic
   let todaysFollowupsAll = 0;
   try {
-    let tenantWhere = `l.tenant_id = $1::uuid`;
-    const tenantParams: any[] = [tenantId];
+    if (coalesceExpr) {
+      // params for the tenant-wide SQL: tenantId, IST, (optional companyId)
+      const paramsAll: any[] = [tenantId, IST];
+      let companyClause = "";
+      if (hasCompanyId && companyId) {
+        companyClause = ` AND l.company_id = $3`;
+        paramsAll.push(companyId);
+      }
 
-    if (hasCompanyId && companyId) {
-      tenantWhere += ` AND l.company_id = $${tenantParams.length + 1}`;
-      tenantParams.push(companyId);
+      const sqlAll = `
+        WITH vars AS (
+          SELECT $1::uuid AS tenant_id,
+                 to_char((NOW() AT TIME ZONE $2)::date,'YYYY-MM-DD') AS today_ist
+        )
+        SELECT COUNT(*)::int AS todays_followups_all
+        FROM ${table} l, vars v
+        WHERE l.tenant_id = v.tenant_id
+          ${companyClause}
+          AND (${coalesceExpr}) = v.today_ist;
+      `;
+
+      const allRes = await cx.query(sqlAll, paramsAll);
+      todaysFollowupsAll = (allRes?.rows?.[0]?.todays_followups_all ?? 0);
+    } else {
+      // no JSON meta present: fallback (use direct fupDateTextExpr if available)
+      if (fupDateTextExpr && fupDateTextExpr !== "NULL") {
+        const tenantParams: any[] = [tenantId];
+        let companyClause = "";
+        if (hasCompanyId && companyId) {
+          companyClause = ` AND l.company_id = $2`;
+          tenantParams.push(companyId);
+        }
+        const sqlAllFallback = `
+          WITH vars AS (
+            SELECT $1::uuid AS tenant_id,
+                   to_char((NOW() AT TIME ZONE $2)::date,'YYYY-MM-DD') AS today_ist
+          )
+          SELECT COUNT(*)::int AS todays_followups_all
+          FROM ${table} l, vars v
+          WHERE l.tenant_id = v.tenant_id
+            ${companyClause}
+            AND (${fupDateTextExpr}) = v.today_ist;
+        `;
+        const allRes = await cx.query(sqlAllFallback, [tenantId, IST, ...(hasCompanyId && companyId ? [companyId] : [])]);
+        todaysFollowupsAll = (allRes?.rows?.[0]?.todays_followups_all ?? 0);
+      } else {
+        todaysFollowupsAll = 0;
+      }
     }
-
-    const sqlAll = `
-      WITH base AS (
-        SELECT l.id, ${fupDateTextExpr} AS fup_date_text
-        FROM ${table} l
-        WHERE ${tenantWhere}
-      )
-      SELECT COUNT(*)::int AS todays_followups_all
-      FROM base
-      WHERE fup_date_text IS NOT NULL AND fup_date_text = ${todayTextExpr};
-    `;
-    const allRes = await cx.query(sqlAll, tenantParams);
-    todaysFollowupsAll = (allRes?.rows?.[0]?.todays_followups_all ?? 0);
   } catch (e) {
     console.error("Failed to compute tenant-wide todays followups:", e);
     todaysFollowupsAll = 0;
   }
+  // -------------------------------------------------------------------------------
 
-  // scoped open leads + scoped followups
-  const sql = `
+  // now compute scoped open leads + scoped today's followups (not used for dashboard but returned)
+  const fallbackSql = `
     WITH base AS (
       SELECT l.id, ${fupDateTextExpr} AS fup_date_text
       FROM ${table} l
@@ -438,23 +482,38 @@ async function computeKpis(
     FROM base;
   `;
 
-  try {
-    console.log("[kpis SQL]", sql.replace(/\s+/g, " ").trim());
-    console.log("[kpis PARAMS]", params);
-  } catch (e) {
-    void e;
-  }
-
   let rows;
   try {
-    const res = await cx.query(sql, params);
-    rows = res.rows;
+    if (coalesceExpr) {
+      // scoped SQL using coalesceExpr and parameterized IST as last param
+      const paramsScoped = [...params, IST]; // IST is used by $N in the SQL below
+      const sqlScoped = `
+        WITH base AS (
+          SELECT l.id, (${coalesceExpr}) AS fup_date_text
+          FROM ${table} l
+          WHERE ${where}
+            AND (${openPredicate})
+        )
+        SELECT
+          COUNT(*)::int AS open_leads,
+          SUM(
+            CASE WHEN fup_date_text IS NOT NULL AND fup_date_text = to_char((NOW() AT TIME ZONE $${paramsScoped.length})::date,'YYYY-MM-DD') THEN 1 ELSE 0 END
+          )::int AS todays_followups
+        FROM base;
+      `;
+      const res = await cx.query(sqlScoped, paramsScoped);
+      rows = res.rows;
+    } else {
+      // no coalesceExpr — use fallback sql (which references fupDateTextExpr already built)
+      const res = await cx.query(fallbackSql, params);
+      rows = res.rows;
+    }
   } catch (err: any) {
     try {
       console.error("KPIS QUERY ERROR:", err);
       const posStr = err && err.position ? String(err.position) : null;
       const pos = posStr ? Math.max(0, parseInt(posStr, 10) - 1) : null;
-      const compactSql = String(sql).replace(/\s+/g, " ").trim();
+      const compactSql = String(fallbackSql).replace(/\s+/g, " ").trim();
       console.error("[kpis SQL compact]", compactSql);
       console.error("[kpis PARAMS]", params);
       if (pos !== null && !Number.isNaN(pos)) {
@@ -478,10 +537,12 @@ async function computeKpis(
 
   const row = rows?.[0] ?? { open_leads: 0, todays_followups: 0 };
 
+  // Return object — use tenant-wide count for dashboard's today followups as requested
   return {
     scope: mine ? "mine" : "all",
     open_leads_count: row.open_leads,
     open_leads: row.open_leads,
+    // Dashboard: tenant-wide today's followups (unfiltered by owner/scope)
     todays_followups: todaysFollowupsAll,
     followups_today: todaysFollowupsAll,
     open_leads_trend: "+0%",
