@@ -5,6 +5,7 @@ import bcrypt from "bcryptjs";
 import { pool } from "../db";
 import { provisionTenantRBAC } from "../services/provisionTenant";
 import type { PoolClient } from "pg";
+import { issueSession } from "../lib/session"; // <- added import
 
 const router = Router();
 
@@ -221,6 +222,25 @@ router.post("/", async (req, res) => {
 
     await cx.query("COMMIT");
     began = false;
+
+    // ======= NEW: issue session and set cookie immediately after successful signup =======
+    try {
+      const sid = await issueSession(userId, tenantId);
+      const isProd = process.env.NODE_ENV === "production";
+      const cookieName = process.env.COOKIE_NAME_SID || "sid";
+
+      res.cookie(cookieName, sid, {
+        httpOnly: true,
+        sameSite: isProd ? "none" : "lax",
+        secure: isProd,
+        path: "/",
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      });
+    } catch (sessErr: any) {
+      console.error("[tenant-signup] failed to issue session cookie:", sessErr);
+      // do not fail signup — still return success to client
+    }
+    // ================================================================================
 
     return res.status(201).json({ ok: true, tenantId, companyId, userId });
   } catch (err: any) {
