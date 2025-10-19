@@ -24,6 +24,9 @@ import schedulerRouter from "./routes/scheduler";
 import adminCompaniesRouter from "./routes/admin/companies";
 import tenantSignup from "./routes/tenant-signup"; // ✅ kebab-case file
 import uploadsRouter from "./routes/uploads";
+import checkEmail from "./routes/check-email";
+import activitiesRouter from "./routes/activities";
+
 
 /* ───────────────────────────── Express init ───────────────────────────── */
 const app = express();
@@ -94,12 +97,16 @@ app.post("/api/leads/__probe", (req, res) => {
 /* ───────────────────────────── Auth + Core APIs ───────────────────────────── */
 // Note: auth is NOT under /api by design (web rewrite maps /api/auth → /auth)
 app.use("/auth", auth);
+app.use("/api/check-email", checkEmail);
+
 
 app.use("/api", me);
 app.use("/api", kpis);
 app.use("/api", leads);
 app.use("/api", pipelines);
 app.use("/api", kanban);
+app.use("/api/activities", activitiesRouter);
+
 
 /* ───────────────────────────── Admin namespace ───────────────────────────── */
 app.use("/api/admin", adminRoutes);
@@ -108,6 +115,7 @@ app.use("/api/admin/roles", adminRolesRouter);
 app.use("/api/admin/permissions", adminPermissionsRouter);
 app.use("/api/admin/companies", adminCompaniesRouter);
 app.use("/api/admin/custom-fields", adminCustomFieldsRouter);
+
 
 /* ───────────────────────────── Uploads, Tenants, Scheduler ───────────────────────────── */
 app.use("/api/uploads", uploadsRouter);

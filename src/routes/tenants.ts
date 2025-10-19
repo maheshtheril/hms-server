@@ -1,3 +1,4 @@
+// server/src/routes/tenant.ts
 import { Router } from "express";
 import { q } from "../db";
 import { requireSession } from "../lib/session-mw";
@@ -37,9 +38,9 @@ router.get("/", requireSession, async (req, res, next) => {
   }
 });
 
-/** List tenants */
+/** List tenants (platform only) */
 router.get("/", requireSession, async (req, res) => {
-  const me = req.user;
+  const me = req.user as any;
   if (!ensurePlatform(me)) return res.status(403).json({ error: "forbidden" });
 
   try {
@@ -52,13 +53,14 @@ router.get("/", requireSession, async (req, res) => {
     `);
     return res.json({ tenants: rows });
   } catch (e) {
+    console.error("GET /api/tenant list error:", e);
     return res.status(500).json({ error: "tenant_list_failed" });
   }
 });
 
-/** Get one tenant */
+/** Get one tenant (platform only) */
 router.get("/:id", requireSession, async (req, res) => {
-  const me = req.user;
+  const me = req.user as any;
   if (!ensurePlatform(me)) return res.status(403).json({ error: "forbidden" });
 
   try {
@@ -71,14 +73,15 @@ router.get("/:id", requireSession, async (req, res) => {
     );
     if (!rows[0]) return res.status(404).json({ error: "not_found" });
     return res.json({ tenant: rows[0] });
-  } catch {
+  } catch (e) {
+    console.error("GET /api/tenant/:id error:", e);
     return res.status(500).json({ error: "tenant_read_failed" });
   }
 });
 
-/** Create tenant */
+/** Create tenant (platform only) */
 router.post("/", requireSession, async (req, res) => {
-  const me = req.user;
+  const me = req.user as any;
   if (!ensurePlatform(me)) return res.status(403).json({ error: "forbidden" });
 
   const { name, slug, domain, owner_email } = req.body || {};
@@ -158,13 +161,14 @@ router.post("/", requireSession, async (req, res) => {
     if (String(e?.message || "").includes("duplicate")) {
       return res.status(409).json({ error: "slug_exists" });
     }
+    console.error("POST /api/tenant error:", e);
     return res.status(500).json({ error: "tenant_create_failed" });
   }
 });
 
-/** Update tenant */
+/** Update tenant (platform only) */
 router.patch("/:id", requireSession, async (req, res) => {
-  const me = req.user;
+  const me = req.user as any;
   if (!ensurePlatform(me)) return res.status(403).json({ error: "forbidden" });
 
   const { name, slug, domain } = req.body || {};
@@ -188,13 +192,14 @@ router.patch("/:id", requireSession, async (req, res) => {
     if (String(e?.message || "").includes("duplicate")) {
       return res.status(409).json({ error: "slug_exists" });
     }
+    console.error("PATCH /api/tenant/:id error:", e);
     return res.status(500).json({ error: "tenant_update_failed" });
   }
 });
 
-/** Delete tenant (soft delete) */
+/** Delete tenant (soft delete) (platform only) */
 router.delete("/:id", requireSession, async (req, res) => {
-  const me = req.user;
+  const me = req.user as any;
   if (!ensurePlatform(me)) return res.status(403).json({ error: "forbidden" });
 
   try {
@@ -204,7 +209,8 @@ router.delete("/:id", requireSession, async (req, res) => {
     );
     if (!rowCount) return res.status(404).json({ error: "not_found" });
     return res.json({ ok: true });
-  } catch {
+  } catch (e) {
+    console.error("DELETE /api/tenant/:id error:", e);
     return res.status(500).json({ error: "tenant_delete_failed" });
   }
 });
