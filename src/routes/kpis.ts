@@ -21,7 +21,8 @@ async function requireSession(req: any, res: any, next: any) {
       company_id: sess.company_id ?? null,
     };
 
-    touchSession(sid).catch(() => {});
+    // don't silently swallow touch errors — log them
+    touchSession(sid).catch((err: any) => console.error("touchSession error:", err));
     next();
   } catch (e) {
     next(e);
@@ -317,6 +318,36 @@ async function computeKpis(
     fupDateTextExpr = `NULL`;
   }
 
+  // ------------------ Tenant-wide today's followups (UNFILTERED) ------------------
+  // This counts followups across the tenant (and company if provided), ignoring owner/scope/open filters.
+  let todaysFollowupsAll = 0;
+  try {
+    let tenantWhere = `l.tenant_id = $1`;
+    const tenantParams: any[] = [tenantId];
+
+    if (hasCompanyId && companyId) {
+      tenantWhere += ` AND l.company_id = $${tenantParams.length + 1}`;
+      tenantParams.push(companyId);
+    }
+
+    const sqlAll = `
+      WITH base AS (
+        SELECT l.id, ${fupDateTextExpr} AS fup_date_text
+        FROM ${table} l
+        WHERE ${tenantWhere}
+      )
+      SELECT COUNT(*)::int AS todays_followups_all
+      FROM base
+      WHERE fup_date_text IS NOT NULL AND fup_date_text = ${todayTextExpr};
+    `;
+    const allRes = await cx.query(sqlAll, tenantParams);
+    todaysFollowupsAll = (allRes?.rows?.[0]?.todays_followups_all ?? 0);
+  } catch (e) {
+    console.error("Failed to compute tenant-wide todays followups:", e);
+    todaysFollowupsAll = 0;
+  }
+  // -------------------------------------------------------------------------------
+
   const sql = `
     WITH base AS (
       SELECT l.id, ${fupDateTextExpr} AS fup_date_text
@@ -383,8 +414,9 @@ async function computeKpis(
     scope: mine ? "mine" : "all",
     open_leads_count: row.open_leads,
     open_leads: row.open_leads,
-    todays_followups: row.todays_followups,
-    followups_today: row.todays_followups,
+    // use tenant-wide count for dashboard's today followups
+    todays_followups: todaysFollowupsAll,
+    followups_today: todaysFollowupsAll,
     open_leads_trend: "+0%",
     tenant_count: tenantCount,
   };
@@ -460,7 +492,7 @@ router.get("/events/kpis", requireSession, async (req: any, res: any) => {
     await cxInit.query("BEGIN");
     await cxInit.query(`SELECT set_config('app.tenant_id', $1::text, true)`, [String(tenantId)]);
     await cxInit.query(`SELECT set_config('app.user_id', $1::text, true)`, [String(userId)]);
-    if (companyId) await cxInit.query(`SELECT set_config('app.company_id', $1::text, true)`, [String(companyId)]);
+    if (companyId) await cxInit.query("SELECT set_config('app.company_id', $1::text, true)`, [String(companyId)]);
     const initial = await computeKpis(cxInit, tenantId, userId, companyId, String(req.query.table ?? ""));
     await cxInit.query("COMMIT");
     sendEvent("kpis", initial);
