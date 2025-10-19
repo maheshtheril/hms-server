@@ -219,5 +219,27 @@ router.get("/me", async (req, res) => {
     tenant: tenantId ? { id: tenantId } : null,
   });
 });
+// inside server/src/routes/auth.ts (add near other auth handlers)
+router.get("/last-login", async (req, res) => {
+  try {
+    const sid = req.cookies?.[process.env.COOKIE_NAME_SID || "sid"];
+    if (!sid) return res.status(404).json({ error: "no_session" });
+
+    const { rows } = await q(
+      `SELECT u.id, u.email, s.last_active_at
+         FROM sessions s
+         JOIN app_user u ON u.id = s.user_id
+        WHERE s.sid = $1
+        LIMIT 1`,
+      [sid]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "not_found" });
+
+    return res.json({ last_login: rows[0].last_active_at || null });
+  } catch (err) {
+    console.error("GET /api/auth/last-login error:", err);
+    return res.status(500).json({ error: "last_login_failed" });
+  }
+});
 
 export default router;
