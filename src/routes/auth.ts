@@ -12,14 +12,22 @@ const router = Router();
 const COOKIE_NAME = process.env.COOKIE_NAME_SID || "sid";
 const isProd = process.env.NODE_ENV === "production";
 function cookieOptions() {
-  return {
+  const opts = {
     httpOnly: true,
-    secure: isProd, // true in production (HTTPS), false in local dev
-    sameSite: isProd ? "none" : "lax",
+    secure: isProd,              // ✅ required for HTTPS on Render
+    sameSite: "none" as const,   // ✅ always allow cross-site cookies
     path: "/",
     maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-  } as const;
+  };
+
+  // ✅ optional — ensure correct cookie scope (helps in Render environments)
+  if (isProd) {
+    opts["domain"] = ".onrender.com"; // covers both frontend + backend subdomains
+  }
+
+  return opts;
 }
+
 
 /**
  * POST /auth/login
