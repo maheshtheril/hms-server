@@ -1179,5 +1179,74 @@ router.put("/:leadId/custom-fields/:definitionId", requireSession, async (req: a
     return res.status(500).json({ error: "Internal Server Error", detail: err?.message });
   }
 });
+// GET /api/kpis/todays  — insert into routes/leads.ts (uses existing requireSession, pool, getAdminFlags, setAppContext)
+router.get("/kpis/todays", requireSession, async (req: any, res: any, next: any) => {
+  try {
+    const tenantId = req.session?.tenant_id as string | null;
+    const userId   = req.session?.user_id   as string | null;
+    if (!tenantId) return res.status(401).json({ error: "unauthenticated" });
+
+    const mine = String(req.query?.mine ?? "").toLowerCase() === "1" || String(req.query?.mine ?? "").toLowerCase() === "true";
+    const ownerParam = req.query?.owner ? String(req.query.owner) : null;
+
+    // IST date YYYY-MM-DD to match calendar UI
+    const istToday = (new Date().toLocaleString("en-CA", { timeZone: "Asia/Kolkata" })).slice(0, 10);
+
+    const cx = await pool.connect();
+    try {
+      // set app context like other handlers (optional but consistent)
+      await setAppContext(cx, tenantId, userId, req.session?.company_id);
+
+      // admin check: allow admin to pass ?owner=... to count for someone else
+      const flags = await getAdminFlags(cx, tenantId, userId);
+      const isAdminish = flags.isPlatformAdmin || flags.isTenantAdmin || flags.isAdmin;
+      const effectiveOwner = isAdminish ? ownerParam : (mine ? userId : null);
+
+      // Build SQL: union of lead ids from lead.meta follow_up_date and open tasks due today.
+      // Count DISTINCT lead_id to avoid double-counting.
+      const params: any[] = [tenantId, istToday];
+      let ownerClauseLead = "";
+      let ownerClauseTask = "";
+      if (effectiveOwner) {
+        params.push(effectiveOwner);
+        ownerClauseLead = ` and l.owner_id = $${params.length}`;
+        ownerClauseTask = ` and l.owner_id = $${params.length}`;
+      }
+
+      const sql = `
+        SELECT count(DISTINCT lead_id)::int AS cnt FROM (
+          -- leads with meta follow_up_date = today
+          SELECT l.id::text AS lead_id
+          FROM public.lead l
+          WHERE l.tenant_id = $1
+            AND (l.meta->>'follow_up_date')::date = $2
+            AND (l.meta->>'deleted_at') IS NULL
+            ${ownerClauseLead}
+
+          UNION ALL
+
+          -- open tasks due today (join to lead for tenant + owner scoping)
+          SELECT t.lead_id::text AS lead_id
+          FROM public.lead_task t
+          JOIN public.lead l ON l.id = t.lead_id AND l.tenant_id = t.tenant_id
+          WHERE t.tenant_id = $1
+            AND t.status IN ('open')
+            AND t.due_date::date = $2
+            ${ownerClauseTask}
+        ) AS u;
+      `;
+
+      const q = await cx.query(sql, params);
+      const total = Number(q.rows?.[0]?.cnt ?? 0);
+      return res.json({ ok: true, todays_followups: total });
+    } catch (err) {
+      next(err);
+    } finally {
+      cx.release();
+    }
+  } catch (err) {
+    next(err);
+  }
+});
 
 export default router;
