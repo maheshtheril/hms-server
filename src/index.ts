@@ -10,7 +10,6 @@ import adminCustomFieldsRouter from "./routes/admin/custom-fields";
 import leadCustomFieldsRouter from "./routes/leads/custom-fields";
 import auth from "./routes/auth";
 import me from "./routes/me";
-import kpis from "./routes/kpis";
 import leads from "./routes/leads";
 import pipelines from "./routes/pipelines";
 import kanban from "./routes/kanban";
@@ -106,7 +105,7 @@ app.use("/", kpisTodaysRouter);
 
 
 app.use("/api", me);
-app.use("/api", kpis);
+
 app.use("/api", leads);
 app.use("/api", pipelines);
 app.use("/api", kanban);
