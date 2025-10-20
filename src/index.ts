@@ -26,6 +26,7 @@ import tenantSignup from "./routes/tenant-signup"; // ✅ kebab-case file
 import uploadsRouter from "./routes/uploads";
 import checkEmail from "./routes/check-email";
 import kpisTodaysRouter from "./routes/kpis_todays";
+import kpisRouter from "./routes/kpis";
 
 
 /* ───────────────────────────── Express init ───────────────────────────── */
@@ -64,6 +65,8 @@ app.options("*", (req, res) => {
   );
   return res.sendStatus(200);
 });
+app.use("/api/kpis", kpisRouter); 
+
 
 /* ───────────────────────────── Parsers BEFORE routes ───────────────────────────── */
 app.use(cookieParser());
