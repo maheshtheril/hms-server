@@ -25,6 +25,7 @@ import adminCompaniesRouter from "./routes/admin/companies";
 import tenantSignup from "./routes/tenant-signup"; // ✅ kebab-case file
 import uploadsRouter from "./routes/uploads";
 import checkEmail from "./routes/check-email";
+import kpisTodaysRouter from "./routes/kpis_todays";
 
 
 /* ───────────────────────────── Express init ───────────────────────────── */
@@ -97,6 +98,8 @@ app.post("/api/leads/__probe", (req, res) => {
 // Note: auth is NOT under /api by design (web rewrite maps /api/auth → /auth)
 app.use("/auth", auth);
 app.use("/api/check-email", checkEmail);
+
+app.use("/", kpisTodaysRouter);
 
 
 app.use("/api", me);

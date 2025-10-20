@@ -236,6 +236,8 @@ async function resolveDefaultCompanyId(cx: any, tenantId: string, userId: string
    computeKpis - the main flexible KPI computation routine.
    - Adapts to table name variants (lead/leads), many follow-up locations,
      JSON containers, and chooses scope based on discovered role tokens.
+   - Improved: robust tenant-wide date extraction using regex to normalize
+     ISO and ISO-like values so '2025-10-20T08:00:00' will match '2025-10-20'.
 ──────────────────────────────────────────────────────────────────────────── */
 async function computeKpis(
   cx: any,
@@ -276,8 +278,9 @@ async function computeKpis(
   const sanityQ = await cx.query(`SELECT COUNT(*)::int AS c FROM ${table} l WHERE l.tenant_id = $1::uuid`, [tenantId]);
   const tenantCount = sanityQ?.rows?.[0]?.c ?? 0;
 
+  // check for direct date columns (fix: check both independently)
   const hasFollowUpDate = await columnExists(cx, "public", bare, "follow_up_date");
-  const hasFollowupDate = !hasFollowUpDate && (await columnExists(cx, "public", bare, "followup_date"));
+  const hasFollowupDate = await columnExists(cx, "public", bare, "followup_date");
 
   // JSON meta candidates
   const metaCandidates: string[] = [];
@@ -383,6 +386,7 @@ async function computeKpis(
   if (directDateExpr) {
     fupDateTextExpr = `(CASE WHEN (${directDateExpr}) IS NOT NULL THEN to_char((${directDateExpr})::date,'YYYY-MM-DD') ELSE NULL END)`;
   } else if (rawMetaExpr) {
+    // Keep original heuristics as a fallback, but tenant-wide SQL below will prefer regex extraction
     fupDateTextExpr = `(CASE
       WHEN (${rawMetaExpr}) IS NULL OR trim(${rawMetaExpr}) = '' THEN NULL
       WHEN (${rawMetaExpr}) ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN (${rawMetaExpr})
@@ -408,7 +412,7 @@ async function computeKpis(
   }
 
   // ------------------ Tenant-wide today's followups (UNFILTERED) ------------------
-  // If we have JSON meta columns, use the coalesceExpr approach; otherwise fall back to previous logic
+  // Improved: use regex extraction to normalise any ISO-like date snippet to YYYY-MM-DD
   let todaysFollowupsAll = 0;
   try {
     if (coalesceExpr) {
@@ -420,16 +424,20 @@ async function computeKpis(
         paramsAll.push(companyId);
       }
 
+      // Use regexp_matches to extract YYYY-MM-DD anywhere in the coalesced string
       const sqlAll = `
         WITH vars AS (
           SELECT $1::uuid AS tenant_id,
                  to_char((NOW() AT TIME ZONE $2)::date,'YYYY-MM-DD') AS today_ist
         )
         SELECT COUNT(*)::int AS todays_followups_all
-        FROM ${table} l, vars v
-        WHERE l.tenant_id = v.tenant_id
+        FROM ${table} l
+        JOIN vars v ON l.tenant_id = v.tenant_id
+        WHERE 1=1
           ${companyClause}
-          AND (${coalesceExpr}) = v.today_ist;
+          AND (
+            (regexp_matches(trim(${coalesceExpr}::text), '(\\\\d{4}-\\\\d{2}-\\\\d{2})'))[1]
+          ) = v.today_ist;
       `;
 
       const allRes = await cx.query(sqlAll, paramsAll);
@@ -437,10 +445,10 @@ async function computeKpis(
     } else {
       // no JSON meta present: fallback (use direct fupDateTextExpr if available)
       if (fupDateTextExpr && fupDateTextExpr !== "NULL") {
-        const tenantParams: any[] = [tenantId];
+        const tenantParams: any[] = [tenantId, IST];
         let companyClause = "";
         if (hasCompanyId && companyId) {
-          companyClause = ` AND l.company_id = $2`;
+          companyClause = ` AND l.company_id = $3`;
           tenantParams.push(companyId);
         }
         const sqlAllFallback = `
@@ -449,12 +457,13 @@ async function computeKpis(
                    to_char((NOW() AT TIME ZONE $2)::date,'YYYY-MM-DD') AS today_ist
           )
           SELECT COUNT(*)::int AS todays_followups_all
-          FROM ${table} l, vars v
-          WHERE l.tenant_id = v.tenant_id
+          FROM ${table} l
+          JOIN vars v ON l.tenant_id = v.tenant_id
+          WHERE 1=1
             ${companyClause}
             AND (${fupDateTextExpr}) = v.today_ist;
         `;
-        const allRes = await cx.query(sqlAllFallback, [tenantId, IST, ...(hasCompanyId && companyId ? [companyId] : [])]);
+        const allRes = await cx.query(sqlAllFallback, tenantParams);
         todaysFollowupsAll = (allRes?.rows?.[0]?.todays_followups_all ?? 0);
       } else {
         todaysFollowupsAll = 0;
@@ -485,11 +494,13 @@ async function computeKpis(
   let rows;
   try {
     if (coalesceExpr) {
-      // scoped SQL using coalesceExpr and parameterized IST as last param
+      // scoped SQL using coalesceExpr and regex extraction for normalization
       const paramsScoped = [...params, IST]; // IST is used by $N in the SQL below
       const sqlScoped = `
         WITH base AS (
-          SELECT l.id, (${coalesceExpr}) AS fup_date_text
+          SELECT l.id,
+                 -- extract first YYYY-MM-DD from the coalesced raw meta (if present)
+                 (regexp_matches(trim(${coalesceExpr}::text), '(\\\\d{4}-\\\\d{2}-\\\\d{2})'))[1] AS fup_date_text
           FROM ${table} l
           WHERE ${where}
             AND (${openPredicate})
