@@ -103,5 +103,59 @@ router.get("/kpis/todays", requireSession, async (req: any, res: any) => {
     }
   }
 });
+// Temporary debug route — REMOVE THIS AFTER DEBUGGING
+router.get("/kpis/todays/debug", async (req: any, res: any) => {
+  const tenantId = String(req.query?.tenantId || "");
+  if (!tenantId) return res.status(400).json({ error: "tenantId required" });
+
+  const cx = await pool.connect();
+  try {
+    const sql = `
+      WITH vars AS (
+        SELECT $1::uuid AS tenant_id,
+               to_char((NOW() AT TIME ZONE 'Asia/Kolkata')::date, 'YYYY-MM-DD') AS today_ist
+      ),
+      lead_dates AS (
+        SELECT
+          l.id,
+          trim(coalesce(
+            l.meta       ->> 'follow_up_date',
+            l.meta       ->> 'followup_date',
+            l.meta       ->> 'followUpDate',
+            l.meta       ->> 'followupDate',
+            l.metadata   ->> 'follow_up_date',
+            l.metadata   ->> 'followup_date',
+            l.metadata   ->> 'followUpDate',
+            l.metadata   ->> 'followupDate',
+            l.custom_data->> 'follow_up_date',
+            l.custom_data->> 'followup_date',
+            l.custom_data->> 'followUpDate',
+            l.custom_data->> 'followupDate'
+          ), '') AS raw_date
+        FROM public.lead l
+        JOIN vars v ON l.tenant_id = v.tenant_id
+      ),
+      normalized AS (
+        SELECT
+          id,
+          raw_date,
+          (regexp_matches(raw_date, '(\\d{4}-\\d{2}-\\d{2})'))[1] AS ymd
+        FROM lead_dates
+      )
+      SELECT COUNT(*)::int AS todays_followups
+      FROM normalized n
+      JOIN vars v ON true
+      WHERE n.ymd = v.today_ist;
+    `;
+    const result = await cx.query(sql, [tenantId]);
+    const count = result?.rows?.[0]?.todays_followups ?? 0;
+    return res.json({ todays_followups: Number(count) });
+  } catch (err) {
+    console.error("GET /kpis/todays/debug error:", err);
+    return res.status(500).json({ error: "internal" });
+  } finally {
+    try { cx.release(true); } catch {}
+  }
+});
 
 export default router;
