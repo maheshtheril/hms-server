@@ -239,10 +239,11 @@ router.get("/leads", requireSession, async (req: any, res: any, next: any) => {
       params.push(effectiveOwner);
       // Note: use the same param index for all OR'd checks so we can pass only one param value.
       ownerFilterSQL = ` and (
-        owner_id = $${params.length}
-        OR created_by = $${params.length}
-        OR (meta->>'assigned_to') = $${params.length}
-      )\n`;
+  owner_id::text = $${params.length}
+  OR created_by::text = $${params.length}
+  OR (meta->>'assigned_to') = $${params.length}
+)\n`;
+
       sql += ownerFilterSQL;
     }
 
@@ -258,10 +259,11 @@ router.get("/leads", requireSession, async (req: any, res: any, next: any) => {
     if (effectiveOwner) {
       countParams.push(effectiveOwner);
       countSql += ` and (
-        owner_id = $2
-        OR created_by = $2
-        OR (meta->>'assigned_to') = $2
-      )`;
+  owner_id::text = $2
+  OR created_by::text = $2
+  OR (meta->>'assigned_to') = $2
+)`;
+
     }
     const countQ = await cx.query(countSql, countParams);
     const total = Number((countQ.rows?.[0]?.cnt) ?? result.rowCount);
@@ -1076,7 +1078,8 @@ router.get("/scheduler/leads", requireSession, async (req: any, res: any, next: 
         and (l.meta->>'follow_up_date')::date between $2::date and $3::date
     `;
     const p1: any[] = [tenantId, from, to];
-    if (ownerFilter) { p1.push(ownerFilter); sql1 += ` and l.owner_id = $${p1.length}\n`; }
+    if (ownerFilter) { p1.push(ownerFilter); sql1 += ` and l.owner_id::text = $${p1.length}\n`; }
+
     const followUps = await cx.query(sql1, p1);
 
     let sql2 = `
@@ -1096,7 +1099,8 @@ router.get("/scheduler/leads", requireSession, async (req: any, res: any, next: 
         and t.due_date between $2::date and $3::date
     `;
     const p2: any[] = [tenantId, from, to];
-    if (ownerFilter) { p2.push(ownerFilter); sql2 += ` and l.owner_id = $${p2.length}\n`; }
+    if (ownerFilter) { p2.push(ownerFilter); sql2 += ` and l.owner_id::text = $${p2.length}\n`; }
+
     const tasks = await cx.query(sql2, p2);
 
     const all = [...followUps.rows, ...tasks.rows]
@@ -1229,8 +1233,9 @@ router.get("/kpis/todays", requireSession, async (req: any, res: any, next: any)
       let ownerClauseTask = "";
       if (effectiveOwner) {
         params.push(effectiveOwner);
-        ownerClauseLead = ` and l.owner_id = $${params.length}`;
-        ownerClauseTask = ` and l.owner_id = $${params.length}`;
+        ownerClauseLead = ` and l.owner_id::text = $${params.length}`;
+ownerClauseTask = ` and l.owner_id::text = $${params.length}`;
+
       }
 
       const sql = `
