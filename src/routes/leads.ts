@@ -1268,5 +1268,92 @@ router.get("/kpis/todays", requireSession, async (req: any, res: any, next: any)
     next(err);
   }
 });
+/* ────────────────────────────────────────────────────────────────────────────
+   BACKWARDS-COMPAT: GET /api/kpis?table=leads
+   Tenant admins (and platform admins) see tenant-wide counts.
+   Non-admins see only their own leads (owner = current user).
+──────────────────────────────────────────────────────────────────────────── */
+router.get("/kpis", requireSession, async (req: any, res: any, next: any) => {
+  try {
+    const table = String(req.query?.table || "").toLowerCase();
+    if (table !== "leads") {
+      return res.status(400).json({ error: "unsupported_table", supported: ["leads"] });
+    }
+
+    const mineParam = String(req.query?.mine ?? "").toLowerCase();
+    const mine = mineParam === "1" || mineParam === "true";
+    // ownerParam is allowed for admins only — ignored for regular users
+    const ownerParam = req.query?.owner ? String(req.query.owner) : null;
+
+    // IST date YYYY-MM-DD (matches frontend calendar expectations)
+    const istToday = (new Date().toLocaleString("en-CA", { timeZone: "Asia/Kolkata" })).slice(0, 10);
+
+    const tenantId = req.session?.tenant_id as string | null;
+    const userId   = req.session?.user_id   as string | null;
+    if (!tenantId) return res.status(401).json({ error: "unauthenticated" });
+
+    const cx = await pool.connect();
+    try {
+      await setAppContext(cx, tenantId, userId, req.session?.company_id);
+
+      const flags = await getAdminFlags(cx, tenantId, userId);
+      const isAdminish = !!(flags.isPlatformAdmin || flags.isTenantAdmin);
+
+      // Determine owner scoping:
+      // - Admins: no owner scoping (see all)
+      // - Non-admins: always scope to current user (owner = userId)
+      // - If non-admin and mine=true it's still userId; ownerParam is ignored for non-admin
+      let effectiveOwner: string | null = null;
+      if (!isAdminish) {
+        effectiveOwner = userId; // enforce own-only
+      } else {
+        // admin: allow owner override (or null -> tenant-wide)
+        effectiveOwner = ownerParam || null;
+      }
+
+      const params: any[] = [tenantId, istToday];
+      let ownerClauseLead = "";
+      let ownerClauseTask = "";
+      if (effectiveOwner) {
+        params.push(effectiveOwner);
+        ownerClauseLead = ` and l.owner_id = $${params.length}`;
+        ownerClauseTask = ` and l.owner_id = $${params.length}`;
+      }
+
+      const sql = `
+        SELECT count(DISTINCT lead_id)::int AS cnt FROM (
+          -- leads with follow_up_date = today (and not deleted)
+          SELECT l.id::text AS lead_id
+          FROM public.lead l
+          WHERE l.tenant_id = $1
+            AND (l.meta->>'follow_up_date')::date = $2
+            AND (l.meta->>'deleted_at') IS NULL
+            ${ownerClauseLead}
+
+          UNION ALL
+
+          -- open tasks due today (join to lead for tenant + optional owner scoping)
+          SELECT t.lead_id::text AS lead_id
+          FROM public.lead_task t
+          JOIN public.lead l ON l.id = t.lead_id AND l.tenant_id = t.tenant_id
+          WHERE t.tenant_id = $1
+            AND t.status IN ('open')
+            AND t.due_date::date = $2
+            ${ownerClauseTask}
+        ) AS u;
+      `;
+
+      const q = await cx.query(sql, params);
+      const total = Number(q.rows?.[0]?.cnt ?? 0);
+      return res.json({ ok: true, todays_followups: total });
+    } catch (err) {
+      next(err);
+    } finally {
+      cx.release();
+    }
+  } catch (err) {
+    next(err);
+  }
+});
 
 export default router;
