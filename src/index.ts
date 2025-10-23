@@ -101,7 +101,8 @@ app.post("/api/leads/__probe", (req, res) => {
 app.use("/auth", auth);
 app.use("/api/check-email", checkEmail);
 
-app.use("/", kpisTodaysRouter);
+app.use("/api", kpisTodaysRouter);
+
 
 
 app.use("/api", me);
