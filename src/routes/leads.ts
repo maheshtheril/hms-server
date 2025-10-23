@@ -209,6 +209,10 @@ router.get("/leads", requireSession, async (req: any, res: any, next: any) => {
 
     const flags = await getAdminFlags(cx, tenantId, userId);
     const isAdminish = flags.isPlatformAdmin || flags.isTenantAdmin || flags.isAdmin;
+
+    // If admin-ish and owner param provided → allow admin to filter by that owner.
+    // Otherwise, non-admins should only see their own leads. We also broaden the "own" definition
+    // to include leads where owner_id = user, created_by = user, or meta.assigned_to = user.
     const effectiveOwner = isAdminish ? ownerParam : (ownerParam || userId);
 
     const params: any[] = [tenantId];
@@ -229,21 +233,38 @@ router.get("/leads", requireSession, async (req: any, res: any, next: any) => {
       where tenant_id = $1
       ${deletedWhere}
     `;
+
+    // Build owner filter that is robust: check owner_id, created_by or meta->>'assigned_to'
+    let ownerFilterSQL = "";
     if (effectiveOwner) {
       params.push(effectiveOwner);
-      sql += ` and owner_id = $${params.length}\n`;
+      // Note: use the same param index for all OR'd checks so we can pass only one param value.
+      ownerFilterSQL = ` and (
+        owner_id = $${params.length}
+        OR created_by = $${params.length}
+        OR (meta->>'assigned_to') = $${params.length}
+      )\n`;
+      sql += ownerFilterSQL;
     }
+
     // apply pagination
     sql += ` order by created_at desc LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(pageSize, offset);
 
     const result = await cx.query(sql, params);
 
-    // count total (simple approach: separate count)
-    const countQ = await cx.query(
-      `select count(1) as cnt from public.lead where tenant_id = $1 ${deletedWhere}` + (effectiveOwner ? ` and owner_id = $2` : ""),
-      effectiveOwner ? [tenantId, effectiveOwner] : [tenantId]
-    );
+    // count total (matching same filters — ensure same deletedWhere & owner conditions)
+    let countSql = `select count(1) as cnt from public.lead where tenant_id = $1 ${deletedWhere}`;
+    const countParams: any[] = [tenantId];
+    if (effectiveOwner) {
+      countParams.push(effectiveOwner);
+      countSql += ` and (
+        owner_id = $2
+        OR created_by = $2
+        OR (meta->>'assigned_to') = $2
+      )`;
+    }
+    const countQ = await cx.query(countSql, countParams);
     const total = Number((countQ.rows?.[0]?.cnt) ?? result.rowCount);
 
     const items = result.rows;
