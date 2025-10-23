@@ -136,6 +136,26 @@ app.get("/api/admin/__health", (_req, res) =>
   res.json({ ok: true, where: "index mount layer" })
 );
 
+/* ────────────────────────────────────────────────────────────────────────────
+   Compatibility shims (non-invasive redirects)
+   These preserve your existing handlers and simply redirect legacy
+   frontend requests to the mounted /api endpoints.
+   - /kpis           -> /api/kpis
+   - /kpis/todays    -> /api/kpis/todays
+   These are safe, temporary, and can be removed once frontend is fixed.
+──────────────────────────────────────────────────────────────────────────── */
+app.get("/kpis", (req, res) => {
+  const qs = req.url.split("?")[1] || "";
+  const target = "/api/kpis" + (qs ? `?${qs}` : "");
+  res.redirect(307, target);
+});
+
+app.get("/kpis/todays", (req, res) => {
+  const qs = req.url.split("?")[1] || "";
+  const target = "/api/kpis/todays" + (qs ? `?${qs}` : "");
+  res.redirect(307, target);
+});
+
 /* ───────────────────────────── 404 handler ───────────────────────────── */
 app.use((req, res) => {
   res.status(404).json({ error: "not_found", path: req.path });
