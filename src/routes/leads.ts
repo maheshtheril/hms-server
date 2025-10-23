@@ -1,4 +1,3 @@
-// routes/leads.ts  (PASTE-OVER REPLACEMENT)  -- NOTIFY-injected version (patched)
 import * as cookie from "cookie";
 import { Router } from "express";
 import { pool } from "../db";
@@ -596,7 +595,7 @@ router.post("/leads/:id/move", requireSession, async (req: any, res: any, next: 
 
   const looksLikeUuid = (s: any) =>
     typeof s === "string" &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
 
   const cx = await pool.connect();
   try {
