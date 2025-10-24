@@ -1,5 +1,5 @@
-// routes/kpis.ts
-import { Router } from "express";
+// src/routes/kpis.ts
+import { Router, Request, Response, NextFunction } from "express";
 import { pool } from "../db";
 import { findSessionBySid, touchSession } from "../services/sessionService";
 
@@ -9,40 +9,35 @@ console.log("[kpis.ts] LOADED FROM", __filename);
 /**
  * Robust cookie parser: handles values that contain '='
  */
-function parseCookies(cookieHeader: string | undefined) {
+function parseCookies(cookieHeader: string | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   if (!cookieHeader) return out;
-  const parts = cookieHeader.split(";").map((s) => s.trim()).filter(Boolean);
+  const parts = cookieHeader
+    .split(";")
+    .map((s) => s.trim())
+    .filter(Boolean);
   for (const kv of parts) {
     const eq = kv.indexOf("=");
     if (eq === -1) continue;
     const key = kv.slice(0, eq).trim();
     const value = kv.slice(eq + 1).trim();
-    out[key] = decodeURIComponent(value);
+    try {
+      out[key] = decodeURIComponent(value);
+    } catch {
+      out[key] = value;
+    }
   }
   return out;
 }
 
-// diagnostic requireSession - paste over your existing requireSession in routes/kpis.ts
-// Replace existing requireSession with this in routes/kpis.ts
-// routes/kpis.ts (top)
-async function requireSession(req: any, res: any, next: any) {
+// diagnostic requireSession - replaces existing requireSession in routes/kpis.ts
+async function requireSession(req: Request & { session?: any }, res: Response, next: NextFunction) {
   try {
-    // log what server receives (temporary debug)
-    console.log('[requireSession] incoming cookie header ->', req.headers.cookie);
+    // debug: what server receives
+    console.log("[requireSession] incoming cookie header ->", req.headers.cookie);
 
-    // parse cookie header into object
-    const cookies = (req.headers.cookie || "")
-      .split(";")
-      .map(s => s.trim())
-      .filter(Boolean)
-      .reduce((acc: any, kv: string) => {
-        const [k, ...rest] = kv.split("=");
-        if (!k) return acc;
-        const v = rest.join("=");
-        acc[k] = decodeURIComponent(v || "");
-        return acc;
-      }, {});
+    // parse cookie header into object using helper
+    const cookies = parseCookies(req.headers.cookie as string | undefined);
 
     // try several common cookie names (robust)
     const sidCandidates = [
@@ -53,12 +48,13 @@ async function requireSession(req: any, res: any, next: any) {
       "session_id",
       "next-auth.session-token",
       "next-auth.callback-url",
-      "sid_token"
+      "sid_token",
     ];
-    let sid = null;
-    let sidName = null;
+
+    let sid: string | null = null;
+    let sidName: string | null = null;
     for (const name of sidCandidates) {
-      if (cookies[name]) {
+      if (typeof cookies[name] === "string" && cookies[name].length > 0) {
         sid = cookies[name];
         sidName = name;
         break;
@@ -67,22 +63,21 @@ async function requireSession(req: any, res: any, next: any) {
 
     // If still missing, also try to pick the longest cookie value (heuristic)
     if (!sid && Object.keys(cookies).length) {
-      // choose cookie with longest value (likely the session)
-      const kv = Object.entries(cookies).sort((a,b) => b[1].length - a[1].length)[0];
-      if (kv) {
+      const sorted = Object.entries(cookies).sort((a, b) => b[1].length - a[1].length);
+      const kv = sorted[0];
+      if (kv && kv[1] && kv[1].length > 0) {
         sid = kv[1];
         sidName = kv[0];
       }
     }
 
-    console.log('[requireSession] resolved sidName ->', sidName);
+    console.log("[requireSession] resolved sidName ->", sidName);
 
     if (!sid) {
       return res.status(401).json({ error: "unauthenticated" });
     }
 
-    // existing logic: findSessionBySid etc.
-    const { findSessionBySid } = require("../services/sessionService");
+    // find session by sid (imported at top)
     const sess = await findSessionBySid(sid);
     if (!sess) return res.status(401).json({ error: "invalid_session" });
 
@@ -93,17 +88,14 @@ async function requireSession(req: any, res: any, next: any) {
       company_id: (cookies.cid || sess.company_id) || null,
     };
 
-    const { touchSession } = require("../services/sessionService");
+    // touch session asynchronously (don't await)
     touchSession(sid).catch(() => {});
+
     next();
   } catch (e) {
     next(e);
   }
 }
-
-
-
-
 
 /**
  * GET /todays
@@ -115,7 +107,9 @@ router.get("/todays", requireSession, async (req: any, res: any, next: any) => {
     const userId = req.session?.user_id as string | null;
     if (!tenantId) return res.status(401).json({ error: "unauthenticated" });
 
-    const mine = String(req.query?.mine ?? "").toLowerCase() === "1" || String(req.query?.mine ?? "").toLowerCase() === "true";
+    const mine =
+      String(req.query?.mine ?? "").toLowerCase() === "1" ||
+      String(req.query?.mine ?? "").toLowerCase() === "true";
     const ownerParam = req.query?.owner ? String(req.query.owner) : null;
     const ownerFilter = mine ? userId : ownerParam;
 
