@@ -26,6 +26,8 @@ import uploadsRouter from "./routes/uploads";
 import checkEmail from "./routes/check-email";
 import kpisTodaysRouter from "./routes/kpis_todays";
 import kpisRouter from "./routes/kpis";
+import hmsDepartments from "./routes/hmsDepartments";
+import hmsSettingsRouter from "./routes/hmsSettings";
 
 
 /* ───────────────────────────── Express init ───────────────────────────── */
@@ -103,6 +105,7 @@ app.use("/api/check-email", checkEmail);
 
 app.use("/api", kpisTodaysRouter);
 
+app.use("/api/hms/departments", hmsDepartments);
 
 
 app.use("/api", me);
@@ -120,6 +123,7 @@ app.use("/api/admin/roles", adminRolesRouter);
 app.use("/api/admin/permissions", adminPermissionsRouter);
 app.use("/api/admin/companies", adminCompaniesRouter);
 app.use("/api/admin/custom-fields", adminCustomFieldsRouter);
+app.use("/api/hms/settings", hmsSettingsRouter);
 
 
 /* ───────────────────────────── Uploads, Tenants, Scheduler ───────────────────────────── */
