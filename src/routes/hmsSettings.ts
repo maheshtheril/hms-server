@@ -1,16 +1,16 @@
-// server/src/routes/hmsSettings.ts
 import { Router, Request, Response, NextFunction } from "express";
-import { q } from "../db"; // your DB helper that returns { rows, rowCount } or pg result
-import requireSession from "../middleware/requireSession"; // must attach req.session with tenant_id, user_id, flags
+import { q } from "../db";
+import requireSession from "../middleware/requireSession";
 
 const router = Router();
 
-/* --------------------------- small helpers --------------------------- */
+/* ---------------------------------------------------------------------
+   Helper Utilities
+------------------------------------------------------------------------ */
 function getRowCount(r: any): number {
   if (!r) return 0;
   if (typeof r.rowCount === "number") return r.rowCount;
   if (Array.isArray(r.rows)) return r.rows.length;
-  if (Array.isArray(r)) return r.length;
   return 0;
 }
 
@@ -18,48 +18,65 @@ function isObject(v: any): v is Record<string, any> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
-/* --------------------------- permissions --------------------------- */
-/**
- * allow write if session has is_tenant_admin || is_admin || is_platform_admin
- * or you can extend to check session.roles / permissions
- */
+/* ---------------------------------------------------------------------
+   Permission Checks
+------------------------------------------------------------------------ */
 function requireWrite(req: Request, res: Response, next: NextFunction) {
   const ss = (req as any).session;
   if (!ss) return res.status(401).json({ error: "unauthenticated" });
 
   if (ss.is_tenant_admin || ss.is_admin || ss.is_platform_admin) return next();
 
-  // optional: check roles array
+  // Optional roles array check
   // if (Array.isArray(ss.roles) && ss.roles.includes("hms_settings_write")) return next();
 
   return res.status(403).json({ error: "forbidden" });
 }
 
-/* --------------------------- routes --------------------------- */
+/* ---------------------------------------------------------------------
+   ROUTES
+------------------------------------------------------------------------ */
 
 /**
  * GET /
- * Returns the settings JSON for the current tenant.
- * If none exists returns { settings: {} } (HTTP 200).
+ * Fetch all HMS settings for the current tenant (optionally filtered by company_id or scope)
+ * Query params:
+ *    ?company_id=<uuid>
+ *    ?scope=tenant|company
  */
 router.get("/", requireSession, async (req: Request, res: Response) => {
   try {
-    const tenantId = (req as any).session.tenant_id;
-    const r = await q(`SELECT settings, updated_by, updated_at FROM hms_settings WHERE tenant_id = $1 LIMIT 1`, [
-      tenantId,
-    ]);
+    const ss = (req as any).session;
+    const tenantId = ss.tenant_id;
+    const companyId = req.query.company_id ?? null;
+    const scope = req.query.scope ?? "tenant";
 
-    if (getRowCount(r) === 0) {
-      return res.json({ tenantId, settings: {}, meta: { exists: false } });
+    const params: any[] = [tenantId];
+    let sql = `SELECT key, value, company_id, scope, updated_by, updated_at
+               FROM hms_settings WHERE tenant_id = $1`;
+
+    if (companyId) {
+      params.push(companyId);
+      sql += ` AND company_id = $${params.length}`;
     }
 
-    const row = r.rows?.[0];
-    return res.json({
+    if (scope) {
+      params.push(scope);
+      sql += ` AND scope = $${params.length}`;
+    }
+
+    const r = await q(sql, params);
+    const settings: Record<string, any> = {};
+    r.rows?.forEach((row: any) => {
+      settings[row.key] = row.value;
+    });
+
+    return res.status(200).json({
       tenantId,
-      settings: row.settings ?? {},
-      updatedBy: row.updated_by ?? null,
-      updatedAt: row.updated_at ?? null,
-      meta: { exists: true },
+      companyId,
+      scope,
+      settings,
+      meta: { count: getRowCount(r) },
     });
   } catch (err) {
     console.error("GET /api/hms/settings error:", err);
@@ -69,29 +86,38 @@ router.get("/", requireSession, async (req: Request, res: Response) => {
 
 /**
  * PUT /
- * Full replace of settings JSON object for the tenant.
- * Body: JSON object
+ * Full replace (overwrite) of settings for the current tenant & scope.
+ * Body: { scope?: "tenant"|"company", company_id?: uuid, settings: { key: value, ... } }
  */
 router.put("/", requireSession, requireWrite, async (req: Request, res: Response) => {
   try {
-    const tenantId = (req as any).session.tenant_id;
-    const actor = (req as any).session.user_id ?? null;
-    const incoming = req.body;
+    const ss = (req as any).session;
+    const tenantId = ss.tenant_id;
+    const actor = ss.user_id ?? null;
+    const { scope = "tenant", company_id = null, settings } = req.body;
 
-    if (!isObject(incoming)) {
+    if (!isObject(settings)) {
       return res.status(400).json({ error: "invalid_payload" });
     }
 
-    const sql = `
-      INSERT INTO hms_settings (tenant_id, settings, updated_by, updated_at)
-      VALUES ($1, $2::jsonb, $3, now())
-      ON CONFLICT (tenant_id)
-      DO UPDATE SET settings = $2::jsonb, updated_by = $3, updated_at = now()
-      RETURNING tenant_id, settings, updated_by, updated_at
-    `;
+    // Delete existing for scope + company
+    await q(
+      `DELETE FROM hms_settings WHERE tenant_id = $1 AND scope = $2 AND (company_id IS NOT DISTINCT FROM $3)`,
+      [tenantId, scope, company_id]
+    );
 
-    const r = await q(sql, [tenantId, JSON.stringify(incoming), actor]);
-    return res.status(200).json({ success: true, data: r.rows?.[0] ?? null });
+    // Insert all settings
+    const inserts = Object.entries(settings).map(([key, value]) =>
+      q(
+        `INSERT INTO hms_settings (tenant_id, company_id, key, value, scope, updated_by, updated_at)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6, now())`,
+        [tenantId, company_id, key, JSON.stringify(value), scope, actor]
+      )
+    );
+
+    await Promise.all(inserts);
+
+    return res.status(200).json({ success: true, replaced: Object.keys(settings).length });
   } catch (err) {
     console.error("PUT /api/hms/settings error:", err);
     return res.status(500).json({ error: "settings_save_failed" });
@@ -100,36 +126,32 @@ router.put("/", requireSession, requireWrite, async (req: Request, res: Response
 
 /**
  * PATCH /
- * Partial merge (shallow) of existing settings with provided object.
- * Body: JSON object (fields to merge)
+ * Partial merge (upsert) — updates or inserts only provided keys.
+ * Body: { scope?: "tenant"|"company", company_id?: uuid, patch: { key: value, ... } }
  */
 router.patch("/", requireSession, requireWrite, async (req: Request, res: Response) => {
   try {
-    const tenantId = (req as any).session.tenant_id;
-    const actor = (req as any).session.user_id ?? null;
-    const patch = req.body;
+    const ss = (req as any).session;
+    const tenantId = ss.tenant_id;
+    const actor = ss.user_id ?? null;
+    const { scope = "tenant", company_id = null, patch } = req.body;
 
     if (!isObject(patch)) {
       return res.status(400).json({ error: "invalid_payload" });
     }
 
-    // load existing
-    const getR = await q(`SELECT settings FROM hms_settings WHERE tenant_id = $1 LIMIT 1`, [tenantId]);
-    const existing = getRowCount(getR) === 0 ? {} : (getR.rows?.[0]?.settings ?? {});
+    const upserts = Object.entries(patch).map(([key, value]) =>
+      q(
+        `INSERT INTO hms_settings (tenant_id, company_id, key, value, scope, updated_by, updated_at)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6, now())
+         ON CONFLICT (tenant_id, company_id, key)
+         DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()`,
+        [tenantId, company_id, key, JSON.stringify(value), scope, actor]
+      )
+    );
 
-    // shallow merge — replace fields at top-level; use deep merge if needed
-    const merged = { ...existing, ...patch };
-
-    const sql = `
-      INSERT INTO hms_settings (tenant_id, settings, updated_by, updated_at)
-      VALUES ($1, $2::jsonb, $3, now())
-      ON CONFLICT (tenant_id)
-      DO UPDATE SET settings = $2::jsonb, updated_by = $3, updated_at = now()
-      RETURNING tenant_id, settings, updated_by, updated_at
-    `;
-
-    const r = await q(sql, [tenantId, JSON.stringify(merged), actor]);
-    return res.status(200).json({ success: true, data: r.rows?.[0] ?? null });
+    await Promise.all(upserts);
+    return res.status(200).json({ success: true, patched: Object.keys(patch).length });
   } catch (err) {
     console.error("PATCH /api/hms/settings error:", err);
     return res.status(500).json({ error: "settings_patch_failed" });
@@ -137,9 +159,42 @@ router.patch("/", requireSession, requireWrite, async (req: Request, res: Respon
 });
 
 /**
- * Optional: DELETE /_dev/reset  — dev only (tenant-admin)
- * Removes the tenant's settings. Only include if you want it.
- * Keep it out of production or protect with stricter checks.
+ * DELETE /
+ * Delete one key or all settings for given scope/company
+ * Query: ?key=xyz or ?all=true
+ */
+router.delete("/", requireSession, requireWrite, async (req: Request, res: Response) => {
+  try {
+    const ss = (req as any).session;
+    const tenantId = ss.tenant_id;
+    const companyId = req.query.company_id ?? null;
+    const scope = req.query.scope ?? "tenant";
+    const key = req.query.key ?? null;
+    const all = req.query.all === "true";
+
+    if (!key && !all) {
+      return res.status(400).json({ error: "missing_key_or_all" });
+    }
+
+    const params: any[] = [tenantId, scope, companyId];
+    let sql = `DELETE FROM hms_settings WHERE tenant_id = $1 AND scope = $2 AND (company_id IS NOT DISTINCT FROM $3)`;
+
+    if (!all && key) {
+      params.push(key);
+      sql += ` AND key = $${params.length}`;
+    }
+
+    const r = await q(sql, params);
+    return res.status(200).json({ success: true, deleted: r.rowCount ?? 0 });
+  } catch (err) {
+    console.error("DELETE /api/hms/settings error:", err);
+    return res.status(500).json({ error: "settings_delete_failed" });
+  }
+});
+
+/**
+ * POST /_dev/reset
+ * Developer endpoint — wipes all settings for tenant (use only in non-prod)
  */
 router.post("/_dev/reset", requireSession, requireWrite, async (req: Request, res: Response) => {
   try {
