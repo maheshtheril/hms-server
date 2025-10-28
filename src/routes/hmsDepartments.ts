@@ -1,4 +1,3 @@
-// server/src/routes/hmsDepartments.ts
 import { Router, Request, Response, NextFunction } from "express";
 import { q } from "../db";
 import requireSession from "../middleware/requireSession";
@@ -77,6 +76,24 @@ async function isParentCycle(candidateParentId: string, childId: string, tenantI
 /* --------------------------- Routes --------------------------- */
 
 /**
+ * Utility: parse a query/body param into a boolean
+ * Accepts boolean, number 1/0, string "true"/"false"/"1"/"0" (case-insensitive)
+ */
+function parseBooleanParam(v: unknown): boolean {
+  if (v === true) return true;
+  if (v === false) return false;
+  if (v === 1 || v === "1") return true;
+  if (v === 0 || v === "0") return false;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (s === "true" || s === "1") return true;
+    return false;
+  }
+  // `ParsedQs` or other objects are not booleans
+  return false;
+}
+
+/**
  * GET /api/hms/departments
  * Query params:
  *  - company_id (uuid) optional
@@ -97,7 +114,7 @@ router.get("/", requireSession, async (req: Request, res: Response) => {
     const includeDeletedRaw = Array.isArray(req.query.include_deleted)
       ? req.query.include_deleted[0]
       : req.query.include_deleted;
-    const includeDeleted = String(includeDeletedRaw) === "true";
+    const includeDeleted = parseBooleanParam(includeDeletedRaw);
 
     const params: any[] = [tenantId];
     let where = `d.tenant_id = $1`;
@@ -111,12 +128,7 @@ router.get("/", requireSession, async (req: Request, res: Response) => {
 
     if (rawActive !== undefined && rawActive !== null && String(rawActive).trim() !== "") {
       // Accept boolean, string "true"/"false", "1"/"0"
-      const a = rawActive;
-      const activeBool =
-        a === true ||
-        a === "true" ||
-        a === "1" ||
-        (typeof a === "string" && a.trim().toLowerCase() === "true");
+      const activeBool = parseBooleanParam(rawActive);
       params.push(activeBool);
       where += ` AND d.is_active = $${params.length}`;
     }
@@ -190,7 +202,7 @@ router.get("/:id", requireSession, async (req: Request, res: Response) => {
     const tenantId: string = String(ss.tenant_id);
 
     const includeDeletedParam = Array.isArray(req.query.include_deleted) ? req.query.include_deleted[0] : req.query.include_deleted;
-    const includeDeleted = String(includeDeletedParam) === "true";
+    const includeDeleted = parseBooleanParam(includeDeletedParam);
 
     const id = String(req.params.id || "").trim();
     if (!isValidUUID(id)) return res.status(400).json({ error: "invalid_id" });
