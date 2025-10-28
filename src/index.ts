@@ -28,6 +28,8 @@ import kpisTodaysRouter from "./routes/kpis_todays";
 import kpisRouter from "./routes/kpis";
 import hmsDepartments from "./routes/hmsDepartments";
 import hmsSettingsRouter from "./routes/hmsSettings";
+import hmsPatientsRouter from "./routes/hmsPatients";
+import hmsPatientInsights from "./routes/hmsPatientInsights";
 
 
 /* ───────────────────────────── Express init ───────────────────────────── */
@@ -124,7 +126,8 @@ app.use("/api/admin/permissions", adminPermissionsRouter);
 app.use("/api/admin/companies", adminCompaniesRouter);
 app.use("/api/admin/custom-fields", adminCustomFieldsRouter);
 app.use("/api/hms/settings", hmsSettingsRouter);
-
+app.use("/api/hms/patients", hmsPatientsRouter);
+app.use("/api/hms", hmsPatientInsights); 
 
 /* ───────────────────────────── Uploads, Tenants, Scheduler ───────────────────────────── */
 app.use("/api/uploads", uploadsRouter);
