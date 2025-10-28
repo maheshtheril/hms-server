@@ -257,12 +257,14 @@ router.post("/", requireSession, requireWrite, async (req: Request, res: Respons
       is_active: rawIsActive = true,
     } = body;
 
-    // Normalize + trim
+    // Normalize + trim, with defensive handling for empty strings
     const name = typeof rawName === "string" ? rawName.trim() : rawName;
-    const company_id = typeof rawCompanyId === "string" ? rawCompanyId.trim() : rawCompanyId;
+    let company_id = typeof rawCompanyId === "string" ? rawCompanyId.trim() : rawCompanyId;
+    if (company_id === "") company_id = null;
     const code = rawCode === null || rawCode === undefined ? null : String(rawCode).trim();
     const description = rawDescription === null || rawDescription === undefined ? null : String(rawDescription).trim();
-    const parent_id = rawParentId === null || rawParentId === undefined ? null : String(rawParentId).trim();
+    let parent_id = rawParentId === null || rawParentId === undefined ? null : String(rawParentId).trim();
+    if (parent_id === "") parent_id = null;
     const is_active = rawIsActive === true || rawIsActive === "true" || rawIsActive === 1 || rawIsActive === "1";
 
     if (!name || typeof name !== "string") {
@@ -336,12 +338,14 @@ router.put("/:id", requireSession, requireWrite, async (req: Request, res: Respo
 
     if (!isValidUUID(id)) return res.status(400).json({ error: "invalid_id" });
 
-    // Normalize + trim
+    // Normalize + trim, with defensive handling for empty strings
     const name = typeof rawName === "string" ? rawName.trim() : rawName;
-    const company_id = typeof rawCompanyId === "string" ? rawCompanyId.trim() : rawCompanyId;
+    let company_id = typeof rawCompanyId === "string" ? rawCompanyId.trim() : rawCompanyId;
+    if (company_id === "") company_id = null;
     const code = rawCode === null || rawCode === undefined ? null : String(rawCode).trim();
     const description = rawDescription === null || rawDescription === undefined ? null : String(rawDescription).trim();
-    const parent_id = rawParentId === null || rawParentId === undefined ? null : String(rawParentId).trim();
+    let parent_id = rawParentId === null || rawParentId === undefined ? null : String(rawParentId).trim();
+    if (parent_id === "") parent_id = null;
     const is_active = rawIsActive === true || rawIsActive === "true" || rawIsActive === 1 || rawIsActive === "1";
 
     if (!name || typeof name !== "string") return res.status(400).json({ error: "invalid_name" });
@@ -430,9 +434,14 @@ router.patch("/:id", requireSession, requireWrite, async (req: Request, res: Res
     const name = patch.name !== undefined ? (typeof patch.name === "string" ? patch.name.trim() : patch.name) : current.name;
     const code = patch.code !== undefined ? (patch.code === null ? null : String(patch.code).trim()) : current.code;
     const description = patch.description !== undefined ? (patch.description === null ? null : String(patch.description).trim()) : current.description;
-    const parent_id = patch.parent_id !== undefined ? (patch.parent_id === null ? null : String(patch.parent_id).trim()) : current.parent_id;
+
+    let parent_id = patch.parent_id !== undefined ? (patch.parent_id === null ? null : String(patch.parent_id).trim()) : current.parent_id;
+    if (parent_id === "") parent_id = null;
+
     const is_active = patch.is_active !== undefined ? (patch.is_active === true || patch.is_active === "true" || patch.is_active === 1 || patch.is_active === "1") : current.is_active;
-    const company_id = patch.company_id !== undefined ? (typeof patch.company_id === "string" ? patch.company_id.trim() : patch.company_id) : current.company_id;
+
+    let company_id = patch.company_id !== undefined ? (typeof patch.company_id === "string" ? patch.company_id.trim() : patch.company_id) : current.company_id;
+    if (company_id === "") company_id = null;
 
     if (!name || typeof name !== "string") return res.status(400).json({ error: "invalid_name" });
     if (!company_id || !isValidUUID(company_id)) return res.status(400).json({ error: "invalid_company_id" });

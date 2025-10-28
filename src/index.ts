@@ -30,6 +30,7 @@ import hmsDepartments from "./routes/hmsDepartments";
 import hmsSettingsRouter from "./routes/hmsSettings";
 import hmsPatientsRouter from "./routes/hmsPatients";
 import hmsPatientInsights from "./routes/hmsPatientInsights";
+import hmsClinicians from "./routes/hmsClinicians";
 
 
 /* ───────────────────────────── Express init ───────────────────────────── */
@@ -167,6 +168,7 @@ app.use("/api/admin/custom-fields", adminCustomFieldsRouter);
 app.use("/api/hms/settings", hmsSettingsRouter);
 app.use("/api/hms/patients", hmsPatientsRouter);
 app.use("/api/hms", hmsPatientInsights); 
+app.use("/api/hms/clinicians", hmsClinicians);
 
 /* ───────────────────────────── Uploads, Tenants, Scheduler ───────────────────────────── */
 app.use("/api/uploads", uploadsRouter);
