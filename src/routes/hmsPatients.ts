@@ -1,97 +1,443 @@
-import { Router } from "express";
+// server/src/routes/hmsPatients.ts
+import { Router, Request, Response } from "express";
 import { q } from "../db";
 import requireSession from "../middleware/requireSession";
+import { v4 as uuidv4 } from "uuid";
+import { validate as isUuid } from "uuid";
+import { generatePatientNumber } from "../lib/ids";
+import { callAi } from "../lib/ai";
 
 const router = Router();
 
 /**
- * GET /hms/patients
+ * Helper: extract tenant_id from session (enforce multi-tenant)
  */
-router.get("/", requireSession, async (req, res) => {
+function getTenantId(req: Request): string | null {
+  // requireSession will ensure req.session exists (but double-check)
+  // session shape inferred from your auth.ts
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const s = (req as any).session;
+  return s?.tenant_id || s?.company_id || null;
+}
+
+/**
+ * Helper: normalize name payloads
+ * - If payload.name exists and first_name is missing, split name into first_name / last_name.
+ * - Mutates the body object for convenience.
+ */
+function normalizeNameFields(body: Record<string, any>) {
+  if (!body || typeof body !== "object") return;
+  if (body.name && !body.first_name) {
+    const raw = String(body.name).trim();
+    if (raw.length === 0) {
+      body.first_name = "";
+      body.last_name = null;
+      return;
+    }
+    const parts = raw.split(/\s+/);
+    body.first_name = parts.shift() || "";
+    body.last_name = parts.length > 0 ? parts.join(" ") : null;
+  }
+}
+
+/**
+ * GET /hms/patients
+ * Query params:
+ *  - q: text query (fuzzy on name/patient_number)
+ *  - status
+ *  - limit, offset
+ */
+router.get("/", requireSession, async (req: Request, res: Response) => {
   try {
-    const { tenant_id } = req.session!;
-    const { rows } = await q(
-      `SELECT * FROM hms_patient WHERE tenant_id = $1 ORDER BY created_at DESC`,
-      [tenant_id]
-    );
-    res.json(rows);
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(403).json({ error: "missing_tenant" });
+
+    const qText = String(req.query.q || "").trim();
+    const status = req.query.status ? String(req.query.status) : null;
+    const limit = Math.min(Number(req.query.limit) || 50, 500);
+    const offset = Number(req.query.offset) || 0;
+
+    // Basic search: if q provided use trigram/tsv indexes; otherwise simple tenant listing
+    if (qText) {
+      const qResult = await q(
+        `SELECT id, tenant_id, company_id, patient_number, first_name, last_name, dob, gender, contact, metadata, status, created_at, updated_at
+           FROM public.hms_patient
+          WHERE tenant_id = $1
+            AND (to_tsvector('simple', COALESCE(first_name,'') || ' ' || COALESCE(last_name,'')) @@ plainto_tsquery('simple', $2)
+                 OR patient_number ILIKE '%' || $2 || '%'
+                 OR (contact::text ILIKE '%' || $2 || '%'))
+          ORDER BY created_at DESC
+          LIMIT $3 OFFSET $4`,
+        [tenantId, qText, limit, offset]
+      );
+      return res.json({ rows: qResult.rows, total: qResult.rowCount });
+    }
+
+    // default list
+    const params: any[] = [tenantId, limit, offset];
+    let whereExtra = "";
+    if (status) {
+      whereExtra = ` AND status = $4`;
+      params.splice(2, 0, status); // ensure params order matches $4 being status
+    }
+
+    const listQ =
+      whereExtra.length > 0
+        ? `SELECT id, tenant_id, company_id, patient_number, first_name, last_name, dob, gender, contact, metadata, status, created_at, updated_at
+            FROM public.hms_patient
+           WHERE tenant_id = $1 ${whereExtra}
+           ORDER BY created_at DESC
+           LIMIT $3 OFFSET $4`
+        : `SELECT id, tenant_id, company_id, patient_number, first_name, last_name, dob, gender, contact, metadata, status, created_at, updated_at
+            FROM public.hms_patient
+           WHERE tenant_id = $1
+           ORDER BY created_at DESC
+           LIMIT $2 OFFSET $3`;
+
+    const rows = (await q(listQ, params)).rows;
+    return res.json({ rows, total: rows.length });
   } catch (err) {
-    console.error("GET /hms/patients:", err);
-    res.status(500).json({ error: "fetch_failed" });
+    console.error("GET /hms/patients error:", err);
+    return res.status(500).json({ error: "list_failed" });
   }
 });
 
 /**
  * POST /hms/patients
+ * Create a new patient
  */
-router.post("/", requireSession, async (req, res) => {
+router.post("/", requireSession, async (req: Request, res: Response) => {
   try {
-    const { tenant_id, user_id } = req.session!;
-    const { name, dob, gender, phone } = req.body;
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(403).json({ error: "missing_tenant" });
+
+    const userId = (req as any).session?.user_id || null;
+    const body = req.body || {};
+
+    // Normalize 'name' -> first_name/last_name (if provided)
+    normalizeNameFields(body);
+
+    const first_name = (body.first_name || "").trim();
+    const last_name = (body.last_name || "").trim();
+    if (!first_name) return res.status(400).json({ error: "first_name_required" });
+
+    // auto-generate patient_number if not provided
+    let patient_number = body.patient_number || null;
+    if (!patient_number) {
+      patient_number = await generatePatientNumber(tenantId);
+    }
+
+    // basic JSON fields
+    const identifiers = body.identifiers || {};
+    const contact = body.contact || {};
+    const metadata = body.metadata || {};
+    const dob = body.dob ? new Date(body.dob) : null;
+    const gender = body.gender || null;
+    const external_id = body.external_id || null;
+    const company_id = body.company_id || null;
+
+    const id = body.id && isUuid(body.id) ? body.id : uuidv4();
+
+    const insertQ = `
+      INSERT INTO public.hms_patient
+        (id, tenant_id, company_id, patient_number, first_name, last_name, dob, gender, identifiers, contact, metadata, created_by, updated_by, external_id, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      RETURNING id, patient_number, first_name, last_name, dob, gender, identifiers, contact, metadata, status, created_at, updated_at
+    `;
+
+    const params = [
+      id,
+      tenantId,
+      company_id,
+      patient_number,
+      first_name,
+      last_name || null,
+      dob,
+      gender,
+      JSON.stringify(identifiers),
+      JSON.stringify(contact),
+      JSON.stringify(metadata),
+      userId,
+      userId,
+      external_id,
+      body.status || "active",
+    ];
+
+    const { rows } = await q(insertQ, params);
+    const created = rows[0];
+
+    // optional: trigger background AI job via callAi stub (non-blocking)
+    if (created) {
+      // best effort — don't fail create if AI fails
+      callAi("patient.created", { patientId: created.id, tenantId }).catch((e) =>
+        console.error("AI hook failed (patient.created):", e)
+      );
+    }
+
+    return res.status(201).json({ patient: created });
+  } catch (err) {
+    console.error("POST /hms/patients error:", err);
+    if ((err as any).code === "23505") {
+      // unique violation (e.g., patient_number unique per tenant)
+      return res.status(409).json({ error: "patient_conflict" });
+    }
+    return res.status(500).json({ error: "create_failed" });
+  }
+});
+
+/**
+ * GET /hms/patients/:id
+ */
+router.get("/:id", requireSession, async (req: Request, res: Response) => {
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(403).json({ error: "missing_tenant" });
+
+    const id = req.params.id;
+    if (!isUuid(id)) return res.status(400).json({ error: "invalid_id" });
 
     const { rows } = await q(
-      `INSERT INTO hms_patient (tenant_id, name, dob, gender, phone, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       RETURNING *`,
-      [tenant_id, name, dob, gender, phone, user_id]
+      `SELECT id, tenant_id, company_id, patient_number, first_name, last_name, dob, gender, identifiers, contact, metadata, status, created_at, updated_at, external_id, merged_into
+         FROM public.hms_patient
+        WHERE id = $1 AND tenant_id = $2
+        LIMIT 1`,
+      [id, tenantId]
     );
-    res.json(rows[0]);
+    const row = rows[0];
+    if (!row) return res.status(404).json({ error: "not_found" });
+    return res.json({ patient: row });
   } catch (err) {
-    console.error("POST /hms/patients:", err);
-    res.status(500).json({ error: "create_failed" });
+    console.error("GET /hms/patients/:id error:", err);
+    return res.status(500).json({ error: "fetch_failed" });
   }
 });
 
 /**
  * PUT /hms/patients/:id
+ * Update patient (full replace semantics)
  */
-router.put("/:id", requireSession, async (req, res) => {
+router.put("/:id", requireSession, async (req: Request, res: Response) => {
   try {
-    const { tenant_id, user_id } = req.session!;
-    const { id } = req.params;
-    const { name, dob, gender, phone } = req.body;
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(403).json({ error: "missing_tenant" });
 
-    const { rows } = await q(
-      `UPDATE hms_patient
-          SET name=$1, dob=$2, gender=$3, phone=$4, updated_by=$5, updated_at=NOW()
-        WHERE id=$6 AND tenant_id=$7
-        RETURNING *`,
-      [name, dob, gender, phone, user_id, id, tenant_id]
-    );
-    res.json(rows[0]);
+    const id = req.params.id;
+    if (!isUuid(id)) return res.status(400).json({ error: "invalid_id" });
+
+    // ensure exists & belongs to tenant
+    const existing = await q(`SELECT id FROM public.hms_patient WHERE id = $1 AND tenant_id = $2 LIMIT 1`, [id, tenantId]);
+    if (!existing.rows[0]) return res.status(404).json({ error: "not_found" });
+
+    const body = req.body || {};
+
+    // Normalize 'name' -> first_name/last_name
+    normalizeNameFields(body);
+
+    const first_name = (body.first_name || "").trim();
+    if (!first_name) return res.status(400).json({ error: "first_name_required" });
+
+    const last_name = body.last_name || null;
+    const dob = body.dob ? new Date(body.dob) : null;
+    const gender = body.gender || null;
+    const identifiers = body.identifiers || {};
+    const contact = body.contact || {};
+    const metadata = body.metadata || {};
+    const external_id = body.external_id || null;
+    const updated_by = (req as any).session?.user_id || null;
+    const status = body.status || "active";
+
+    const updateQ = `
+      UPDATE public.hms_patient
+         SET first_name = $1,
+             last_name = $2,
+             dob = $3,
+             gender = $4,
+             identifiers = $5,
+             contact = $6,
+             metadata = $7,
+             external_id = $8,
+             updated_by = $9,
+             status = $10,
+             updated_at = now()
+       WHERE id = $11 AND tenant_id = $12
+       RETURNING id, patient_number, first_name, last_name, dob, gender, identifiers, contact, metadata, status, created_at, updated_at, external_id
+    `;
+    const params = [
+      first_name,
+      last_name,
+      dob,
+      gender,
+      JSON.stringify(identifiers),
+      JSON.stringify(contact),
+      JSON.stringify(metadata),
+      external_id,
+      updated_by,
+      status,
+      id,
+      tenantId,
+    ];
+    const { rows } = await q(updateQ, params);
+    return res.json({ patient: rows[0] });
   } catch (err) {
-    console.error("PUT /hms/patients:", err);
-    res.status(500).json({ error: "update_failed" });
+    console.error("PUT /hms/patients/:id error:", err);
+    return res.status(500).json({ error: "update_failed" });
+  }
+});
+
+/**
+ * PATCH /hms/patients/:id — partial update (sparse)
+ */
+router.patch("/:id", requireSession, async (req: Request, res: Response) => {
+  // For brevity: implement partial update by reading existing record, merging and updating
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(403).json({ error: "missing_tenant" });
+
+    const id = req.params.id;
+    if (!isUuid(id)) return res.status(400).json({ error: "invalid_id" });
+
+    const { rows: existingRows } = await q(`SELECT * FROM public.hms_patient WHERE id = $1 AND tenant_id = $2 LIMIT 1`, [id, tenantId]);
+    const existing = existingRows[0];
+    if (!existing) return res.status(404).json({ error: "not_found" });
+
+    // Merge JSON columns carefully
+    const body = req.body || {};
+
+    // Normalize 'name' -> first_name/last_name in the incoming patch body
+    normalizeNameFields(body);
+
+    const updated = {
+      first_name: body.first_name ?? existing.first_name,
+      last_name: body.last_name ?? existing.last_name,
+      dob: body.dob ? new Date(body.dob) : existing.dob,
+      gender: body.gender ?? existing.gender,
+      identifiers: { ...(existing.identifiers || {}), ...(body.identifiers || {}) },
+      contact: { ...(existing.contact || {}), ...(body.contact || {}) },
+      metadata: { ...(existing.metadata || {}), ...(body.metadata || {}) },
+      external_id: body.external_id ?? existing.external_id,
+      status: body.status ?? existing.status,
+      updated_by: (req as any).session?.user_id || existing.updated_by,
+    };
+
+    const updateQ = `
+      UPDATE public.hms_patient
+         SET first_name = $1,
+             last_name = $2,
+             dob = $3,
+             gender = $4,
+             identifiers = $5,
+             contact = $6,
+             metadata = $7,
+             external_id = $8,
+             status = $9,
+             updated_by = $10,
+             updated_at = now()
+       WHERE id = $11 AND tenant_id = $12
+       RETURNING id, patient_number, first_name, last_name, dob, gender, identifiers, contact, metadata, status, created_at, updated_at, external_id
+    `;
+    const params = [
+      updated.first_name,
+      updated.last_name,
+      updated.dob,
+      updated.gender,
+      JSON.stringify(updated.identifiers),
+      JSON.stringify(updated.contact),
+      JSON.stringify(updated.metadata),
+      updated.external_id,
+      updated.status,
+      updated.updated_by,
+      id,
+      tenantId,
+    ];
+    const { rows } = await q(updateQ, params);
+    return res.json({ patient: rows[0] });
+  } catch (err) {
+    console.error("PATCH /hms/patients/:id error:", err);
+    return res.status(500).json({ error: "patch_failed" });
   }
 });
 
 /**
  * DELETE /hms/patients/:id
+ * Soft-delete by setting status = 'deleted' and merged_into if provided
  */
-router.delete("/:id", requireSession, async (req, res) => {
+router.delete("/:id", requireSession, async (req: Request, res: Response) => {
   try {
-    const { tenant_id } = req.session!;
-    const { id } = req.params;
-    await q(`DELETE FROM hms_patient WHERE id=$1 AND tenant_id=$2`, [id, tenant_id]);
-    res.json({ ok: true });
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(403).json({ error: "missing_tenant" });
+
+    const id = req.params.id;
+    if (!isUuid(id)) return res.status(400).json({ error: "invalid_id" });
+
+    const mergedInto = req.body?.merged_into ?? null;
+    const updated_by = (req as any).session?.user_id || null;
+
+    const { rows } = await q(
+      `UPDATE public.hms_patient
+          SET status = 'deleted', merged_into = $1, updated_by = $2, updated_at = now()
+        WHERE id = $3 AND tenant_id = $4
+        RETURNING id`,
+      [mergedInto, updated_by, id, tenantId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "not_found" });
+
+    // non-blocking AI hook
+    callAi("patient.deleted", { patientId: id, tenantId }).catch((e) =>
+      console.error("AI hook failed (patient.deleted):", e)
+    );
+
+    return res.json({ ok: true });
   } catch (err) {
-    console.error("DELETE /hms/patients:", err);
-    res.status(500).json({ error: "delete_failed" });
+    console.error("DELETE /hms/patients/:id error:", err);
+    return res.status(500).json({ error: "delete_failed" });
   }
 });
 
 /**
- * AI HOOK: POST /hms/patients/ai/summary
- * - Input: patient_id
- * - Output: summary text (AI-ready stub)
+ * AI-ready endpoint: POST /hms/patients/:id/ai/summary
+ * Returns a generated clinical summary (stub calling lib/ai)
  */
-router.post("/ai/summary", requireSession, async (req, res) => {
-  const { patient_id } = req.body;
-  // Placeholder: In the future, connect to your LLM service.
-  res.json({
-    patient_id,
-    summary: "[AI placeholder] Summary for patient will be generated here.",
-  });
+router.post("/:id/ai/summary", requireSession, async (req: Request, res: Response) => {
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(403).json({ error: "missing_tenant" });
+    const id = req.params.id;
+    if (!isUuid(id)) return res.status(400).json({ error: "invalid_id" });
+
+    // Fetch core patient demographics + recent encounters (limit 10)
+    const [{ rows: pr }] = [await q(`SELECT id, first_name, last_name, dob, gender, identifiers, contact, metadata FROM public.hms_patient WHERE id = $1 AND tenant_id = $2 LIMIT 1`, [id, tenantId])];
+    const patient = pr[0];
+    if (!patient) return res.status(404).json({ error: "not_found" });
+
+    // Fetch recent encounters (lightweight)
+    const enc = await q(
+      `SELECT id, encounter_date, summary, metadata
+         FROM public.hms_encounter
+        WHERE patient_id = $1 AND tenant_id = $2
+        ORDER BY encounter_date DESC
+        LIMIT 10`,
+      [id, tenantId]
+    );
+
+    // call AI service (synchronous) — may be slow: keep a timeout client-side; this is a convenience endpoint
+    const promptPayload = {
+      patient,
+      recentEncounters: enc.rows,
+    };
+
+    const summary = await callAi("generate_patient_summary", promptPayload);
+    // Optionally persist summary into metadata.ai_summary (not mandatory)
+    await q(`UPDATE public.hms_patient SET metadata = metadata || $1::jsonb, updated_at = now() WHERE id = $2 AND tenant_id = $3`, [
+      JSON.stringify({ ai_summary: summary }),
+      id,
+      tenantId,
+    ]);
+
+    return res.json({ summary });
+  } catch (err) {
+    console.error("POST /hms/patients/:id/ai/summary error:", err);
+    return res.status(500).json({ error: "ai_summary_failed" });
+  }
 });
 
 export default router;
