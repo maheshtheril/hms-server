@@ -1,19 +1,26 @@
 {
   "compilerOptions": {
+    /* ---------------- Core Targets ---------------- */
     "target": "ES2022",
-    "lib": ["ES2022"],
+    "lib": ["ES2022", "DOM"],              // ✅ Add DOM to support fetch, RequestInfo, etc.
     "module": "CommonJS",
     "moduleResolution": "Node",
     "esModuleInterop": true,
-    "skipLibCheck": true,
+    "resolveJsonModule": true,
 
+    /* ---------------- Type Checking ---------------- */
     "strict": false,
     "noImplicitAny": false,
-
-    "resolveJsonModule": true,
+    "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "outDir": "dist",
-    "types": ["node"]
+
+    /* ---------------- Environment & Output ---------------- */
+    "types": ["node"],                     // ✅ Node built-ins (fs, path, process, etc.)
+    "outDir": "dist",                      // compiled JS output directory
+
+    /* ---------------- Future-Safe Options ---------------- */
+    "allowSyntheticDefaultImports": true,
+    "noEmitOnError": false
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist"]
