@@ -40,6 +40,45 @@ app.set("trust proxy", 1); // required for secure cookies on Render
 // APP_ORIGIN may be comma-separated: "https://site1.com,http://localhost:3000"
 const rawOrigins = (process.env.APP_ORIGIN || "http://localhost:3000").split(",");
 const ALLOWED_ORIGINS = rawOrigins.map((s) => s.trim()).filter(Boolean);
+// === Debug routes (for Render diagnostics) ===
+app.get("/api/_debug", (_req, res) => {
+  res.json({
+    ok: true,
+    env: process.env.NODE_ENV || "development",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get("/api/_routes", (_req, res) => {
+  try {
+    let listEndpoints: any = null;
+    try { listEndpoints = require("express-list-endpoints"); } catch { listEndpoints = null; }
+
+    if (listEndpoints) {
+      const endpoints = listEndpoints(app);
+      return res.json({ ok: true, endpoints });
+    }
+
+    const routes: Array<{ method: string; path: string }> = [];
+    function walk(stack: any[]) {
+      for (const layer of stack) {
+        if (layer.route && layer.route.path) {
+          const methods = Object.keys(layer.route.methods || {})
+            .map((m) => m.toUpperCase())
+            .join(",");
+          routes.push({ method: methods || "ALL", path: layer.route.path });
+        } else if (layer.name === "router" && layer.handle && layer.handle.stack) {
+          walk(layer.handle.stack);
+        }
+      }
+    }
+    if (app._router && app._router.stack) walk(app._router.stack);
+    return res.json({ ok: true, endpoints: routes });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: "failed_to_list_routes", message: String(err) });
+  }
+});
+// === end debug routes ===
 
 app.use(
   cors({
