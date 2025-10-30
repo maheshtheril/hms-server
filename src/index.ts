@@ -32,6 +32,12 @@ import hmsPatientsRouter from "./routes/hmsPatients";
 import hmsPatientInsights from "./routes/hmsPatientInsights";
 import hmsClinicians from "./routes/hmsClinicians";
 import hmsCliniciansRouter from "./routes/hmsClinicians";
+import hmsAppointments from "./routes/hmsAppointments";
+import stockRouter from "./routes/hmsStock";
+import hmsPurchasesRouter from "./routes/hmsPurchases";
+import hmsReceiptsRouter from "./routes/hmsReceipts";
+import hmsInvoicesRouter from "./routes/hmsInvoices";
+
 
 
 
@@ -173,6 +179,11 @@ app.use("/api/hms/patients", hmsPatientsRouter);
 app.use("/api/hms", hmsPatientInsights); 
 app.use("/api/hms/clinicians", hmsClinicians);
 app.use("/api/hms/clinicians", hmsCliniciansRouter);
+app.use("/hms/appointments", hmsAppointments);
+app.use("/hms/stock", stockRouter);
+app.use("/hms/purchases", hmsPurchasesRouter);
+app.use("/hms/receipts", hmsReceiptsRouter);
+app.use("/hms/invoices", hmsInvoicesRouter);
 
 /* ───────────────────────────── Uploads, Tenants, Scheduler ───────────────────────────── */
 app.use("/api/uploads", uploadsRouter);
