@@ -3,12 +3,13 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-// server/src/routes/tenant-signup.ts
+// src/routes/tenant-signup.ts
 const express_1 = require("express");
 const crypto_1 = require("crypto");
 const bcryptjs_1 = __importDefault(require("bcryptjs"));
 const db_1 = require("../db");
 const provisionTenant_1 = require("../services/provisionTenant");
+const session_1 = require("../lib/session"); // <- added import
 const router = (0, express_1.Router)();
 /* ───────────────── Password policy ───────────────── */
 const PASSWORD_POLICY = {
@@ -153,7 +154,7 @@ router.post("/", async (req, res) => {
             }
             catch (err) {
                 if (err?.code === "23505")
-                    continue; // unique violation on slug -> try next
+                    continue; // slug unique violation → try next
                 throw err;
             }
         }
@@ -164,7 +165,7 @@ router.post("/", async (req, res) => {
             id: companyId,
             tenant_id: tenantId,
             name: company_name,
-            enabled: true, // kept if column exists; buildInsert filters safely
+            enabled: true, // safe: buildInsert filters
             created_at: now,
         };
         const companyIns = buildInsert("public.company", companyCols, companyWanted);
@@ -175,8 +176,8 @@ router.post("/", async (req, res) => {
             tenant_id: tenantId,
             email: email_lc,
             name: user_name,
-            password: passwordHash, // your schema uses "password"
-            is_admin: true, // optional flags in your schema
+            password: passwordHash, // column is "password"
+            is_admin: true,
             is_tenant_admin: true,
             is_active: true,
             created_at: now,
@@ -200,18 +201,31 @@ router.post("/", async (req, res) => {
             }
             catch (err) {
                 if (err?.code !== "23505")
-                    throw err; // ignore duplicate default
+                    throw err; // ignore duplicate
             }
         }
+        // ─ RBAC bootstrap within the SAME transaction ─
+        await (0, provisionTenant_1.provisionTenantRBAC)(cx, { tenantId, ownerUserId: userId });
         await cx.query("COMMIT");
         began = false;
-        // ─ RBAC provision (non-blocking), pass the SAME client to satisfy PoolClient type
+        // ======= NEW: issue session and set cookie immediately after successful signup =======
         try {
-            await (0, provisionTenant_1.provisionTenantRBAC)(cx, { tenantId, ownerUserId: userId });
+            const sid = await (0, session_1.issueSession)(userId, tenantId);
+            const isProd = process.env.NODE_ENV === "production";
+            const cookieName = process.env.COOKIE_NAME_SID || "sid";
+            res.cookie(cookieName, sid, {
+                httpOnly: true,
+                sameSite: isProd ? "none" : "lax",
+                secure: isProd,
+                path: "/",
+                maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+            });
         }
-        catch (e) {
-            console.error("[tenant-signup] RBAC", e);
+        catch (sessErr) {
+            console.error("[tenant-signup] failed to issue session cookie:", sessErr);
+            // do not fail signup — still return success to client
         }
+        // ================================================================================
         return res.status(201).json({ ok: true, tenantId, companyId, userId });
     }
     catch (err) {

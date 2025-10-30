@@ -105,20 +105,24 @@ router.post(
       return res.status(422).json(errBody);
     }
 
-    const payload = {
+        const payload = {
       tenantId: session.tenantId,
       companyId: session.companyId ?? null,
       patient_id: body.patient_id,
       clinician_id: body.clinician_id,
-      starts_at: starts.toISOString(),
-      ends_at: ends.toISOString(),
+      starts_at: new Date(starts).toISOString(),
+      ends_at: new Date(ends).toISOString(),
       notes: body.notes ?? null,
       createdBy: session.userId,
       type: body.type,
       mode: body.mode,
-      priority: body.priority,
+      // coerce priority to string (or undefined) to satisfy CreatePayload
+      priority: body.priority === undefined || body.priority === null
+        ? undefined
+        : String(body.priority),
       source: body.source ?? "api"
     };
+
 
     const result = await svc.createAppointment(payload);
 

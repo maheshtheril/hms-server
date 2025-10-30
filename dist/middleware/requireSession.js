@@ -1,9 +1,39 @@
 "use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", { value: true });
-const cookie_1 = __importDefault(require("cookie"));
+const cookie = __importStar(require("cookie"));
 const db_1 = require("../db");
 const sessionService_1 = require("../services/sessionService");
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -17,14 +47,11 @@ const requireSession = (req, res, next) => {
     (async () => {
         const r = req;
         // Prefer cookie-parser if present; fall back to manual parse
-        const parsed = r.cookies ??
-            (r.headers?.cookie ? cookie_1.default.parse(r.headers.cookie) : {});
-        const sid = parsed?.sid ||
-            parsed?.ssr_sid ||
-            parsed?.SESSION_ID ||
-            parsed?.session_id ||
-            null;
+        const parsed = r.cookies ?? (r.headers?.cookie ? cookie.parse(r.headers.cookie) : {});
+        const sid = parsed?.sid || parsed?.ssr_sid || parsed?.SESSION_ID || parsed?.session_id || null;
         if (!sid) {
+            // Helpful debug log for missing cookie (useful for mobile / CORS issues)
+            console.warn("[requireSession] missing sid cookie. parsed cookies:", parsed, "origin:", req.headers.origin);
             res.status(401).json({ error: "unauthenticated" });
             return;
         }
@@ -37,9 +64,7 @@ const requireSession = (req, res, next) => {
             sid: String(s.sid),
             user_id: String(s.user_id),
             tenant_id: String(s.tenant_id),
-            active_company_id: s.active_company_id != null
-                ? String(s.active_company_id)
-                : null,
+            active_company_id: s.active_company_id != null ? String(s.active_company_id) : null,
         };
         const tenantId = r.session.tenant_id;
         const userId = r.session.user_id;
@@ -112,10 +137,13 @@ const requireSession = (req, res, next) => {
             }
             r.company = { active_company_id: active ?? null };
             r.session.active_company_id = active ?? null;
+            // Use environment-aware cookie options so mobile / cross-origin works correctly
+            const isProd = process.env.NODE_ENV === "production";
             res.cookie("active_company_id", active ?? "", {
                 httpOnly: true,
-                sameSite: "lax",
-                secure: process.env.NODE_ENV === "production",
+                sameSite: isProd ? "none" : "lax",
+                secure: isProd,
+                path: "/",
                 maxAge: 30 * 24 * 60 * 60 * 1000,
             });
         }
