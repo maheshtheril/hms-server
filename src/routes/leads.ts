@@ -1,1363 +1,193 @@
-import * as cookie from "cookie";
+// server/src/routes/leads.ts
 import { Router } from "express";
-import { pool } from "../db";
-import { findSessionBySid, touchSession } from "../services/sessionService";
+import { q } from "../db"; // your q helper that returns { rows }
+import requireSession from "../middleware/requireSession";
+import { v4 as uuidv4 } from "uuid";
 
 const router = Router();
-console.log("[leads.ts] LOADED FROM", __filename);
 
-/* ────────────────────────────────────────────────────────────────────────────
-   Auth middleware → puts tenant_id, user_id, company_id on req.session
-   Accepts optional company switch via header `x-company-id` or cookie `cid`
-──────────────────────────────────────────────────────────────────────────── */
-async function requireSession(req: any, res: any, next: any) {
+// Create lead
+router.post("/", requireSession, async (req, res) => {
   try {
-    const cookiesObj = cookie.parse(req.headers.cookie || "");
-    const sid = cookiesObj.sid || cookiesObj.ssr_sid;
-    if (!sid) return res.status(401).json({ error: "unauthenticated" });
-
-    const sess = await findSessionBySid(sid); // ideally returns { sid, user_id, tenant_id, company_id? }
-    if (!sess) return res.status(401).json({ error: "invalid_session" });
-
-    const headerCompany = (req.headers["x-company-id"] as string | undefined)?.trim();
-    const cookieCompany = (cookiesObj.cid as string | undefined)?.trim();
-
-    req.session = {
-      sid: sess.sid,
-      user_id: sess.user_id,
-      tenant_id: sess.tenant_id,
-      company_id: (headerCompany || cookieCompany || (sess as any).company_id || null) || null,
-    };
-
-    touchSession(sid).catch(() => {});
-    next();
-  } catch (err) {
-    next(err);
-  }
-}
-
-/* ────────────────────────────────────────────────────────────────────────────
-   Helpers
-──────────────────────────────────────────────────────────────────────────── */
-async function getAdminFlags(cx: any, tenantId: string, userId: string) {
-  try {
-    const q = await cx.query(
-      `select
-         coalesce(is_platform_admin, false) as is_platform_admin,
-         coalesce(is_tenant_admin,  false) as is_tenant_admin,
-         coalesce(is_admin,         false) as is_admin
-       from public.app_user
-      where id = $1 and tenant_id = $2
-      limit 1`,
-      [userId, tenantId]
-    );
-    const r = q.rows[0] || {};
-    return {
-      isPlatformAdmin: !!r.is_platform_admin,
-      isTenantAdmin:   !!r.is_tenant_admin,
-      isAdmin:         !!r.is_admin,
-    };
-  } catch {
-    return { isPlatformAdmin: false, isTenantAdmin: false, isAdmin: false };
-  }
-}
-
-async function setAppContext(cx: any, tenantId: string, userId: string, companyId?: string | null) {
-  await cx.query(`select set_config('app.tenant_id', $1::text, true)`, [tenantId]);
-  await cx.query(`select set_config('app.user_id',   $1::text, true)`, [userId]);
-  if (companyId) {
-    await cx.query(`select set_config('app.company_id', $1::text, true)`, [companyId]);
-  }
-}
-
-/** Resolve a sensible default company when session doesn’t have it */
-async function resolveDefaultCompanyId(cx: any, tenantId: string, userId: string) {
-  // 1) user default
-  const u = await cx.query(
-    `select company_id from public.app_user where id = $1 and tenant_id = $2 limit 1`,
-    [userId, tenantId]
-  );
-  if (u.rows[0]?.company_id) return u.rows[0].company_id as string;
-
-  // 2) single company fallback
-  const companies = await cx.query(`select id from public.company where tenant_id = $1`, [tenantId]);
-  if (companies.rowCount === 1) return companies.rows[0].id as string;
-
-  return null;
-}
-
-/* ────────────────────────────────────────────────────────────────────────────
-   POST /api/leads/:id/restore
-──────────────────────────────────────────────────────────────────────────── */
-router.post("/leads/:id/restore", requireSession, async (req: any, res: any, next: any) => {
-  const tenantId = req.session?.tenant_id as string | null;
-  const userId   = req.session?.user_id as string | null;
-  const leadId   = req.params.id as string;
-  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
-
-  const cx = await pool.connect();
-  try {
-    await cx.query("BEGIN");
-    await setAppContext(cx, tenantId, userId, req.session?.company_id);
-
-    const upd = await cx.query(
-      `
-      update public.lead
-         set meta = jsonb_strip_nulls( (coalesce(meta, '{}'::jsonb) - 'deleted_at' - 'deleted_by') ),
-             updated_at = now()
-       where id = $1 and tenant_id = $2
-       returning id
-      `,
-      [leadId, tenantId]
-    );
-
-    await cx.query("COMMIT");
-
-    // notify after commit
-    try {
-      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "restored" })]);
-    } catch (notifyErr) {
-      console.error("NOTIFY leads_changed failed:", notifyErr);
-    }
-
-    if (upd.rowCount === 0) return res.status(404).json({ error: "not_found" });
-    return res.json({ ok: true, id: upd.rows[0].id });
-  } catch (err) {
-    try { await cx.query("ROLLBACK"); } catch {}
-    next(err);
-  } finally {
-    cx.release();
-  }
-});
-
-/* ────────────────────────────────────────────────────────────────────────────
-   DELETE /api/leads/:id  (soft delete)
-──────────────────────────────────────────────────────────────────────────── */
-router.delete("/leads/:id", requireSession, async (req: any, res: any, next: any) => {
-  const tenantId = req.session?.tenant_id as string | null;
-  const userId   = req.session?.user_id as string | null;
-  const leadId   = req.params.id as string;
-  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
-
-  const cx = await pool.connect();
-  try {
-    await cx.query("BEGIN");
-    await setAppContext(cx, tenantId, userId, req.session?.company_id);
-
-    const upd = await cx.query(
-      `
-      update public.lead
-         set meta = jsonb_strip_nulls(
-               coalesce(meta, '{}'::jsonb) ||
-               jsonb_build_object('deleted_at', to_jsonb(now()), 'deleted_by', to_jsonb($3::uuid))
-             ),
-             updated_at = now()
-       where id = $1
-         and tenant_id = $2
-         and (meta->>'deleted_at') is null
-       returning id
-      `,
-      [leadId, tenantId, userId]
-    );
-
-    await cx.query("COMMIT");
-
-    // notify after commit
-    try {
-      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "deleted" })]);
-    } catch (notifyErr) {
-      console.error("NOTIFY leads_changed failed:", notifyErr);
-    }
-
-    if (upd.rowCount === 0) return res.status(404).json({ error: "not_found_or_already_deleted" });
-    return res.status(204).end();
-  } catch (err) {
-    try { await cx.query("ROLLBACK"); } catch {}
-    next(err);
-  } finally {
-    cx.release();
-  }
-});
-
-/* ────────────────────────────────────────────────────────────────────────────
-   GET /api/leads  (include_deleted/only_deleted, owner filter)
-   RETURNS { items, total, page, pageSize } for frontend compatibility
-──────────────────────────────────────────────────────────────────────────── */
-router.get("/leads", requireSession, async (req: any, res: any, next: any) => {
-  const tenantId = req.session?.tenant_id as string | null;
-  const userId   = req.session?.user_id as string | null;
-  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
-
-  const truthy = (v: any) => ["1","true","yes","on"].includes(String(v ?? "").toLowerCase());
-  const includeDeleted = truthy(req.query.include_deleted);
-  const onlyDeleted    = truthy(req.query.only_deleted);
-  const ownerParam     = (req.query.owner ? String(req.query.owner) : undefined);
-
-  const deletedWhere = onlyDeleted
-    ? "and (meta->>'deleted_at') is not null"
-    : (includeDeleted ? "" : "and (meta->>'deleted_at') is null");
-
-  // pagination support (optional, default: return all but prefer page)
-  const page = Math.max(1, Number(req.query.page || 1));
-  const pageSize = Math.min(200, Math.max(1, Number(req.query.pageSize || 100))); // limit pageSize to 200
-  const offset = (page - 1) * pageSize;
-
-  const cx = await pool.connect();
-  try {
-    await setAppContext(cx, tenantId, userId, req.session?.company_id);
-
-    const flags = await getAdminFlags(cx, tenantId, userId);
-    const isAdminish = flags.isPlatformAdmin || flags.isTenantAdmin || flags.isAdmin;
-
-    // If admin-ish and owner param provided → allow admin to filter by that owner.
-    // Otherwise, non-admins should only see their own leads. We also broaden the "own" definition
-    // to include leads where owner_id = user, created_by = user, or meta.assigned_to = user.
-    const effectiveOwner = isAdminish ? ownerParam : (ownerParam || userId);
-
-    const params: any[] = [tenantId];
-    let sql = `
-      select
-        id, tenant_id, company_id, owner_id, pipeline_id, stage_id,
-        name,
-        primary_email as email,
-        coalesce(primary_phone, primary_phone_e164) as phone,
-        primary_phone_e164,
-        source_id, status, stage,
-        estimated_value, probability, tags, meta,
-        (meta->>'deleted_at') is not null          as deleted,
-        (meta->>'deleted_at')::timestamptz         as deleted_at,
-        (meta->>'deleted_by')::uuid                as deleted_by,
-        created_by, created_at, updated_at
-      from public.lead
-      where tenant_id = $1
-      ${deletedWhere}
-    `;
-
-    // Build owner filter that is robust: check owner_id, created_by or meta->>'assigned_to'
-    let ownerFilterSQL = "";
-    if (effectiveOwner) {
-      params.push(effectiveOwner);
-      // Note: use the same param index for all OR'd checks so we can pass only one param value.
-      ownerFilterSQL = ` and (
-  owner_id::text = $${params.length}
-  OR created_by::text = $${params.length}
-  OR (meta->>'assigned_to') = $${params.length}
-)\n`;
-
-      sql += ownerFilterSQL;
-    }
-
-    // apply pagination
-    sql += ` order by created_at desc LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-    params.push(pageSize, offset);
-
-    const result = await cx.query(sql, params);
-
-    // count total (matching same filters — ensure same deletedWhere & owner conditions)
-    let countSql = `select count(1) as cnt from public.lead where tenant_id = $1 ${deletedWhere}`;
-    const countParams: any[] = [tenantId];
-    if (effectiveOwner) {
-      countParams.push(effectiveOwner);
-      countSql += ` and (
-  owner_id::text = $2
-  OR created_by::text = $2
-  OR (meta->>'assigned_to') = $2
-)`;
-
-    }
-    const countQ = await cx.query(countSql, countParams);
-    const total = Number((countQ.rows?.[0]?.cnt) ?? result.rowCount);
-
-    const items = result.rows;
-
-    return res.json({ items, total, page, pageSize });
-  } catch (err) {
-    next(err);
-  } finally {
-    cx.release();
-  }
-});
-
-/* ────────────────────────────────────────────────────────────────────────────
-   GET /api/leads/:id  (detail + notes + tasks)
-──────────────────────────────────────────────────────────────────────────── */
-router.get("/leads/:id", requireSession, async (req: any, res: any, next: any) => {
-  const tenantId = req.session?.tenant_id as string | null;
-  const userId   = req.session?.user_id as string | null;
-  const leadId   = req.params.id as string;
-  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
-
-  const cx = await pool.connect();
-  try {
-    await setAppContext(cx, tenantId, userId, req.session?.company_id);
-
-    const leadQ = await cx.query(
-      `
-      select
-        id, tenant_id, company_id, owner_id, pipeline_id, stage_id,
-        name,
-        primary_email as email,
-        coalesce(primary_phone, primary_phone_e164) as phone,
-        primary_phone_e164,
-        source_id, status, stage,
-        estimated_value, probability, tags, meta,
-        created_by, created_at, updated_at
-      from public.lead
-      where id = $1 and tenant_id = $2
-      limit 1
-      `,
-      [leadId, tenantId]
-    );
-    if (leadQ.rowCount === 0) return res.status(404).json({ error: "not_found" });
-
-    const notesQ = await cx.query(
-      `
-      select id, lead_id, body, author_id, created_at
-      from public.lead_note
-      where lead_id = $1 and tenant_id = $2
-      order by created_at desc
-      `,
-      [leadId, tenantId]
-    );
-
-    const tasksQ = await cx.query(
-      `
-      select id, lead_id, title, status, due_date, assigned_to, created_by, created_at, completed_at
-      from public.lead_task
-      where lead_id = $1 and tenant_id = $2
-      order by created_at desc
-      `,
-      [leadId, tenantId]
-    );
-
-    res.json({ lead: leadQ.rows[0], notes: notesQ.rows, tasks: tasksQ.rows });
-  } catch (err) {
-    next(err);
-  } finally {
-    cx.release();
-  }
-});
-
-/* ────────────────────────────────────────────────────────────────────────────
-   POST /api/leads  (CREATE) → prefers session company id
-   TEMP: replaced hardcoded company id with env var DEFAULT_COMPANY_ID
-──────────────────────────────────────────────────────────────────────────── */
-router.post("/leads", requireSession, async (req: any, res: any, next: any) => {
-  const {
-    lead_name, name, title,
-    email,
-    phone, phone_e164,
-    assigned_user_id,
-    owner_id,
-    company_id,
-    estimated_value,
-    probability,
-    tags,
-    source_id,
-    pipeline_id,
-    stage_id,
-    meta,
-  } = req.body || {};
-
-  try {
-    const finalName: string = String(lead_name || name || title || "").trim();
-    if (!finalName) return res.status(400).json({ error: "lead_name_required" });
-
-    const tenantId = req.session?.tenant_id as string | null;
-    const userId   = req.session?.user_id as string | null;
-    if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
-
-    const estVal =
-      estimated_value === undefined || estimated_value === null || estimated_value === ""
-        ? null
-        : Number(estimated_value);
-    const prob =
-      probability === undefined || probability === null || probability === ""
-        ? null
-        : Math.min(100, Math.max(0, Number(probability)));
-    const tagArr: string[] = Array.isArray(tags) ? tags : [];
-    const safeMeta = meta && typeof meta === "object" ? meta : {};
-
-    const cx = await pool.connect();
-    try {
-      await cx.query("BEGIN");
-
-      // resolve company
-      let finalCompanyId: string | null = null;
-
-      if (company_id) {
-        const ok = await cx.query(
-          `select 1 from public.company where id = $1 and tenant_id = $2 limit 1`,
-          [company_id, tenantId]
-        );
-        if (ok.rowCount === 0) {
-          await cx.query("ROLLBACK");
-          return res.status(400).json({ error: "invalid_company_id" });
-        }
-        finalCompanyId = company_id;
-      } else if (req.session?.company_id) {
-        const ok = await cx.query(
-          `select 1 from public.company where id = $1 and tenant_id = $2 limit 1`,
-          [req.session.company_id, tenantId]
-        );
-        if (ok.rowCount) finalCompanyId = req.session.company_id;
-      }
-
-      if (!finalCompanyId) {
-        finalCompanyId = await resolveDefaultCompanyId(cx, tenantId, userId);
-      }
-
-      // REPLACED HARD-CODE: use env var if you absolutely must fallback in dev
-      if (!finalCompanyId && process.env.DEFAULT_COMPANY_ID) {
-        finalCompanyId = String(process.env.DEFAULT_COMPANY_ID);
-      }
-
-      if (!finalCompanyId) {
-        await cx.query("ROLLBACK");
-        return res.status(400).json({ error: "company_required" });
-      }
-
-      await setAppContext(cx, tenantId, userId, finalCompanyId);
-
-      const ins = await cx.query(
-        `
-        insert into public.lead
-          (tenant_id, company_id, owner_id, pipeline_id, stage_id,
-           name, primary_email, primary_phone, primary_phone_e164,
-           source_id, status,
-           estimated_value, probability, tags, meta,
-           created_by)
-        values
-          ($1,        $2,         $3,       $4,         $5,
-           $6,        $7,          $8,       $9,
-           $10,       $11,
-           $12,       $13,         $14,      $15,
-           $16)
-        returning
-          id, tenant_id, company_id, owner_id, pipeline_id, stage_id,
-          name, primary_email as email,
-          coalesce(primary_phone, primary_phone_e164) as phone,
-          primary_phone_e164,
-          source_id, status, stage,
-          estimated_value, probability, tags, meta,
-          created_by, created_at, updated_at
-        `,
-        [
-          tenantId,
-          finalCompanyId,
-          (owner_id ?? assigned_user_id ?? userId) ?? null,
-          pipeline_id ?? null,
-          stage_id ?? null,
-
-          finalName,
-          email ?? null,
-          null,
-          (phone_e164 || phone) ?? null,
-
-          source_id ?? null,
-          "new",
-
-          estVal,
-          prob,
-          tagArr,
-          safeMeta,
-
-          userId,
-        ]
-      );
-
-      await cx.query("COMMIT");
-
-      // notify after commit
-      try {
-        const createdId = ins.rows?.[0]?.id ?? null;
-        await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: createdId, action: "created" })]);
-      } catch (notifyErr) {
-        console.error("NOTIFY leads_changed failed:", notifyErr);
-      }
-
-      res.status(201).json({ lead: ins.rows[0] });
-    } catch (err: any) {
-      try { await cx.query("ROLLBACK"); } catch {}
-      if (err?.code === "23503") {
-        return res.status(400).json({ error: "foreign_key_violation", detail: err?.detail });
-      }
-      next(err);
-    } finally {
-      cx.release();
-    }
-
-  } catch (err) {
-    next(err);
-  }
-});
-
-/* ────────────────────────────────────────────────────────────────────────────
-   PATCH /api/leads/:id
-──────────────────────────────────────────────────────────────────────────── */
-router.patch("/leads/:id", requireSession, async (req: any, res: any, next: any) => {
-  const tenantId = req.session?.tenant_id as string | null;
-  const userId   = req.session?.user_id as string | null;
-  const leadId   = req.params.id as string;
-  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
-
-  const {
-    name, email, phone, phone_e164, status, stage,
-    owner_id, company_id, pipeline_id, stage_id,
-    estimated_value, probability, tags, meta,
-  } = req.body || {};
-  const tagArr = Array.isArray(tags) ? tags : undefined;
-
-  const cx = await pool.connect();
-  try {
-    await cx.query("BEGIN");
-    await setAppContext(cx, tenantId, userId, req.session?.company_id);
-
-    const upd = await cx.query(
-      `
-      update public.lead
-      set
-        name = coalesce($2, name),
-        primary_email = coalesce($3, primary_email),
-        primary_phone_e164 = coalesce($4, primary_phone_e164),
-        status = coalesce($5, status),
-        stage = coalesce($6, stage),
-        owner_id = coalesce($7, owner_id),
-        company_id = coalesce($8, company_id),
-        pipeline_id = coalesce($9, pipeline_id),
-        stage_id = coalesce($10, stage_id),
-        estimated_value = coalesce($11, estimated_value),
-        probability = coalesce($12, probability),
-        tags = coalesce($13, tags),
-        meta = case
-          when $14::jsonb is null then meta
-          else jsonb_strip_nulls(coalesce(meta, '{}'::jsonb) || $14::jsonb)
-        end,
-        updated_at = now()
-      where id = $1 and tenant_id = $15
-      returning
-        id, tenant_id, company_id, owner_id, pipeline_id, stage_id,
-        name, primary_email as email,
-        coalesce(primary_phone, primary_phone_e164) as phone,
-        primary_phone_e164,
-        source_id, status, stage,
-        estimated_value, probability, tags, meta,
-        created_by, created_at, updated_at
-      `,
+    const user = (req as any).session;
+    const tenant_id = user.tenant_id;
+    const company_id = user.active_company_id || null;
+    const created_by = user.user_id;
+
+    const {
+      name,
+      primary_email,
+      primary_phone,
+      pipeline_id = null,
+      stage_id = null,
+      owner_id = null,
+      estimated_value = 0,
+      probability = 0,
+      priority = 3,
+      custom_data = {},
+      tags = [],
+      meta = {},
+    } = req.body || {};
+
+    if (!name) return res.status(400).json({ error: "missing_name" });
+
+    const id = uuidv4();
+    // Insert lead
+    await q(
+      `INSERT INTO public.lead
+         (id, tenant_id, company_id, owner_id, pipeline_id, stage_id, name, primary_email, primary_phone,
+          estimated_value, probability, priority, custom_data, tags, meta, created_by, created_at, updated_at)
+       VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now(),now())`,
       [
-        leadId,
-        name ?? null,
-        email ?? null,
-        (phone_e164 ?? phone) ?? null,
-        status ?? null,
-        stage ?? null,
-        owner_id ?? null,
-        company_id ?? null,
-        pipeline_id ?? null,
-        stage_id ?? null,
-        estimated_value !== undefined ? Number(estimated_value) : null,
-        probability !== undefined ? Math.min(100, Math.max(0, Number(probability))) : null,
-        tagArr ?? null,
-        meta ?? null,
-        tenantId,
+        id,
+        tenant_id,
+        company_id,
+        owner_id,
+        pipeline_id,
+        stage_id,
+        name,
+        primary_email,
+        primary_phone,
+        estimated_value,
+        probability,
+        priority,
+        JSON.stringify(custom_data),
+        tags || [],
+        JSON.stringify(meta),
+        created_by,
       ]
     );
 
-    await cx.query("COMMIT");
-
-    // notify after commit
-    try {
-      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "updated" })]);
-    } catch (notifyErr) {
-      console.error("NOTIFY leads_changed failed:", notifyErr);
-    }
-
-    if (upd.rowCount === 0) return res.status(404).json({ error: "not_found" });
-    res.json({ lead: upd.rows[0] });
-  } catch (err) {
-    try { await cx.query("ROLLBACK"); } catch {}
-    next(err);
-  } finally {
-    cx.release();
-  }
-});
-
-/* ────────────────────────────────────────────────────────────────────────────
-   POST /leads/:id/move
-──────────────────────────────────────────────────────────────────────────── */
-router.post("/leads/:id/move", requireSession, async (req: any, res: any, next: any) => {
-  const tenantId = req.session?.tenant_id as string | null;
-  const userId   = req.session?.user_id as string | null;
-  const leadId   = req.params.id as string;
-  const { stage_id, stage } = req.body || {};
-  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
-  if (!stage_id && (!stage || !String(stage).trim())) {
-    return res.status(400).json({ error: "stage_or_stage_id_required" });
-  }
-
-  const looksLikeUuid = (s: any) =>
-    typeof s === "string" &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
-
-  const cx = await pool.connect();
-  try {
-    await cx.query("BEGIN");
-    await setAppContext(cx, tenantId, userId, req.session?.company_id);
-
-    let newStageName:  string | null = null;
-    let newStageId:    string | null = null;
-    let newPipelineId: string | null = null;
-
-    async function probePipelineStageByIdOrName(key: string) {
-      const cols = await cx.query(
-        `select column_name from information_schema.columns
-          where table_schema='public' and table_name='pipeline_stage'`
-      );
-      const set = new Set(cols.rows.map((r: any) => r.column_name as string));
-      const hasTenant = set.has("tenant_id");
-
-      { // by id
-        const where = hasTenant ? "where id::text = $1 and tenant_id = $2" : "where id::text = $1";
-        const params: any[] = hasTenant ? [key, tenantId] : [key];
-        const q = await cx.query(
-          `select id, name, pipeline_id from public.pipeline_stage ${where} limit 1`,
-          params
-        );
-        if ((q?.rowCount ?? 0) > 0) return q.rows[0];
-
-      }
-      { // by name
-        const where = hasTenant ? "where lower(name) = lower($1) and tenant_id = $2" : "where lower(name) = lower($1)";
-        const params: any[] = hasTenant ? [key, tenantId] : [key];
-        const q = await cx.query(
-          `select id, name, pipeline_id from public.pipeline_stage ${where} limit 1`,
-          params
-        );
-        if ((q?.rowCount ?? 0) > 0) return q.rows[0];
-
-      }
-      return null;
-    }
-
-    async function resolveAsName(nameVal: string) {
-      const nm = String(nameVal).trim();
-      try {
-        const rec = await probePipelineStageByIdOrName(nm);
-        if (rec) { newStageId = rec.id; newStageName = rec.name; newPipelineId = rec.pipeline_id ?? null; }
-        else { newStageId = null; newStageName = nm; }
-      } catch (e: any) {
-        if (e?.code === "42P01") { newStageId = null; newStageName = nm; }
-        else throw e;
-      }
-    }
-
-    if (stage && String(stage).trim()) {
-      await resolveAsName(stage);
-    } else if (stage_id) {
-      if (!looksLikeUuid(stage_id)) {
-        await resolveAsName(stage_id);
-      } else {
-        try {
-          const rec = await probePipelineStageByIdOrName(stage_id);
-          if (rec) { newStageId = rec.id; newStageName = rec.name; newPipelineId = rec.pipeline_id ?? null; }
-          else { await resolveAsName(stage_id); }
-        } catch (e: any) {
-          if (e?.code === "42P01") { newStageId = null; newStageName = String(stage_id); }
-          else throw e;
-        }
-      }
-    }
-
-    if (!newStageName) return res.status(400).json({ error: "unable_to_resolve_stage" });
-
-    const upd = await cx.query(
-      `
-      update public.lead
-         set stage      = $3,
-             stage_id   = $4,
-             pipeline_id= coalesce($5, pipeline_id),
-             updated_at = now()
-       where id = $1 and tenant_id = $2
-       returning id, stage, stage_id, pipeline_id, updated_at
-      `,
-      [leadId, tenantId, newStageName, newStageId, newPipelineId]
+    // record activity (optional)
+    await q(
+      `INSERT INTO public.lead_activity (id, lead_id, tenant_id, actor_id, action_key, payload, created_at, company_id)
+       VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, now(), $6::uuid)`,
+      [id, tenant_id, created_by, "lead.created", JSON.stringify({ name }), company_id]
     );
 
-    await cx.query("COMMIT");
-
-    // notify after commit
-    try {
-      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "moved" })]);
-    } catch (notifyErr) {
-      console.error("NOTIFY leads_changed failed:", notifyErr);
-    }
-
-    if (upd.rowCount === 0) return res.status(404).json({ error: "not_found" });
-    res.json({ lead: upd.rows[0] });
+    const { rows } = await q(`SELECT * FROM public.lead WHERE id = $1 LIMIT 1`, [id]);
+    return res.json({ data: rows[0] });
   } catch (err) {
-    try { await cx.query("ROLLBACK"); } catch {}
-    next(err);
-  } finally {
-    cx.release();
+    console.error("POST /api/leads error:", err);
+    return res.status(500).json({ error: "create_lead_failed" });
   }
 });
 
-/* ────────────────────────────────────────────────────────────────────────────
-   Notes & Tasks
-──────────────────────────────────────────────────────────────────────────── */
-router.post("/leads/:id/notes", requireSession, async (req: any, res: any, next: any) => {
-  const tenantId = req.session?.tenant_id as string | null;
-  const userId   = req.session?.user_id as string | null;
-  const leadId   = req.params.id as string;
-  const { body } = req.body || {};
-  if (!body || !String(body).trim()) return res.status(400).json({ error: "note_body_required" });
-
-  const cx = await pool.connect();
+// Get list of leads
+router.get("/", requireSession, async (req, res) => {
   try {
-    await setAppContext(cx, tenantId!, userId!, req.session?.company_id);
-
-    const ins = await cx.query(
-      `
-      insert into public.lead_note (tenant_id, lead_id, body, author_id)
-      values ($1, $2, $3, $4)
-      returning id, lead_id, body, author_id, created_at
-      `,
-      [tenantId, leadId, String(body), userId]
-    );
-
-    // notify about notes added (helps dashboards that care)
-    try {
-      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "note_added" })]);
-    } catch (notifyErr) {
-      console.error("NOTIFY leads_changed failed:", notifyErr);
-    }
-
-    res.status(201).json({ note: ins.rows[0] });
+    const user = (req as any).session;
+    const tenant_id = user.tenant_id;
+    // basic listing; you likely want pagination, filters, tenancy enforcement
+    const { rows } = await q(`SELECT * FROM public.lead WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 200`, [tenant_id]);
+    res.json({ data: rows });
   } catch (err) {
-    next(err);
-  } finally {
-    cx.release();
+    console.error("GET /api/leads error:", err);
+    return res.status(500).json({ error: "list_leads_failed" });
   }
 });
 
-router.post("/leads/:id/tasks", requireSession, async (req: any, res: any, next: any) => {
-  const tenantId = req.session?.tenant_id as string | null;
-  const userId   = req.session?.user_id as string | null;
-  const leadId   = req.params.id as string;
-  const { title, due_date } = req.body || {};
-  if (!title || !String(title).trim()) return res.status(400).json({ error: "task_title_required" });
-
-  const cx = await pool.connect();
+// Get single lead
+router.get("/:id", requireSession, async (req, res) => {
   try {
-    await setAppContext(cx, tenantId!, userId!, req.session?.company_id);
-
-    const ins = await cx.query(
-      `
-      insert into public.lead_task (tenant_id, lead_id, title, status, due_date, created_by)
-      values ($1, $2, $3, 'open', $4, $5)
-      returning id, lead_id, title, status, due_date, assigned_to, created_by, created_at, completed_at
-      `,
-      [tenantId, leadId, String(title), due_date || null, userId]
-    );
-
-    // notify about task created (scheduler / KPI watchers)
-    try {
-      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "task_created" })]);
-    } catch (notifyErr) {
-      console.error("NOTIFY leads_changed failed:", notifyErr);
-    }
-
-    res.status(201).json({ task: ins.rows[0] });
+    const id = req.params.id;
+    const { rows } = await q(`SELECT * FROM public.lead WHERE id = $1 LIMIT 1`, [id]);
+    if (!rows[0]) return res.status(404).json({ error: "not_found" });
+    res.json({ data: rows[0] });
   } catch (err) {
-    next(err);
-  } finally {
-    cx.release();
+    console.error("GET /api/leads/:id error:", err);
+    return res.status(500).json({ error: "get_lead_failed" });
   }
 });
 
-router.patch("/leads/:id/tasks/:taskId", requireSession, async (req: any, res: any, next: any) => {
-  const tenantId = req.session?.tenant_id as string | null;
-  const userId   = req.session?.user_id as string | null;
-  const leadId   = req.params.id as string;
-  const taskId   = req.params.taskId as string;
-  const { status } = req.body || {};
-  if (!["open", "done", "canceled"].includes(status)) return res.status(400).json({ error: "invalid_status" });
-
-  const cx = await pool.connect();
+// Update lead (partial)
+router.patch("/:id", requireSession, async (req, res) => {
   try {
-    await setAppContext(cx, tenantId!, userId!, req.session?.company_id);
-
-    const upd = await cx.query(
-      `
-      update public.lead_task
-      set status = $3,
-          completed_at = case
-            when $3 = 'done' then now()
-            when $3 = 'open' then null
-            else completed_at
-          end
-      where id = $2 and lead_id = $1 and tenant_id = $4
-      returning id, lead_id, title, status, due_date, assigned_to, created_by, created_at, completed_at
-      `,
-      [leadId, taskId, status, tenantId]
-    );
-
-    if (upd.rowCount === 0) return res.status(404).json({ error: "not_found" });
-
-    // notify about task status change
-    try {
-      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, task_id: taskId, action: "task_updated", task_status: status })]);
-    } catch (notifyErr) {
-      console.error("NOTIFY leads_changed failed:", notifyErr);
-    }
-
-    res.json({ task: upd.rows[0] });
-  } catch (err) {
-    next(err);
-  } finally {
-    cx.release();
-  }
-});
-
-/* ────────────────────────────────────────────────────────────────────────────
-   Close/Reopen
-──────────────────────────────────────────────────────────────────────────── */
-router.post("/leads/:id/close", requireSession, async (req: any, res: any, next: any) => {
-  const tenantId = req.session?.tenant_id as string | null;
-  const userId   = req.session?.user_id as string | null;
-  const leadId   = req.params.id as string;
-  const { outcome, reason } = req.body || {};
-  if (!["won", "lost"].includes(outcome)) return res.status(400).json({ error: "invalid_outcome" });
-
-  const cx = await pool.connect();
-  try {
-    await setAppContext(cx, tenantId!, userId!, req.session?.company_id);
-
-    const upd = await cx.query(
-      `
-      update public.lead
-      set status = $3::text,
-          stage  = $3::text,
-          meta = jsonb_strip_nulls(
-            coalesce(meta, '{}'::jsonb) ||
-            jsonb_build_object('close', jsonb_build_object(
-              'outcome', $3::text, 'reason', $4::text, 'at', now()
-            ))
-          ),
-          updated_at = now()
-      where id = $2 and tenant_id = $1
-      returning id, status, stage, meta, updated_at
-      `,
-      [tenantId, leadId, outcome, reason || null]
-    );
-
-    if (upd.rowCount === 0) return res.status(404).json({ error: "not_found" });
-
-    // notify after successful close
-    try {
-      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "closed", outcome })]);
-    } catch (notifyErr) {
-      console.error("NOTIFY leads_changed failed:", notifyErr);
-    }
-
-    res.json({ lead: upd.rows[0] });
-  } catch (err) {
-    next(err);
-  } finally {
-    cx.release();
-  }
-});
-
-router.post("/leads/:id/reopen", requireSession, async (req: any, res: any, next: any) => {
-  const tenantId = req.session?.tenant_id as string | null;
-  const userId   = req.session?.user_id as string | null;
-  const leadId   = req.params.id as string;
-  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
-
-  const cx = await pool.connect();
-  try {
-    await setAppContext(cx, tenantId!, userId!, req.session?.company_id);
-
-    const upd = await cx.query(
-      `
-      update public.lead
-         set status = 'open',
-             stage  = 'New',
-             updated_at = now(),
-             meta = jsonb_strip_nulls(
-               (coalesce(meta, '{}'::jsonb) - 'close') ||
-               jsonb_build_object('reopen', jsonb_build_object('by', $3, 'at', now()))
-             )
-       where id = $1 and tenant_id = $2
-       returning id, status, stage, updated_at, meta
-      `,
-      [leadId, tenantId, userId]
-    );
-
-    if (upd.rowCount === 0) return res.status(404).json({ error: "not_found" });
-
-    // notify reopen
-    try {
-      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "reopened" })]);
-    } catch (notifyErr) {
-      console.error("NOTIFY leads_changed failed:", notifyErr);
-    }
-
-    res.json({ lead: upd.rows[0] });
-  } catch (err) {
-    next(err);
-  } finally {
-    cx.release();
-  }
-});
-
-/* ────────────────────────────────────────────────────────────────────────────
-   GET /api/stages  (unified)
-──────────────────────────────────────────────────────────────────────────── */
-router.get("/stages", requireSession, async (req: any, res: any, next: any) => {
-  const tenantId = req.session?.tenant_id as string | null;
-  const userId   = req.session?.user_id as string | null;
-  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
-
-  const cx = await pool.connect();
-  try {
-    await setAppContext(cx, tenantId!, userId!, req.session?.company_id);
-
-    // 1) Prefer pipeline_stage if present
-    try {
-      try {
-        const q = await cx.query(
-          `
-          select id, name, pipeline_id, order_index
-            from public.pipeline_stage
-           where tenant_id = $1
-           order by coalesce(order_index, 9999), name
-          `,
-          [tenantId]
-        );
-        if ((q?.rowCount ?? 0) > 0) return res.json({ stages: q.rows });
-      } catch (e: any) {
-        if (e?.code === "42703") {
-          const cols = await cx.query(
-            `
-            select column_name
-              from information_schema.columns
-             where table_schema='public' and table_name='pipeline_stage'
-            `
-          );
-          const set = new Set(cols.rows.map((r: any) => r.column_name as string));
-          const hasTenant = set.has("tenant_id");
-          const hasOrder  = set.has("order_index");
-
-          const where = hasTenant ? "where tenant_id = $1" : "";
-          const params: any[] = hasTenant ? [tenantId] : [];
-          const selectOrderIndex = hasOrder ? "order_index" : "null::int as order_index";
-          const orderBy = hasOrder ? "coalesce(order_index, 9999), name" : "name";
-
-          const q2 = await cx.query(
-            `
-            select id, name, pipeline_id, ${selectOrderIndex}
-              from public.pipeline_stage
-              ${where}
-             order by ${orderBy}
-            `,
-            params
-          );
-          if ((q2?.rowCount ?? 0) > 0) return res.json({ stages: q2.rows });
-
-        } else {
-          throw e;
-        }
+    const id = req.params.id;
+    const user = (req as any).session;
+    const allowed = ["name", "primary_email", "primary_phone", "owner_id", "stage_id", "pipeline_id", "status", "estimated_value", "probability", "priority", "custom_data", "tags", "meta"];
+    const updates: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+    for (const k of allowed) {
+      if (k in req.body) {
+        updates.push(`${k} = $${idx}::${k === "tags" ? "text[]" : (k === "custom_data" || k === "meta" ? "jsonb" : "text")}`);
+        let v = req.body[k];
+        if (k === "custom_data" || k === "meta") v = JSON.stringify(v || {});
+        values.push(v);
+        idx++;
       }
-    } catch (e: any) {
-      if (e?.code !== "42P01") console.warn("[/stages] pipeline_stage unavailable:", e?.code || e);
-      // fall through
     }
-
-    // 2) Fall back to lead_stage
-    try {
-      const colsQ = await cx.query(
-        `
-        select column_name
-          from information_schema.columns
-         where table_schema = 'public'
-           and table_name   = 'lead_stage'
-        `
-      );
-      const colset = new Set<string>(colsQ.rows.map((r: any) => String(r.column_name)));
-
-      const hasProb  = colset.has("probability");
-      const hasWon   = colset.has("is_won");
-      const hasLost  = colset.has("is_lost");
-      const hasOrder = colset.has("order_index");
-      const hasCA    = colset.has("created_at");
-
-      const selectList = [
-        "id",
-        "name",
-        hasProb  ? "probability"                : "null::int  as probability",
-        hasWon   ? "is_won"                     : "false      as is_won",
-        hasLost  ? "is_lost"                    : "false      as is_lost",
-        hasOrder ? "order_index"                : "null::int  as order_index",
-        "null::uuid as pipeline_id",
-        hasCA    ? "created_at"                 : "now()      as created_at",
-      ].join(", ");
-
-      const orderBy = hasOrder ? "coalesce(order_index, 999999), name" : "name";
-
-      const s = await cx.query(
-        `
-        select ${selectList}
-          from public.lead_stage
-         where tenant_id = $1
-         order by ${orderBy}
-        `,
-        [tenantId]
-      );
-      if ((s?.rowCount ?? 0) > 0) return res.json({ stages: s.rows });
-
-    } catch (e: any) {
-      if (e?.code !== "42P01") throw e;
-    }
-
-    // 3) Final fallback: distinct lead.stage + defaults
-    const defaults = ["New", "Qualified", "Proposal", "Negotiation", "Won", "Lost"];
-    const distinct = await cx.query(
-      `select distinct stage as name
-         from public.lead
-        where tenant_id = $1 and stage is not null
-        order by name`,
-      [tenantId]
-    );
-    const names = Array.from(new Set<string>([...defaults, ...distinct.rows.map(r => String(r.name))]));
-    const stages = names.map((name, i) => ({ id: name, name, pipeline_id: null, order_index: i }));
-    res.json({ stages });
+    if (updates.length === 0) return res.status(400).json({ error: "nothing_to_update" });
+    values.push(id);
+    const sql = `UPDATE public.lead SET ${updates.join(", ")}, updated_at = now() WHERE id = $${idx} RETURNING *`;
+    const { rows } = await q(sql, values);
+    // activity
+    await q(`INSERT INTO public.lead_activity (id, lead_id, tenant_id, actor_id, action_key, payload, created_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, now())`, [id, user.tenant_id, user.user_id, "lead.updated", JSON.stringify(req.body)]);
+    res.json({ data: rows[0] });
   } catch (err) {
-    next(err);
-  } finally {
-    cx.release();
+    console.error("PATCH /api/leads/:id error:", err);
+    return res.status(500).json({ error: "update_lead_failed" });
   }
 });
 
-/* ────────────────────────────────────────────────────────────────────────────
-   Scheduler
-──────────────────────────────────────────────────────────────────────────── */
-router.get("/scheduler/leads", requireSession, async (req: any, res: any, next: any) => {
-  const tenantId = req.session?.tenant_id as string | null;
-  const userId   = req.session?.user_id   as string | null;
-
-  const { date_from, date_to } = req.query || {};
-  const page      = Math.max(1, Number(req.query.page || 1));
-  const pageSize  = Math.min(1000, Math.max(1, Number(req.query.pageSize || 1000)));
-
-  if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
-  if (!date_from || !date_to) return res.status(400).json({ error: "date_from_and_date_to_required" });
-
-  const from = String(date_from).slice(0, 10);
-  const to   = String(date_to).slice(0, 10);
-
-  const cx = await pool.connect();
+// Delete lead (soft delete pattern could be preferred)
+router.delete("/:id", requireSession, async (req, res) => {
   try {
-    await setAppContext(cx, tenantId!, userId!, req.session?.company_id);
-
-    const flags = await getAdminFlags(cx, tenantId!, userId!);
-    const isAdminish = flags.isPlatformAdmin || flags.isTenantAdmin || flags.isAdmin;
-    const ownerFilter = isAdminish ? (req.query.owner ? String(req.query.owner) : undefined) : userId;
-
-    let sql1 = `
-      select
-        l.id                         as lead_id,
-        l.name                       as lead_name,
-        (l.meta->>'follow_up_date')::date as event_date,
-        'lead_follow_up'             as kind,
-        null::uuid                   as task_id,
-        l.status                     as status
-      from public.lead l
-      where l.tenant_id = $1
-        and (l.meta->>'follow_up_date') is not null
-        and (l.meta->>'follow_up_date')::date between $2::date and $3::date
-    `;
-    const p1: any[] = [tenantId, from, to];
-    if (ownerFilter) { p1.push(ownerFilter); sql1 += ` and l.owner_id::text = $${p1.length}\n`; }
-
-    const followUps = await cx.query(sql1, p1);
-
-    let sql2 = `
-      select
-        t.lead_id                    as lead_id,
-        l.name                       as lead_name,
-        t.due_date::date             as event_date,
-        'lead_task'                  as kind,
-        t.id                         as task_id,
-        t.status                     as status
-      from public.lead_task t
-      join public.lead l
-        on l.id = t.lead_id
-       and l.tenant_id = t.tenant_id
-      where t.tenant_id = $1
-        and t.status in ('open')
-        and t.due_date between $2::date and $3::date
-    `;
-    const p2: any[] = [tenantId, from, to];
-    if (ownerFilter) { p2.push(ownerFilter); sql2 += ` and l.owner_id::text = $${p2.length}\n`; }
-
-    const tasks = await cx.query(sql2, p2);
-
-    const all = [...followUps.rows, ...tasks.rows]
-      .filter(r => r.event_date)
-      .sort((a, b) => (a.event_date as any) - (b.event_date as any));
-
-    const total = all.length;
-    const start = (page - 1) * pageSize;
-    const events = all.slice(start, start + pageSize);
-
-    res.json({ events, items: events, total, page, pageSize, range: { from, to } });
+    const id = req.params.id;
+    await q(`DELETE FROM public.lead WHERE id = $1`, [id]);
+    await q(`INSERT INTO public.lead_activity (id, lead_id, tenant_id, actor_id, action_key, payload, created_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4, '{}'::jsonb, now())`, [id, (req as any).session.tenant_id, (req as any).session.user_id, "lead.deleted"]);
+    return res.json({ ok: true });
   } catch (err) {
-    next(err);
-  } finally {
-    cx.release();
+    console.error("DELETE /api/leads/:id error:", err);
+    return res.status(500).json({ error: "delete_lead_failed" });
   }
 });
-
-/* ────────────────────────────────────────────────────────────────────────────
-   Custom Fields Upsert
-   (protected)
-──────────────────────────────────────────────────────────────────────────── */
-// ✅ PUT /api/leads/:leadId/custom-fields/:definitionId
-router.put("/:leadId/custom-fields/:definitionId", requireSession, async (req: any, res: any) => {
+router.post("/notes", requireSession, async (req, res) => {
   try {
-    const tenantId = String(req.session?.tenant_id || "").trim();
-    const userId = String(req.session?.user_id || "").trim();
-    const { leadId, definitionId } = req.params;
-
-    if (!tenantId) return res.status(401).json({ error: "No tenant in session" });
-    if (!userId)   return res.status(401).json({ error: "No user in session" });
-
-    const UUID_RX =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    const isUuid = (v: string) => UUID_RX.test(v);
-
-    if (!isUuid(leadId))       return res.status(400).json({ error: "Invalid leadId" });
-    if (!isUuid(definitionId)) return res.status(400).json({ error: "Invalid definitionId" });
-
-    const {
-      value_text = null,
-      value_number = null,
-      value_boolean = null,
-      value_json = null,
-    } = req.body ?? {};
-
-    // allow exactly one type
-    const provided = [value_text, value_number, value_boolean, value_json].filter(
-      (v) => v !== null && v !== undefined
-    );
-    if (provided.length === 0) {
-      return res.status(400).json({ error: "No value_* provided" });
-    }
-    if (provided.length > 1) {
-      return res.status(400).json({
-        error: "Provide only one of value_text / value_number / value_boolean / value_json",
-      });
-    }
-
-    const sql = `
-      INSERT INTO public.custom_field_value
-        (definition_id, tenant_id, lead_id, value_text, value_number, value_boolean, value_json, created_by)
-      VALUES
-        ($1::uuid,       $2::uuid,  $3::uuid, $4::text, $5::numeric, $6::boolean, $7::jsonb,  $8::uuid)
-      ON CONFLICT ON CONSTRAINT uq_cfv_tenant_lead_definition
-      DO UPDATE SET
-        value_text    = EXCLUDED.value_text,
-        value_number  = EXCLUDED.value_number,
-        value_boolean = EXCLUDED.value_boolean,
-        value_json    = EXCLUDED.value_json,
-        created_by    = EXCLUDED.created_by
-      RETURNING id, definition_id, tenant_id, lead_id,
-                value_text, value_number, value_boolean, value_json,
-                created_by, created_at;
-    `;
-
-    const params = [
-      definitionId,  // $1
-      tenantId,      // $2
-      leadId,        // $3
-      value_text,    // $4
-      value_number,  // $5
-      value_boolean, // $6
-      value_json,    // $7
-      userId,        // $8
-    ];
-
-    const { rows } = await pool.query(sql, params);
-
-    // optional: notify that a custom field changed (helps realtime dashboards)
-    try {
-      await pool.query(`NOTIFY leads_changed, $1`, [JSON.stringify({ tenant_id: String(tenantId), lead_id: leadId, action: "custom_field_upsert" })]);
-    } catch (notifyErr) {
-      console.error("NOTIFY leads_changed failed:", notifyErr);
-    }
-
-    return res.json({ ok: true, data: rows[0] });
-  } catch (err: any) {
-    console.error("[custom-field upsert] error:", err);
-    return res.status(500).json({ error: "Internal Server Error", detail: err?.message });
+    const { lead_id, body, visibility = "internal" } = req.body;
+    if (!lead_id || !body) return res.status(400).json({ error: "missing_fields" });
+    const id = uuidv4();
+    const user = (req as any).session;
+    await q(`INSERT INTO public.lead_note (id, lead_id, tenant_id, author_id, body, visibility, metadata, created_at, company_id)
+             VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5,$6,$7::jsonb,now(),$8::uuid)`, [id, lead_id, user.tenant_id, user.user_id, body, visibility, JSON.stringify({}), user.active_company_id]);
+    const { rows } = await q(`SELECT * FROM public.lead_note WHERE id = $1`, [id]);
+    await q(`INSERT INTO public.lead_activity (id, lead_id, tenant_id, actor_id, action_key, payload, created_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, now())`, [lead_id, user.tenant_id, user.user_id, "lead.note.created", JSON.stringify({ note_id: id })]);
+    return res.json({ data: rows[0] });
+  } catch (err) {
+    console.error("POST /api/lead-notes", err);
+    return res.status(500).json({ error: "create_note_failed" });
   }
 });
-// GET /api/kpis/todays  — insert into routes/leads.ts (uses existing requireSession, pool, getAdminFlags, setAppContext)
-router.get("/kpis/todays", requireSession, async (req: any, res: any, next: any) => {
+router.post("/tasks", requireSession, async (req, res) => {
   try {
-    const tenantId = req.session?.tenant_id as string | null;
-    const userId   = req.session?.user_id   as string | null;
-    if (!tenantId) return res.status(401).json({ error: "unauthenticated" });
-
-    const mine = String(req.query?.mine ?? "").toLowerCase() === "1" || String(req.query?.mine ?? "").toLowerCase() === "true";
-    const ownerParam = req.query?.owner ? String(req.query.owner) : null;
-
-    // IST date YYYY-MM-DD to match calendar UI
-    const istToday = (new Date().toLocaleString("en-CA", { timeZone: "Asia/Kolkata" })).slice(0, 10);
-
-    const cx = await pool.connect();
-    try {
-      // set app context like other handlers (optional but consistent)
-      await setAppContext(cx, tenantId, userId, req.session?.company_id);
-
-      // admin check: allow admin to pass ?owner=... to count for someone else
-      const flags = await getAdminFlags(cx, tenantId, userId);
-      const isAdminish = flags.isPlatformAdmin || flags.isTenantAdmin || flags.isAdmin;
-      const effectiveOwner = isAdminish ? ownerParam : (mine ? userId : null);
-
-      // Build SQL: union of lead ids from lead.meta follow_up_date and open tasks due today.
-      // Count DISTINCT lead_id to avoid double-counting.
-      const params: any[] = [tenantId, istToday];
-      let ownerClauseLead = "";
-      let ownerClauseTask = "";
-      if (effectiveOwner) {
-        params.push(effectiveOwner);
-        ownerClauseLead = ` and l.owner_id::text = $${params.length}`;
-ownerClauseTask = ` and l.owner_id::text = $${params.length}`;
-
-      }
-
-      const sql = `
-        SELECT count(DISTINCT lead_id)::int AS cnt FROM (
-          -- leads with meta follow_up_date = today
-          SELECT l.id::text AS lead_id
-          FROM public.lead l
-          WHERE l.tenant_id = $1
-            AND (l.meta->>'follow_up_date')::date = $2
-            AND (l.meta->>'deleted_at') IS NULL
-            ${ownerClauseLead}
-
-          UNION ALL
-
-          -- open tasks due today (join to lead for tenant + owner scoping)
-          SELECT t.lead_id::text AS lead_id
-          FROM public.lead_task t
-          JOIN public.lead l ON l.id = t.lead_id AND l.tenant_id = t.tenant_id
-          WHERE t.tenant_id = $1
-            AND t.status IN ('open')
-            AND t.due_date::date = $2
-            ${ownerClauseTask}
-        ) AS u;
-      `;
-
-      const q = await cx.query(sql, params);
-      const total = Number(q.rows?.[0]?.cnt ?? 0);
-      return res.json({ ok: true, todays_followups: total });
-    } catch (err) {
-      next(err);
-    } finally {
-      cx.release();
-    }
+    const { lead_id, title, due_date, assigned_to = null } = req.body;
+    if (!lead_id || !title) return res.status(400).json({ error: "missing_fields" });
+    const id = uuidv4();
+    const user = (req as any).session;
+    await q(`INSERT INTO public.lead_task (id, tenant_id, lead_id, title, due_date, status, assigned_to, created_by, created_at, company_id)
+             VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7::uuid,$8::uuid,now(),$9::uuid)`, [id, user.tenant_id, lead_id, title, due_date || null, "open", assigned_to, user.user_id, user.active_company_id]);
+    const { rows } = await q(`SELECT * FROM public.lead_task WHERE id = $1`, [id]);
+    await q(`INSERT INTO public.lead_activity (id, lead_id, tenant_id, actor_id, action_key, payload, created_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, now())`, [lead_id, user.tenant_id, user.user_id, "lead.task.created", JSON.stringify({ task_id: id })]);
+    return res.json({ data: rows[0] });
   } catch (err) {
-    next(err);
+    console.error("POST /api/lead-tasks", err);
+    return res.status(500).json({ error: "create_task_failed" });
   }
 });
-/* ────────────────────────────────────────────────────────────────────────────
-   BACKWARDS-COMPAT: GET /api/kpis?table=leads
-   Tenant admins (and platform admins) see tenant-wide counts.
-   Non-admins see only their own leads (owner = current user).
-──────────────────────────────────────────────────────────────────────────── */
-router.get("/kpis", requireSession, async (req: any, res: any, next: any) => {
+router.post("/followups", requireSession, async (req, res) => {
   try {
-    const table = String(req.query?.table || "").toLowerCase();
-    if (table !== "leads") {
-      return res.status(400).json({ error: "unsupported_table", supported: ["leads"] });
-    }
-
-    const mineParam = String(req.query?.mine ?? "").toLowerCase();
-    const mine = mineParam === "1" || mineParam === "true";
-    // ownerParam is allowed for admins only — ignored for regular users
-    const ownerParam = req.query?.owner ? String(req.query.owner) : null;
-
-    // IST date YYYY-MM-DD (matches frontend calendar expectations)
-    const istToday = (new Date().toLocaleString("en-CA", { timeZone: "Asia/Kolkata" })).slice(0, 10);
-
-    const tenantId = req.session?.tenant_id as string | null;
-    const userId   = req.session?.user_id   as string | null;
-    if (!tenantId) return res.status(401).json({ error: "unauthenticated" });
-
-    const cx = await pool.connect();
-    try {
-      await setAppContext(cx, tenantId, userId, req.session?.company_id);
-
-      const flags = await getAdminFlags(cx, tenantId, userId);
-      const isAdminish = !!(flags.isPlatformAdmin || flags.isTenantAdmin);
-
-      // Determine owner scoping:
-      // - Admins: no owner scoping (see all)
-      // - Non-admins: always scope to current user (owner = userId)
-      // - If non-admin and mine=true it's still userId; ownerParam is ignored for non-admin
-      let effectiveOwner: string | null = null;
-      if (!isAdminish) {
-        effectiveOwner = userId; // enforce own-only
-      } else {
-        // admin: allow owner override (or null -> tenant-wide)
-        effectiveOwner = ownerParam || null;
-      }
-
-      const params: any[] = [tenantId, istToday];
-      let ownerClauseLead = "";
-      let ownerClauseTask = "";
-      if (effectiveOwner) {
-        params.push(effectiveOwner);
-        ownerClauseLead = ` and l.owner_id = $${params.length}`;
-        ownerClauseTask = ` and l.owner_id = $${params.length}`;
-      }
-
-      const sql = `
-        SELECT count(DISTINCT lead_id)::int AS cnt FROM (
-          -- leads with follow_up_date = today (and not deleted)
-          SELECT l.id::text AS lead_id
-          FROM public.lead l
-          WHERE l.tenant_id = $1
-            AND (l.meta->>'follow_up_date')::date = $2
-            AND (l.meta->>'deleted_at') IS NULL
-            ${ownerClauseLead}
-
-          UNION ALL
-
-          -- open tasks due today (join to lead for tenant + optional owner scoping)
-          SELECT t.lead_id::text AS lead_id
-          FROM public.lead_task t
-          JOIN public.lead l ON l.id = t.lead_id AND l.tenant_id = t.tenant_id
-          WHERE t.tenant_id = $1
-            AND t.status IN ('open')
-            AND t.due_date::date = $2
-            ${ownerClauseTask}
-        ) AS u;
-      `;
-
-      const q = await cx.query(sql, params);
-      const total = Number(q.rows?.[0]?.cnt ?? 0);
-      return res.json({ ok: true, todays_followups: total });
-    } catch (err) {
-      next(err);
-    } finally {
-      cx.release();
-    }
+    const { lead_id, due_at, note = null } = req.body;
+    if (!lead_id || !due_at) return res.status(400).json({ error: "missing_fields" });
+    const user = (req as any).session;
+    const { rows } = await q(`INSERT INTO public.lead_followups (tenant_id, company_id, lead_id, due_at, status, note, created_by, changed_by, version, effective_from, created_at, updated_at, due_date_local)
+                              VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7::uuid,$8::uuid,$9,now(),now(),now(), $10::date) RETURNING *`,
+      [user.tenant_id, user.active_company_id, lead_id, due_at, 'planned', note, user.user_id, user.user_id, 1, (new Date(due_at)).toISOString().slice(0,10)]);
+    await q(`INSERT INTO public.lead_activity (id, lead_id, tenant_id, actor_id, action_key, payload, created_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, now())`, [lead_id, user.tenant_id, user.user_id, "lead.followup.created", JSON.stringify({ followup_id: rows[0].id })]);
+    return res.json({ data: rows[0] });
   } catch (err) {
-    next(err);
+    console.error("POST /api/lead-followups", err);
+    return res.status(500).json({ error: "create_followup_failed" });
   }
 });
 
