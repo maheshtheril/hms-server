@@ -37,6 +37,15 @@ import stockRouter from "./routes/hmsStock";
 import hmsPurchasesRouter from "./routes/hmsPurchases";
 import hmsReceiptsRouter from "./routes/hmsReceipts";
 import hmsInvoicesRouter from "./routes/hmsInvoices";
+import rolesRouter from "./routes/hmsRoles";
+import specsRouter from "./routes/hmsSpecializations";
+import leadSourcesRouter from "./routes/leads/sources";
+import leadProfessionsRouter from "./routes/leads/professions";
+import leadPipelinesRouter from "./routes/leads/pipelines";
+import leadStagesRouter from "./routes/leads/stages";
+import leadIndustriesRouter from "./routes/leads/industries";
+import { leadsNewRouter } from "./routes/new/leads-new";
+
 
 
 
@@ -184,6 +193,16 @@ app.use("/hms/stock", stockRouter);
 app.use("/hms/purchases", hmsPurchasesRouter);
 app.use("/hms/receipts", hmsReceiptsRouter);
 app.use("/hms/invoices", hmsInvoicesRouter);
+app.use("/api/hms/roles", rolesRouter);
+app.use("/api/hms/specializations", specsRouter);
+app.use("/api/leads/sources", leadSourcesRouter);
+app.use("/api/leads/professions", leadProfessionsRouter);
+app.use("/api/leads/pipelines", leadPipelinesRouter);
+app.use("/api/leads/stages", leadStagesRouter);
+app.use("/api/leads/industries", leadIndustriesRouter);
+app.use("/api", leadsNewRouter);
+
+
 
 /* ───────────────────────────── Uploads, Tenants, Scheduler ───────────────────────────── */
 app.use("/api/uploads", uploadsRouter);
