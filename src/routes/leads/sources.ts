@@ -1,4 +1,3 @@
-// server/src/routes/leads/sources.ts
 import { Router } from "express";
 // Adjust this import to your DB client. Example: import db from "../db";
 import db from "../../db"; // <-- replace with your actual DB module
@@ -32,20 +31,43 @@ router.get("/", async (req, res, next) => {
 
 /**
  * POST /api/leads/sources
- * Create new source (admin-only)
+ * Create new source
  * body: { key, name, config, tenant_id? }
+ *
+ * Permission model:
+ * - platform admins can create global or tenant-scoped sources
+ * - tenant admins can create sources scoped to their tenant only
  */
 router.post("/", async (req, res, next) => {
   try {
-    // enforce admin — adapt to your auth
-    if (!req.user?.is_admin) return res.status(403).json({ error: "forbidden" });
+    // Quick debug log (remove in production if you don't want verbose logs)
+    console.log("POST /api/leads/sources called by:", req.user?.id, "userFlags:", {
+      is_platform_admin: req.user?.is_platform_admin,
+      is_tenant_admin: req.user?.is_tenant_admin,
+      tenant_id: req.user?.tenant_id,
+    });
 
-    const { key, name, config, tenant_id } = req.body;
+    const isPlatformAdmin = !!req.user?.is_platform_admin;
+    const isTenantAdmin = !!req.user?.is_tenant_admin;
+
+    if (!isPlatformAdmin && !isTenantAdmin) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+
+    const { key, name, config } = req.body;
+    // tenant_id: prefer explicit body, fall back to user's tenant
+    let tenant_id = req.body?.tenant_id ?? req.user?.tenant_id ?? null;
+
+    // tenant admins cannot create for other tenants (safety)
+    if (isTenantAdmin && tenant_id && req.user?.tenant_id && tenant_id !== req.user.tenant_id) {
+      return res.status(403).json({ error: "forbidden_tenant_mismatch" });
+    }
+
     if (!key || !name) return res.status(400).json({ error: "key_and_name_required" });
 
     const insert = `
       INSERT INTO public.lead_source (tenant_id, key, name, config, created_at)
-      VALUES ($1,$2,$3,$4,now())
+      VALUES ($1,$2,$3,$4, now())
       RETURNING id, tenant_id, key, name, config, created_at
     `;
     try {
@@ -77,10 +99,13 @@ router.get("/:id", async (req, res, next) => {
 /**
  * PUT /api/leads/sources/:id
  * body: { key, name, config }
+ *
+ * NOTE: currently still restricted to platform admins.
+ * If you want tenant admins to update sources in their tenant, we can relax this check similarly.
  */
 router.put("/:id", async (req, res, next) => {
   try {
-    if (!req.user?.is_admin) return res.status(403).json({ error: "forbidden" });
+    if (!req.user?.is_admin && !req.user?.is_platform_admin) return res.status(403).json({ error: "forbidden" });
 
     const id = req.params.id;
     const { key, name, config } = req.body;
@@ -101,7 +126,7 @@ router.put("/:id", async (req, res, next) => {
  */
 router.delete("/:id", async (req, res, next) => {
   try {
-    if (!req.user?.is_admin) return res.status(403).json({ error: "forbidden" });
+    if (!req.user?.is_admin && !req.user?.is_platform_admin) return res.status(403).json({ error: "forbidden" });
     const id = req.params.id;
     await db.query("DELETE FROM public.lead_source WHERE id = $1", [id]);
     return res.json({ ok: true });
