@@ -103,36 +103,99 @@ router.get("/:id", async (req, res, next) => {
  * NOTE: currently still restricted to platform admins.
  * If you want tenant admins to update sources in their tenant, we can relax this check similarly.
  */
+/**
+ * PUT /api/leads/sources/:id
+ * body: { key, name, config }
+ *
+ * Permission model:
+ * - platform admins can update any source
+ * - tenant admins can update sources that belong to their tenant only
+ */
 router.put("/:id", async (req, res, next) => {
   try {
-    if (!req.user?.is_admin && !req.user?.is_platform_admin) return res.status(403).json({ error: "forbidden" });
+    // Who's calling
+    const callerId = req.user?.id ?? "anonymous";
+    const isPlatformAdmin = !!req.user?.is_platform_admin;
+    const isTenantAdmin = !!req.user?.is_tenant_admin;
+    const callerTenant = req.user?.tenant_id ?? null;
+
+    console.log("PUT /api/leads/sources/:id called by", callerId, { isPlatformAdmin, isTenantAdmin, callerTenant });
 
     const id = req.params.id;
+    // Load existing row to check tenant scoping
+    const existingRes = await db.query("SELECT id, tenant_id FROM public.lead_source WHERE id = $1 LIMIT 1", [id]);
+    if (existingRes.rows.length === 0) return res.status(404).json({ error: "not_found" });
+
+    const existing = existingRes.rows[0];
+    const sourceTenant = existing.tenant_id; // may be null (global)
+
+    // Authorization: platform admins can proceed; tenant admins only if tenant matches and source is tenant-scoped
+    if (!isPlatformAdmin) {
+      if (!isTenantAdmin) return res.status(403).json({ error: "forbidden" });
+      // tenant admins cannot alter global (null tenant) sources
+      if (!sourceTenant) return res.status(403).json({ error: "forbidden_global_resource" });
+      if (callerTenant !== sourceTenant) return res.status(403).json({ error: "forbidden_tenant_mismatch" });
+    }
+
     const { key, name, config } = req.body;
     const { rows } = await db.query(
-      `UPDATE public.lead_source SET key=$1, name=$2, config=$3, updated_at = now() WHERE id=$4 RETURNING id, tenant_id, key, name, config, created_at`,
+      `UPDATE public.lead_source
+         SET key=$1, name=$2, config=$3, updated_at = now()
+       WHERE id=$4
+       RETURNING id, tenant_id, key, name, config, created_at`,
       [key, name, config ?? {}, id]
     );
+
     if (rows.length === 0) return res.status(404).json({ error: "not_found" });
     return res.json({ data: rows[0] });
   } catch (err: any) {
-    if (err.code === "23505") return res.status(409).json({ error: "duplicate_key_or_name" });
+    if (err?.code === "23505") return res.status(409).json({ error: "duplicate_key_or_name" });
     return next(err);
   }
 });
 
+
 /**
  * DELETE /api/leads/sources/:id
  */
+/**
+ * DELETE /api/leads/sources/:id
+ *
+ * Permission model:
+ * - platform admins can delete any source
+ * - tenant admins can delete sources that belong to their tenant only
+ */
 router.delete("/:id", async (req, res, next) => {
   try {
-    if (!req.user?.is_admin && !req.user?.is_platform_admin) return res.status(403).json({ error: "forbidden" });
+    const callerId = req.user?.id ?? "anonymous";
+    const isPlatformAdmin = !!req.user?.is_platform_admin;
+    const isTenantAdmin = !!req.user?.is_tenant_admin;
+    const callerTenant = req.user?.tenant_id ?? null;
+
+    console.log("DELETE /api/leads/sources/:id called by", callerId, { isPlatformAdmin, isTenantAdmin, callerTenant });
+
     const id = req.params.id;
+    // Load existing row to check tenant scoping
+    const existingRes = await db.query("SELECT id, tenant_id FROM public.lead_source WHERE id = $1 LIMIT 1", [id]);
+    if (existingRes.rows.length === 0) return res.status(404).json({ error: "not_found" });
+
+    const existing = existingRes.rows[0];
+    const sourceTenant = existing.tenant_id;
+
+    // Authorization checks
+    if (!isPlatformAdmin) {
+      if (!isTenantAdmin) return res.status(403).json({ error: "forbidden" });
+      // tenant admins cannot delete global (null tenant) sources
+      if (!sourceTenant) return res.status(403).json({ error: "forbidden_global_resource" });
+      if (callerTenant !== sourceTenant) return res.status(403).json({ error: "forbidden_tenant_mismatch" });
+    }
+
     await db.query("DELETE FROM public.lead_source WHERE id = $1", [id]);
     return res.json({ ok: true });
   } catch (err) {
     return next(err);
   }
 });
+
 
 export default router;
