@@ -15,13 +15,59 @@ type UserLike = {
   tenant_id?: string | null;
   is_platform_admin?: boolean;
   is_tenant_admin?: boolean;
+  is_admin?: boolean;
   active_company_id?: string | null;
   [k: string]: any;
 };
 
+/**
+ * getUser: tolerant accessor that reads from either req.user (legacy) or req.session.
+ * This makes the route robust to different auth middleware shapes.
+ */
 function getUser(req: Request): UserLike {
-  // If your auth middleware attaches differently, adjust here.
-  return (req as any).user ?? {};
+  const uFromUser = (req as any).user ?? null;
+  const s = (req as any).session ?? null;
+
+  // Prefer explicit req.user if present and not empty
+  if (uFromUser && typeof uFromUser === "object" && Object.keys(uFromUser).length > 0) {
+    return normalizeUserShape(uFromUser);
+  }
+
+  // Fall back to session object (common in this codebase)
+  if (s && typeof s === "object" && Object.keys(s).length > 0) {
+    const normalized = {
+      id: s.user_id ?? s.userId ?? undefined,
+      tenant_id: s.tenant_id ?? s.tenantId ?? s.tenant ?? null,
+      // Some code uses snake_case flags, some camelCase — normalize both
+      is_platform_admin: coerceBool(s.is_platform_admin ?? s.isPlatformAdmin ?? s.platformAdmin),
+      is_tenant_admin: coerceBool(s.is_tenant_admin ?? s.isTenantAdmin ?? s.tenantAdmin),
+      is_admin: coerceBool(s.is_admin ?? s.isAdmin),
+      active_company_id: s.company_id ?? s.active_company_id ?? s.companyId ?? null,
+      ...s,
+    } as UserLike;
+    return normalizeUserShape(normalized);
+  }
+
+  return {};
+}
+
+function coerceBool(v: any): boolean {
+  return v === true || v === "true" || v === 1 || v === "1" || v === "t";
+}
+
+/**
+ * Ensure returned user has consistent flag names (snake_case) used throughout routes.
+ */
+function normalizeUserShape(raw: any): UserLike {
+  return {
+    id: raw.id ?? raw.user_id ?? raw.userId,
+    tenant_id: raw.tenant_id ?? raw.tenantId ?? raw.tenant ?? null,
+    is_platform_admin: coerceBool(raw.is_platform_admin ?? raw.isPlatformAdmin ?? raw.platformAdmin),
+    is_tenant_admin: coerceBool(raw.is_tenant_admin ?? raw.isTenantAdmin ?? raw.tenantAdmin),
+    is_admin: coerceBool(raw.is_admin ?? raw.isAdmin),
+    active_company_id: raw.active_company_id ?? raw.company_id ?? raw.companyId ?? null,
+    ...raw,
+  } as UserLike;
 }
 
 /**
