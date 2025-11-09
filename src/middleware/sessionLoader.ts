@@ -1,26 +1,30 @@
 // src/middleware/sessionLoader.ts
-import { NextFunction, Request, Response } from "express";
+import { RequestHandler, Request, Response, NextFunction } from "express";
 import db from "../db";
 
 const DEBUG = process.env.NODE_ENV !== "production";
 
 /**
- * Lightweight session loader that reads sid cookie and attaches req.session
- * - loadSessionOptional: attaches session if present, otherwise continues (no 401)
- * - requireSession: enforces session and returns 401 when missing/invalid
- *
- * Exports:
- * - named: loadSessionOptional, requireSession, sessionLoader
- * - default: sessionLoader (function) with properties .loadSessionOptional and .requireSession
- *
- * This shape supports code that does:
+ * A RequestHandler that also exposes named middleware properties.
+ * This matches code that does:
  *   import sessionLoader from "./middleware/sessionLoader";
  *   app.use(sessionLoader.loadSessionOptional)
  *
  * or:
  *   import { requireSession } from "./middleware/sessionLoader";
  */
-async function loadSessionOptional(req: any, _res: any, next: NextFunction) {
+export interface SessionLoader extends RequestHandler {
+  loadSessionOptional: RequestHandler;
+  requireSession: RequestHandler;
+}
+
+/* ---------- helpers ---------- */
+function coerceBool(v: any): boolean {
+  return v === true || v === "true" || v === 1 || v === "1" || v === "t";
+}
+
+/* ---------- loadSessionOptional ---------- */
+const loadSessionOptional: RequestHandler = async (req: any, _res: Response, next: NextFunction) => {
   try {
     const COOKIE_NAME = process.env.COOKIE_NAME_SID || "sid";
     const sid = req.cookies?.[COOKIE_NAME];
@@ -82,17 +86,17 @@ async function loadSessionOptional(req: any, _res: any, next: NextFunction) {
   } catch (err) {
     return next(err);
   }
-}
+};
 
-async function requireSession(req: any, res: any, next: NextFunction) {
+/* ---------- requireSession (enforce) ---------- */
+const requireSession: RequestHandler = async (req: any, res: Response, next: NextFunction) => {
   try {
-    // run optional loader first, then enforce
+    // Ensure optional loader runs first (it mutates req.session)
     await new Promise<void>((resolve, reject) => {
       loadSessionOptional(req, res, (err?: any) => (err ? reject(err) : resolve()));
     });
 
-    const has = req.session && req.session.user_id;
-    if (!has) {
+    if (!req.session || !req.session.user_id) {
       if (DEBUG) console.log("[requireSession] missing session -> 401");
       return res.status(401).json({ error: "unauthenticated" });
     }
@@ -100,20 +104,21 @@ async function requireSession(req: any, res: any, next: NextFunction) {
   } catch (err) {
     return next(err);
   }
-}
+};
 
+/* ---------- typed default export with properties ---------- */
 /**
- * default function middleware: acts like loadSessionOptional
- * but we attach named properties so callers can use sessionLoader.requireSession etc.
+ * Create a default function that behaves like loadSessionOptional and
+ * has both named middlewares as properties. Typed as SessionLoader so TS
+ * recognizes the properties.
  */
-async function sessionLoader(req: any, res: any, next: NextFunction) {
-  return loadSessionOptional(req, res, next);
-}
+const sessionLoader = (async (req: Request, res: Response, next: NextFunction) => {
+  return loadSessionOptional(req as any, res, next);
+}) as unknown as SessionLoader;
 
-// attach named exports to the default function so `sessionLoader.requireSession` works
-(sessionLoader as any).loadSessionOptional = loadSessionOptional;
-(sessionLoader as any).requireSession = requireSession;
+sessionLoader.loadSessionOptional = loadSessionOptional;
+sessionLoader.requireSession = requireSession;
 
-// export both named and default
+/* ---------- exports ---------- */
 export { loadSessionOptional, requireSession, sessionLoader };
 export default sessionLoader;
