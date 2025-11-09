@@ -1,15 +1,13 @@
 // src/middleware/sessionLoader.ts
-import { Request, Response, NextFunction } from "express";
-import db from "../db"; // adapt if your DB client export is different
+import { NextFunction, Request, Response } from "express";
+import db from "../db"; // adjust if your DB client location differs
 
-export async function sessionLoader(req: Request & { session?: any }, res: Response, next: NextFunction) {
+export async function sessionLoader(req: any, res: any, next: NextFunction) {
   try {
     const COOKIE_NAME = process.env.COOKIE_NAME_SID || "sid";
     const sid = req.cookies?.[COOKIE_NAME];
-
     if (!sid) {
-      // not authenticated — don't error, just continue (routes can require session explicitly)
-      return next();
+      return next(); // allow routes to decide; or return 401 if you prefer strict
     }
 
     const q = `
@@ -31,12 +29,12 @@ export async function sessionLoader(req: Request & { session?: any }, res: Respo
       WHERE s.sid = $1
       LIMIT 1
     `;
-
     const { rows } = await db.query(q, [sid]);
     const row = rows?.[0];
 
     if (!row) {
-      // stale/invalid session — allow downstream to treat as unauthenticated
+      // No session found — don't attach session, but allow request to continue.
+      // If you want to block unauthenticated routes here, call `return res.status(401).json({error:'session_expired'})`
       return next();
     }
 
@@ -54,11 +52,11 @@ export async function sessionLoader(req: Request & { session?: any }, res: Respo
       last_seen: row.last_seen,
     };
 
-    // Optionally update last_seen asynchronously (non-blocking)
-    db.query(`UPDATE sessions SET last_seen = now() WHERE sid = $1`, [sid]).catch(() => {});
-
     return next();
   } catch (err) {
     return next(err);
   }
 }
+
+// make compatible with both `import sessionLoader from ...` and `import { sessionLoader } from ...`
+export default sessionLoader;
