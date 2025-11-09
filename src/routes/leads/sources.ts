@@ -1,8 +1,12 @@
-// routes/leads/sources.ts
+// server/src/routes/leads/sources.ts
 import { Router, Request, Response, NextFunction } from "express";
 import db from "../../db"; // adjust path to your DB client
+import requireSession from "../../middleware/requireSession"; // ensure path matches your project
 
 const router = Router();
+
+// Ensure session middleware runs for all routes here so req.session is available.
+router.use(requireSession);
 
 // Toggle verbose debug logs (set to `true` while debugging, `false` in prod)
 const DEBUG = true;
