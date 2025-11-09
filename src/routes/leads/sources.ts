@@ -1,9 +1,9 @@
 // server/src/routes/leads/sources.ts
 import { Router, Request, Response, NextFunction } from "express";
-import db from "../../db"; // your DB client (must expose .query)
-const router = Router();
+import db from "../../db";
+import sessionLoader from "../../middleware/sessionLoader";
 
-// Toggle verbose debug logs (set to `false` in prod)
+const router = Router();
 const DEBUG = true;
 
 type UserLike = {
@@ -17,12 +17,9 @@ type UserLike = {
 };
 
 function coerceBool(v: any): boolean {
-  return v === true || v === "true" || v === 1 || v === "1" || v === "t";
+  return v === true || v === "true" || v === 1 || v === "1" || v === "t" || v === "T";
 }
 
-/**
- * Normalize shapes for user/session objects so routes can trust snake_case flags.
- */
 function normalizeUserShape(raw: any): UserLike {
   return {
     id: raw.id ?? raw.user_id ?? raw.userId,
@@ -35,10 +32,6 @@ function normalizeUserShape(raw: any): UserLike {
   } as UserLike;
 }
 
-/**
- * getUser: tolerant accessor that reads from either req.user (legacy) or req.session.
- * This makes the route robust to different auth middleware shapes.
- */
 function getUser(req: Request): UserLike {
   const uFromUser = (req as any).user ?? null;
   const s = (req as any).session ?? null;
@@ -64,85 +57,9 @@ function getUser(req: Request): UserLike {
 }
 
 /**
- * Lightweight requireSession middleware that:
- * - reads sid cookie (uses process.env.COOKIE_NAME_SID || 'sid')
- * - validates session row and joins app_user to fetch canonical admin flags
- * - attaches normalized session object to req.session for downstream routes
- */
-async function requireSession(req: any, res: any, next: NextFunction) {
-  try {
-    const COOKIE_NAME = process.env.COOKIE_NAME_SID || "sid";
-    const sid = req.cookies?.[COOKIE_NAME];
-    if (!sid) {
-      if (DEBUG) console.log("[requireSession] no sid cookie present");
-      return res.status(401).json({ error: "unauthenticated" });
-    }
-
-    // Query sessions join app_user for canonical flags
-    const q = `
-      SELECT s.sid,
-             s.user_id,
-             s.tenant_id   AS session_tenant_id,
-             u.email,
-             u.name,
-             u.is_admin,
-             u.is_tenant_admin,
-             u.is_platform_admin,
-             u.is_active,
-             u.tenant_id   AS user_tenant_id,
-             u.company_id,
-             s.last_seen,
-             s.issued_at
-      FROM sessions s
-      JOIN app_user u ON u.id = s.user_id
-      WHERE s.sid = $1
-      LIMIT 1
-    `;
-    const { rows } = await db.query(q, [sid]);
-    const row = rows?.[0];
-    if (!row) {
-      if (DEBUG) console.log("[requireSession] sid not found or expired:", sid);
-      return res.status(401).json({ error: "session_expired" });
-    }
-
-    // attach normalized session shape used by getUser() and your routes
-    req.session = {
-      sid: row.sid,
-      user_id: row.user_id,
-      tenant_id: row.session_tenant_id ?? row.user_tenant_id ?? null,
-      company_id: row.company_id ?? null,
-      is_admin: !!row.is_admin,
-      is_tenant_admin: !!row.is_tenant_admin,
-      is_platform_admin: !!row.is_platform_admin,
-      email: row.email,
-      name: row.name,
-      issued_at: row.issued_at,
-      last_seen: row.last_seen,
-    };
-
-    if (DEBUG) {
-      console.log("[requireSession] attached session for user:", req.session.user_id, {
-        tenant: req.session.tenant_id,
-        is_tenant_admin: req.session.is_tenant_admin,
-        is_platform_admin: req.session.is_platform_admin,
-      });
-    }
-
-    return next();
-  } catch (err) {
-    return next(err);
-  }
-}
-
-/* -----------------------
-   Routes (list + CRUD)
-   ----------------------- */
-
-/**
  * GET /api/leads/sources?q=...
- * List sources. Tenant-scoped: platform admins can see global + tenant; tenant users see tenant + global.
  */
-router.get("/", async (req: Request, res: Response, next: NextFunction) => {
+router.get("/", sessionLoader.loadSessionOptional, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const qParam = String(req.query.q ?? "");
     const user = getUser(req);
@@ -170,15 +87,11 @@ router.get("/", async (req: Request, res: Response, next: NextFunction) => {
 
 /**
  * POST /api/leads/sources
- * Body: { key, name, config, tenant_id? }
- *
- * Permission model:
- * - platform admins can create global (tenant_id = NULL) or tenant-scoped sources
- * - tenant admins can only create sources for their own tenant
+ * permission: tenant admin or platform admin
  */
-router.post("/", requireSession, async (req: Request, res: Response, next: NextFunction) => {
+router.post("/", sessionLoader.requireSession, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const user = getUser(req); // this will read from req.session due to requireSession
+    const user = getUser(req);
     const isPlatformAdmin = !!user?.is_platform_admin;
     const isTenantAdmin = !!user?.is_tenant_admin;
 
@@ -198,7 +111,6 @@ router.post("/", requireSession, async (req: Request, res: Response, next: NextF
     const { key, name, config } = req.body ?? {};
     let tenant_id: string | null = req.body?.tenant_id ?? user?.tenant_id ?? null;
 
-    // Tenant admins cannot create for other tenants (safety)
     if (isTenantAdmin && tenant_id && user?.tenant_id && tenant_id !== user.tenant_id) {
       return res.status(403).json({ error: "forbidden_tenant_mismatch" });
     }
@@ -217,10 +129,7 @@ router.post("/", requireSession, async (req: Request, res: Response, next: NextF
       const { rows } = await db.query(insert, [tenant_id ?? null, key, name, config ?? {}]);
       return res.status(201).json({ data: rows[0] });
     } catch (e: any) {
-      // Unique violation
-      if (e?.code === "23505") {
-        return res.status(409).json({ error: "duplicate_key_or_name" });
-      }
+      if (e?.code === "23505") return res.status(409).json({ error: "duplicate_key_or_name" });
       throw e;
     }
   } catch (err) {
@@ -231,7 +140,7 @@ router.post("/", requireSession, async (req: Request, res: Response, next: NextF
 /**
  * GET /api/leads/sources/:id
  */
-router.get("/:id", async (req: Request, res: Response, next: NextFunction) => {
+router.get("/:id", sessionLoader.loadSessionOptional, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id;
     const { rows } = await db.query(
@@ -247,11 +156,8 @@ router.get("/:id", async (req: Request, res: Response, next: NextFunction) => {
 
 /**
  * PUT /api/leads/sources/:id
- * Permission model:
- * - platform admins can update any source
- * - tenant admins can update sources that belong to their tenant only (and cannot update global sources)
  */
-router.put("/:id", requireSession, async (req: Request, res: Response, next: NextFunction) => {
+router.put("/:id", sessionLoader.requireSession, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const user = getUser(req);
     const callerId = user?.id ?? "anonymous";
@@ -270,7 +176,6 @@ router.put("/:id", requireSession, async (req: Request, res: Response, next: Nex
     const existing = existingRes.rows[0];
     const sourceTenant = existing.tenant_id; // may be null (global)
 
-    // Authorization
     if (!isPlatformAdmin) {
       if (!isTenantAdmin) return res.status(403).json({ error: "forbidden" });
       if (!sourceTenant) return res.status(403).json({ error: "forbidden_global_resource" });
@@ -296,12 +201,8 @@ router.put("/:id", requireSession, async (req: Request, res: Response, next: Nex
 
 /**
  * DELETE /api/leads/sources/:id
- *
- * Permission model:
- * - platform admins can delete any source
- * - tenant admins can delete sources that belong to their tenant only (not global)
  */
-router.delete("/:id", requireSession, async (req: Request, res: Response, next: NextFunction) => {
+router.delete("/:id", sessionLoader.requireSession, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const user = getUser(req);
     const callerId = user?.id ?? "anonymous";

@@ -45,6 +45,7 @@ import leadPipelinesRouter from "./routes/leads/pipelines";
 import leadStagesRouter from "./routes/leads/stages";
 import leadIndustriesRouter from "./routes/leads/industries";
 import { leadsNewRouter } from "./routes/new/leads-new";
+import { sessionLoader } from "./middleware/sessionLoader";
 
 
 
@@ -133,6 +134,9 @@ app.use("/api/kpis", kpisRouter);
 app.use(cookieParser());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+app.use("/api", sessionLoader);
+
 
 /* ───────────────────────────── Request logger ───────────────────────────── */
 app.use((req, _res, next) => {
