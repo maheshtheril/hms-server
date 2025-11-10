@@ -88,6 +88,8 @@ router.get("/", sessionLoader.loadSessionOptional, async (req: Request, res: Res
 /**
  * POST /api/leads/sources
  * permission: tenant admin or platform admin
+ *
+ * Accepts both { key, name } and { code, name } for backward compatibility.
  */
 router.post("/", sessionLoader.requireSession, async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -100,7 +102,12 @@ router.post("/", sessionLoader.requireSession, async (req: Request, res: Respons
         isPlatformAdmin,
         isTenantAdmin,
         userTenant: user?.tenant_id,
-        bodyPreview: { key: req.body?.key, name: req.body?.name },
+        // only show presence, don't log sensitive fields
+        bodyPreview: {
+          has_key: !!req.body?.key,
+          has_code: !!req.body?.code,
+          has_name: !!req.body?.name,
+        },
       });
     }
 
@@ -108,15 +115,27 @@ router.post("/", sessionLoader.requireSession, async (req: Request, res: Respons
       return res.status(403).json({ error: "forbidden", reason: "requires_admin" });
     }
 
-    const { key, name, config } = req.body ?? {};
+    // Normalize key: accept 'key' or 'code', trim + uppercase
+    const rawKey = (req.body?.key ?? req.body?.code ?? "")?.toString();
+    const normalizedKey = rawKey?.trim() ? rawKey.trim().toUpperCase() : "";
+
+    const name = (req.body?.name ?? "")?.toString().trim();
+    const config = req.body?.config ?? {};
+
     let tenant_id: string | null = req.body?.tenant_id ?? user?.tenant_id ?? null;
 
     if (isTenantAdmin && tenant_id && user?.tenant_id && tenant_id !== user.tenant_id) {
       return res.status(403).json({ error: "forbidden_tenant_mismatch" });
     }
 
-    if (!key || !name) {
-      return res.status(400).json({ error: "key_and_name_required" });
+    if (!normalizedKey || !name) {
+      return res.status(400).json({
+        error: "key_and_name_required",
+        details: {
+          provided: { key: !!req.body?.key, code: !!req.body?.code, name: !!req.body?.name },
+          hint: "send JSON with { key: 'SOMEKEY', name: 'Human readable name' } or { code: 'SOMEKEY', name: '...' }",
+        },
+      });
     }
 
     const insert = `
@@ -126,9 +145,10 @@ router.post("/", sessionLoader.requireSession, async (req: Request, res: Respons
     `;
 
     try {
-      const { rows } = await db.query(insert, [tenant_id ?? null, key, name, config ?? {}]);
+      const { rows } = await db.query(insert, [tenant_id ?? null, normalizedKey, name, config ?? {}]);
       return res.status(201).json({ data: rows[0] });
     } catch (e: any) {
+      // unique violation
       if (e?.code === "23505") return res.status(409).json({ error: "duplicate_key_or_name" });
       throw e;
     }
@@ -182,13 +202,22 @@ router.put("/:id", sessionLoader.requireSession, async (req: Request, res: Respo
       if (callerTenant !== sourceTenant) return res.status(403).json({ error: "forbidden_tenant_mismatch" });
     }
 
-    const { key, name, config } = req.body ?? {};
+    // Normalize incoming key similarly to create
+    const rawKey = (req.body?.key ?? req.body?.code ?? "")?.toString();
+    const normalizedKey = rawKey?.trim() ? rawKey.trim().toUpperCase() : "";
+    const name = (req.body?.name ?? "")?.toString().trim();
+    const config = req.body?.config ?? {};
+
+    if (!normalizedKey || !name) {
+      return res.status(400).json({ error: "key_and_name_required" });
+    }
+
     const { rows } = await db.query(
       `UPDATE public.lead_source
          SET key=$1, name=$2, config=$3, updated_at = now()
        WHERE id=$4
        RETURNING id, tenant_id, key, name, config, created_at`,
-      [key, name, config ?? {}, id]
+      [normalizedKey, name, config ?? {}, id]
     );
 
     if (rows.length === 0) return res.status(404).json({ error: "not_found" });
