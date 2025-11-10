@@ -5,13 +5,22 @@ import { NextFunction, Request, Response } from "express";
 
 const COOKIE_NAME = process.env.COOKIE_NAME_SID || "sid";
 
-function coerceBool(v: any) { return v === true || v === "true" || v === 1 || v === "1" || v === "t"; }
+function coerceBool(v: any) {
+  return v === true || v === "true" || v === 1 || v === "1" || v === "t";
+}
 
-async function loadSessionOptional(req: any, _res: any, next: NextFunction) {
+/**
+ * Load session if cookie present. Does NOT enforce authentication.
+ * Attaches `req.session` (object) in all cases.
+ */
+export async function loadSessionOptional(req: any, _res: any, next: NextFunction) {
   try {
-    const cookies = cookie.parse(req.headers.cookie || "");
+    const cookies = cookie.parse(req.headers?.cookie || "");
     const sid = cookies[COOKIE_NAME] || null;
-    if (!sid) { req.session = {}; return next(); }
+    if (!sid) {
+      req.session = {};
+      return next();
+    }
 
     const q = `
       SELECT s.sid, s.user_id, s.tenant_id AS session_tenant_id,
@@ -26,7 +35,10 @@ async function loadSessionOptional(req: any, _res: any, next: NextFunction) {
     `;
     const { rows } = await db.query(q, [sid]);
     const row = rows?.[0];
-    if (!row) { req.session = {}; return next(); }
+    if (!row) {
+      req.session = {};
+      return next();
+    }
 
     req.session = {
       sid: row.sid,
@@ -41,15 +53,20 @@ async function loadSessionOptional(req: any, _res: any, next: NextFunction) {
       issued_at: row.issued_at,
       last_seen: row.last_seen,
     };
+
     return next();
   } catch (err) {
     return next(err);
   }
 }
 
-async function requireSession(req: any, res: any, next: NextFunction) {
+/**
+ * Require a valid session or respond 401.
+ * Attaches `req.session` when valid.
+ */
+export async function requireSession(req: any, res: any, next: NextFunction) {
   try {
-    const cookies = cookie.parse(req.headers.cookie || "");
+    const cookies = cookie.parse(req.headers?.cookie || "");
     const sid = cookies[COOKIE_NAME] || null;
     if (!sid) return res.status(401).json({ error: "unauthenticated" });
 
@@ -82,7 +99,6 @@ async function requireSession(req: any, res: any, next: NextFunction) {
       last_seen: row.last_seen,
     };
 
-    // small debug to verify cookie reached this process (remove after)
     if (process.env.DEBUG_REQUIRE_SESSION) {
       console.log("[requireSession] parsed sid:", sid, "attached user:", req.session.user_id);
     }
@@ -93,5 +109,11 @@ async function requireSession(req: any, res: any, next: NextFunction) {
   }
 }
 
-export { loadSessionOptional, requireSession };
-export default { loadSessionOptional, requireSession };
+/**
+ * BACKWARDS/INTEROP:
+ * Many files historically import `{ sessionLoader }` — provide that named export.
+ * We alias it to the optional loader so importers that expect a non-fatal loader keep working.
+ */
+export const sessionLoader = loadSessionOptional;
+
+export default { loadSessionOptional, requireSession, sessionLoader };
