@@ -59,7 +59,6 @@ function getUser(req: Request): UserLike {
 /** Return value if v looks like a UUID v4/v1 hex string, otherwise null */
 function safeUUID(v: any): string | null {
   if (!v || typeof v !== "string") return null;
-  // simple UUID check: 36 chars with hex and dashes. Good-enough guard.
   const re = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
   return re.test(v) ? v : null;
 }
@@ -73,7 +72,13 @@ router.get("/", sessionLoader.loadSessionOptional, async (req: Request, res: Res
     const user = getUser(req);
 
     // ensure tenantId is only used when it's a valid UUID string
-    let tenantId = safeUUID(user?.tenant_id ?? null);
+    const rawTenant = user?.tenant_id ?? null;
+    let tenantId = safeUUID(rawTenant);
+
+    if (rawTenant && !tenantId) {
+      // extra defensive log to help trace where bad tenant values come from
+      console.warn("[leads/sources] warning: user.tenant_id present but invalid UUID:", rawTenant);
+    }
 
     if (DEBUG) {
       console.log("GET /api/leads/sources called by:", user?.id ?? "anon", { tenantId, q: qParam });
