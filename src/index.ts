@@ -174,7 +174,7 @@ app.use("/api/hms/departments", hmsDepartments);
 
 app.use("/api", me);
 
-app.use("/api", leads);
+
 app.use("/api", pipelines);
 app.use("/api", kanban);
 
@@ -205,7 +205,7 @@ app.use("/api/leads/pipelines", leadPipelinesRouter);
 app.use("/api/leads/stages", leadStagesRouter);
 app.use("/api/leads/industries", leadIndustriesRouter);
 app.use("/api", leadsNewRouter);
-
+app.use("/api", leads);
 
 
 /* ───────────────────────────── Uploads, Tenants, Scheduler ───────────────────────────── */
