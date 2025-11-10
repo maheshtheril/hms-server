@@ -1,4 +1,14 @@
 // server/src/routes/leads/sources.ts
+/**
+ * Hardened lead sources routes.
+ *
+ * Key improvements:
+ * - Adds router.param('id') to validate :id as UUID early and return 400 if invalid.
+ * - Uses safeUUID consistently for tenant_id and id checks.
+ * - Keeps the same route order: static "/" and POST "/" first, then "/:id" routes.
+ * - Adds concise debug logs to help reproduce route param problems like 'invalid input syntax for type uuid: "sources"'.
+ */
+
 import { Router, Request, Response, NextFunction } from "express";
 import db from "../../db";
 import sessionLoader from "../../middleware/sessionLoader";
@@ -64,7 +74,35 @@ function safeUUID(v: any): string | null {
 }
 
 /**
+ * Defensive param middleware:
+ * If this router is (incorrectly) mounted higher (e.g. at /api/leads),
+ * and a request like GET /api/leads/sources reaches a route that expects :id,
+ * this param middleware will reject non-UUIDs early with a 400 rather than allowing
+ * the value into SQL and causing pg to throw 22P02.
+ */
+router.param("id", (req: Request, res: Response, next: NextFunction, id: string) => {
+  if (!safeUUID(id)) {
+    if (DEBUG) {
+      console.warn("[leads/sources] invalid id param detected (not UUID):", id, "originalUrl=", req.originalUrl);
+    }
+    return res.status(400).json({ error: "invalid_id", reason: "id_must_be_uuid" });
+  }
+  // keep the validated id in req.params (unchanged) — handlers can safely use it
+  next();
+});
+
+// --- Optional: helpful logging for debugging route param issues (temporary)
+router.use((req: Request, res: Response, next: NextFunction) => {
+  if (DEBUG) {
+    // Only basic, non-sensitive info
+    console.log("[LEADS/SOURCES ROUTE]", req.method, req.originalUrl, "params=", req.params, "query=", req.query);
+  }
+  next();
+});
+
+/**
  * GET /api/leads/sources?q=...
+ * (If router is mounted at /api/leads/sources, this is GET "/")
  */
 router.get("/", sessionLoader.loadSessionOptional, async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -179,10 +217,11 @@ router.post("/", sessionLoader.requireSession, async (req: Request, res: Respons
 
 /**
  * GET /api/leads/sources/:id
+ * Note: :id is validated by router.param above
  */
 router.get("/:id", sessionLoader.loadSessionOptional, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const id = req.params.id;
+    const id = req.params.id; // guaranteed UUID by router.param
     const { rows } = await db.query(
       "SELECT id, tenant_id, key, name, config, created_at FROM public.lead_source WHERE id = $1 LIMIT 1",
       [id]
@@ -209,7 +248,7 @@ router.put("/:id", sessionLoader.requireSession, async (req: Request, res: Respo
       console.log("PUT /api/leads/sources/:id called by", callerId, { isPlatformAdmin, isTenantAdmin, callerTenant });
     }
 
-    const id = req.params.id;
+    const id = req.params.id; // validated by router.param
     const existingRes = await db.query("SELECT id, tenant_id FROM public.lead_source WHERE id = $1 LIMIT 1", [id]);
     if (existingRes.rows.length === 0) return res.status(404).json({ error: "not_found" });
 
@@ -263,7 +302,7 @@ router.delete("/:id", sessionLoader.requireSession, async (req: Request, res: Re
       console.log("DELETE /api/leads/sources/:id called by", callerId, { isPlatformAdmin, isTenantAdmin, callerTenant });
     }
 
-    const id = req.params.id;
+    const id = req.params.id; // validated by router.param
     const existingRes = await db.query("SELECT id, tenant_id FROM public.lead_source WHERE id = $1 LIMIT 1", [id]);
     if (existingRes.rows.length === 0) return res.status(404).json({ error: "not_found" });
 
