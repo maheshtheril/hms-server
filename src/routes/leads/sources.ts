@@ -56,6 +56,14 @@ function getUser(req: Request): UserLike {
   return {};
 }
 
+/** Return value if v looks like a UUID v4/v1 hex string, otherwise null */
+function safeUUID(v: any): string | null {
+  if (!v || typeof v !== "string") return null;
+  // simple UUID check: 36 chars with hex and dashes. Good-enough guard.
+  const re = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+  return re.test(v) ? v : null;
+}
+
 /**
  * GET /api/leads/sources?q=...
  */
@@ -63,7 +71,9 @@ router.get("/", sessionLoader.loadSessionOptional, async (req: Request, res: Res
   try {
     const qParam = String(req.query.q ?? "");
     const user = getUser(req);
-    const tenantId = user?.tenant_id ?? null;
+
+    // ensure tenantId is only used when it's a valid UUID string
+    let tenantId = safeUUID(user?.tenant_id ?? null);
 
     if (DEBUG) {
       console.log("GET /api/leads/sources called by:", user?.id ?? "anon", { tenantId, q: qParam });
@@ -72,8 +82,12 @@ router.get("/", sessionLoader.loadSessionOptional, async (req: Request, res: Res
     const sql = `
       SELECT id, tenant_id, key, name, config, created_at
       FROM public.lead_source
-      WHERE ($1::uuid IS NULL OR tenant_id = $1 OR tenant_id IS NULL)
-        AND (name ILIKE $2 OR key ILIKE $2)
+      WHERE (
+          $1::text IS NULL
+          OR tenant_id::text = $1
+          OR tenant_id IS NULL
+      )
+      AND (name ILIKE $2 OR key ILIKE $2)
       ORDER BY name
       LIMIT 1000
     `;
@@ -123,6 +137,7 @@ router.post("/", sessionLoader.requireSession, async (req: Request, res: Respons
     const config = req.body?.config ?? {};
 
     let tenant_id: string | null = req.body?.tenant_id ?? user?.tenant_id ?? null;
+    tenant_id = safeUUID(tenant_id) ?? null;
 
     if (isTenantAdmin && tenant_id && user?.tenant_id && tenant_id !== user.tenant_id) {
       return res.status(403).json({ error: "forbidden_tenant_mismatch" });
