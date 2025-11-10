@@ -1,7 +1,7 @@
 // server/src/middleware/sessionLoader.ts
 import db from "../db";
-import cookie from "cookie";
-import { NextFunction, Request, Response } from "express";
+import { parse as parseCookie } from "cookie";
+import { NextFunction } from "express";
 
 const COOKIE_NAME = process.env.COOKIE_NAME_SID || "sid";
 
@@ -12,10 +12,16 @@ function coerceBool(v: any) {
 /**
  * Load session if cookie present. Does NOT enforce authentication.
  * Attaches `req.session` (object) in all cases.
+ * Very defensive: never throws, always attaches req.session.
  */
 export async function loadSessionOptional(req: any, _res: any, next: NextFunction) {
   try {
-    const cookies = cookie.parse(req.headers?.cookie || "");
+    if (!req || !req.headers) {
+      req.session = {};
+      return next();
+    }
+
+    const cookies = parseCookie(req.headers.cookie || "");
     const sid = cookies[COOKIE_NAME] || null;
     if (!sid) {
       req.session = {};
@@ -55,8 +61,11 @@ export async function loadSessionOptional(req: any, _res: any, next: NextFunctio
     };
 
     return next();
-  } catch (err) {
-    return next(err);
+  } catch (err: any) {
+    console.error("[sessionLoader] error (loadSessionOptional):", err?.stack ?? err);
+    // degrade gracefully
+    try { req.session = {}; } catch (_) {}
+    return next();
   }
 }
 
@@ -66,7 +75,9 @@ export async function loadSessionOptional(req: any, _res: any, next: NextFunctio
  */
 export async function requireSession(req: any, res: any, next: NextFunction) {
   try {
-    const cookies = cookie.parse(req.headers?.cookie || "");
+    if (!req || !req.headers) return res.status(401).json({ error: "unauthenticated" });
+
+    const cookies = parseCookie(req.headers.cookie || "");
     const sid = cookies[COOKIE_NAME] || null;
     if (!sid) return res.status(401).json({ error: "unauthenticated" });
 
@@ -104,16 +115,14 @@ export async function requireSession(req: any, res: any, next: NextFunction) {
     }
 
     return next();
-  } catch (err) {
-    return next(err);
+  } catch (err: any) {
+    console.error("[sessionLoader] error (requireSession):", err?.stack ?? err);
+    return res.status(500).json({ error: "internal_server_error" });
   }
 }
 
-/**
- * BACKWARDS/INTEROP:
- * Many files historically import `{ sessionLoader }` — provide that named export.
- * We alias it to the optional loader so importers that expect a non-fatal loader keep working.
- */
+/* Alias: provide a named export `sessionLoader` (points to optional loader) */
 export const sessionLoader = loadSessionOptional;
 
+/* Default export kept for backward compatibility */
 export default { loadSessionOptional, requireSession, sessionLoader };
