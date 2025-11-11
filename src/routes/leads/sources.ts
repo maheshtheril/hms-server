@@ -2,11 +2,13 @@
 /**
  * Hardened lead sources routes.
  *
- * Key improvements:
- * - Adds router.param('id') to validate :id as UUID early and return 400 if invalid.
- * - Uses safeUUID consistently for tenant_id and id checks.
- * - Keeps the same route order: static "/" and POST "/" first, then "/:id" routes.
- * - Adds concise debug logs to help reproduce route param problems like 'invalid input syntax for type uuid: "sources"'.
+ * Improvements:
+ * - router.param('id') validates :id as UUID early and returns 400 if invalid.
+ * - Stores validated id in req.params._validatedId for handlers to use.
+ * - Normalizes tenant_id with safeUUID everywhere and sends explicit null to SQL.
+ * - Defensive middleware to normalize empty-string query params.
+ * - Clearer error responses for POST/PUT for quicker debugging.
+ * - Debug logging controlled by DEBUG constant.
  */
 
 import { Router, Request, Response, NextFunction } from "express";
@@ -74,35 +76,39 @@ function safeUUID(v: any): string | null {
 }
 
 /**
- * Defensive param middleware:
- * If this router is (incorrectly) mounted higher (e.g. at /api/leads),
- * and a request like GET /api/leads/sources reaches a route that expects :id,
- * this param middleware will reject non-UUIDs early with a 400 rather than allowing
- * the value into SQL and causing pg to throw 22P02.
+ * router.param('id') - validate id early and keep validated copy
  */
 router.param("id", (req: Request, res: Response, next: NextFunction, id: string) => {
-  if (!safeUUID(id)) {
+  const v = safeUUID(id);
+  if (!v) {
     if (DEBUG) {
-      console.warn("[leads/sources] invalid id param detected (not UUID):", id, "originalUrl=", req.originalUrl);
+      console.warn("[leads/sources] invalid id param (not UUID):", id, "originalUrl=", req.originalUrl);
     }
     return res.status(400).json({ error: "invalid_id", reason: "id_must_be_uuid" });
   }
-  // keep the validated id in req.params (unchanged) — handlers can safely use it
+  // store validated value on a non-conflicting key
+  (req.params as any)._validatedId = v;
   next();
 });
 
-// --- Optional: helpful logging for debugging route param issues (temporary)
+// defensive: normalize empty-string query values to undefined/null
 router.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.query) {
+    Object.keys(req.query).forEach((k) => {
+      const v = req.query[k];
+      if (typeof v === "string" && v.trim() === "") {
+        delete req.query[k];
+      }
+    });
+  }
   if (DEBUG) {
-    // Only basic, non-sensitive info
-    console.log("[LEADS/SOURCES ROUTE]", req.method, req.originalUrl, "params=", req.params, "query=", req.query);
+    console.log("[LEADS/SOURCES] Incoming:", req.method, req.originalUrl, "params=", req.params);
   }
   next();
 });
 
 /**
  * GET /api/leads/sources?q=...
- * (If router is mounted at /api/leads/sources, this is GET "/")
  */
 router.get("/", sessionLoader.loadSessionOptional, async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -111,10 +117,10 @@ router.get("/", sessionLoader.loadSessionOptional, async (req: Request, res: Res
 
     // ensure tenantId is only used when it's a valid UUID string
     const rawTenant = user?.tenant_id ?? null;
-    let tenantId = safeUUID(rawTenant);
+    const tenantId = safeUUID(rawTenant) ?? null;
 
     if (rawTenant && !tenantId) {
-      // extra defensive log to help trace where bad tenant values come from
+      // extra defensive log to help trace bad tenant values
       console.warn("[leads/sources] warning: user.tenant_id present but invalid UUID:", rawTenant);
     }
 
@@ -159,7 +165,6 @@ router.post("/", sessionLoader.requireSession, async (req: Request, res: Respons
         isPlatformAdmin,
         isTenantAdmin,
         userTenant: user?.tenant_id,
-        // only show presence, don't log sensitive fields
         bodyPreview: {
           has_key: !!req.body?.key,
           has_code: !!req.body?.code,
@@ -206,9 +211,10 @@ router.post("/", sessionLoader.requireSession, async (req: Request, res: Respons
       const { rows } = await db.query(insert, [tenant_id ?? null, normalizedKey, name, config ?? {}]);
       return res.status(201).json({ data: rows[0] });
     } catch (e: any) {
-      // unique violation
       if (e?.code === "23505") return res.status(409).json({ error: "duplicate_key_or_name" });
-      throw e;
+      // log error and return safe message
+      console.error("[leads/sources] POST DB error:", e && (e.stack || e.message || e));
+      return res.status(500).json({ error: "internal_server_error", message: "could_not_create_source" });
     }
   } catch (err) {
     return next(err);
@@ -217,11 +223,11 @@ router.post("/", sessionLoader.requireSession, async (req: Request, res: Respons
 
 /**
  * GET /api/leads/sources/:id
- * Note: :id is validated by router.param above
+ * Note: :id validated by router.param above; validated id available at req.params._validatedId
  */
 router.get("/:id", sessionLoader.loadSessionOptional, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const id = req.params.id; // guaranteed UUID by router.param
+    const id = (req.params as any)._validatedId ?? req.params.id;
     const { rows } = await db.query(
       "SELECT id, tenant_id, key, name, config, created_at FROM public.lead_source WHERE id = $1 LIMIT 1",
       [id]
@@ -248,7 +254,7 @@ router.put("/:id", sessionLoader.requireSession, async (req: Request, res: Respo
       console.log("PUT /api/leads/sources/:id called by", callerId, { isPlatformAdmin, isTenantAdmin, callerTenant });
     }
 
-    const id = req.params.id; // validated by router.param
+    const id = (req.params as any)._validatedId ?? req.params.id;
     const existingRes = await db.query("SELECT id, tenant_id FROM public.lead_source WHERE id = $1 LIMIT 1", [id]);
     if (existingRes.rows.length === 0) return res.status(404).json({ error: "not_found" });
 
@@ -271,18 +277,23 @@ router.put("/:id", sessionLoader.requireSession, async (req: Request, res: Respo
       return res.status(400).json({ error: "key_and_name_required" });
     }
 
-    const { rows } = await db.query(
-      `UPDATE public.lead_source
-         SET key=$1, name=$2, config=$3, updated_at = now()
-       WHERE id=$4
-       RETURNING id, tenant_id, key, name, config, created_at`,
-      [normalizedKey, name, config ?? {}, id]
-    );
+    try {
+      const { rows } = await db.query(
+        `UPDATE public.lead_source
+           SET key=$1, name=$2, config=$3, updated_at = now()
+         WHERE id=$4
+         RETURNING id, tenant_id, key, name, config, created_at`,
+        [normalizedKey, name, config ?? {}, id]
+      );
 
-    if (rows.length === 0) return res.status(404).json({ error: "not_found" });
-    return res.json({ data: rows[0] });
+      if (rows.length === 0) return res.status(404).json({ error: "not_found" });
+      return res.json({ data: rows[0] });
+    } catch (e: any) {
+      if (e?.code === "23505") return res.status(409).json({ error: "duplicate_key_or_name" });
+      console.error("[leads/sources] PUT DB error:", e && (e.stack || e.message || e));
+      return res.status(500).json({ error: "internal_server_error", message: "could_not_update_source" });
+    }
   } catch (err: any) {
-    if (err?.code === "23505") return res.status(409).json({ error: "duplicate_key_or_name" });
     return next(err);
   }
 });
@@ -302,7 +313,7 @@ router.delete("/:id", sessionLoader.requireSession, async (req: Request, res: Re
       console.log("DELETE /api/leads/sources/:id called by", callerId, { isPlatformAdmin, isTenantAdmin, callerTenant });
     }
 
-    const id = req.params.id; // validated by router.param
+    const id = (req.params as any)._validatedId ?? req.params.id;
     const existingRes = await db.query("SELECT id, tenant_id FROM public.lead_source WHERE id = $1 LIMIT 1", [id]);
     if (existingRes.rows.length === 0) return res.status(404).json({ error: "not_found" });
 
