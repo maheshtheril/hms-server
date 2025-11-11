@@ -172,13 +172,13 @@ router.put("/:id", sessionLoader.requireSession, async (req, res, next) => {
       return res.status(400).json({ error: "key_and_name_required" });
 
     const { rows } = await db.query(
-      `UPDATE public.lead_source
-         SET key=$1, name=$2, description=$3, is_active=$4, config=$5,
-             updated_at = CASE WHEN column_name_exists('public.lead_source','updated_at') THEN now() ELSE created_at END
-       WHERE id=$6
-       RETURNING id, tenant_id, key, name, description, is_active, config, created_at, updated_at`,
-      [key, name, description, is_active, config, id]
-    );
+  `UPDATE public.lead_source
+     SET key=$1, name=$2, description=$3, is_active=$4, config=$5, updated_at = now()
+   WHERE id=$6
+   RETURNING id, tenant_id, key, name, description, is_active, config, created_at, updated_at`,
+  [key, name, description, is_active, config, id]
+);
+
 
     return res.json({ data: rows[0] });
   } catch (e: any) {
