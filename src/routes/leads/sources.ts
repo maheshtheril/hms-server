@@ -246,24 +246,24 @@ router.delete("/:id", sessionLoader.requireSession, async (req, res, next) => {
  * POST /api/leads/sources/:id/restore
  * Clears deleted_at/deleted_by and re-activates the row
  */
+/* POST /:id/restore — improved logging & error responses */
 router.post("/:id/restore", sessionLoader.requireSession, async (req, res, next) => {
-  try {
-    const user = getUser(req);
-    const id = (req.params as any)._validatedId;
+  const id = (req.params as any)._validatedId;
+  const user = getUser(req);
 
-    const existing = await db.query(
-      "SELECT id, tenant_id FROM public.lead_source WHERE id=$1 LIMIT 1",
-      [id]
-    );
+  try {
+    // fetch existing row for tenant checks
+    const existing = await db.query("SELECT id, tenant_id FROM public.lead_source WHERE id=$1 LIMIT 1", [id]);
     if (!existing.rows.length) return res.status(404).json({ error: "not_found" });
     const srcTenant = existing.rows[0].tenant_id;
 
+    // permission checks
     if (!user?.is_platform_admin) {
       if (!user?.is_tenant_admin && !user?.is_admin) return res.status(403).json({ error: "forbidden" });
-      if (srcTenant && srcTenant !== user?.tenant_id)
-        return res.status(403).json({ error: "forbidden_tenant_mismatch" });
+      if (srcTenant && srcTenant !== user?.tenant_id) return res.status(403).json({ error: "forbidden_tenant_mismatch" });
     }
 
+    // attempt restore
     await db.query(
       `UPDATE public.lead_source
          SET deleted_at = NULL, deleted_by = NULL, is_active = true, updated_at = now()
@@ -271,15 +271,32 @@ router.post("/:id/restore", sessionLoader.requireSession, async (req, res, next)
       [id]
     );
 
+    // return the row (fresh)
     const { rows } = await db.query(
-      `SELECT id, tenant_id, key, name, description, is_active, config, created_by, created_at, COALESCE(updated_at, created_at) as updated_at, deleted_at, deleted_by
+      `SELECT id, tenant_id, key, name, description, is_active, config, created_by, created_at,
+              COALESCE(updated_at, created_at) as updated_at, deleted_at, deleted_by
        FROM public.lead_source WHERE id=$1 LIMIT 1`,
       [id]
     );
     return res.json({ data: rows[0] });
-  } catch (err) {
-    next(err);
+  } catch (err: any) {
+    // explicit logging — will appear in your service logs
+    console.error("[lead_source] restore error:", {
+      message: err?.message,
+      stack: err?.stack,
+      code: err?.code,
+      detail: err?.detail,
+      hint: err?.hint,
+    });
+
+    // friendly JSON to client with PG-specific details if present
+    const payload: any = { error: "restore_failed", message: err?.message ?? "unknown_error" };
+    if (err?.code) payload.pg_code = err.code;
+    if (err?.detail) payload.pg_detail = err.detail;
+    if (err?.hint) payload.pg_hint = err.hint;
+    return res.status(500).json(payload);
   }
 });
+
 
 export default router;
