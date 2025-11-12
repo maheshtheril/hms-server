@@ -252,35 +252,86 @@ router.post("/:id/restore", sessionLoader.requireSession, async (req, res, next)
   const user = getUser(req);
 
   try {
-    // fetch existing row for tenant checks
-    const existing = await db.query("SELECT id, tenant_id FROM public.lead_source WHERE id=$1 LIMIT 1", [id]);
-    if (!existing.rows.length) return res.status(404).json({ error: "not_found" });
-    const srcTenant = existing.rows[0].tenant_id;
+    // load the row we want to restore
+    const existing = await db.query(
+      `SELECT id, tenant_id, key, name, deleted_at
+         FROM public.lead_source
+        WHERE id=$1 LIMIT 1`,
+      [id]
+    );
+    if (!existing.rows.length)
+      return res.status(404).json({ error: "not_found" });
+
+    const row = existing.rows[0];
+    const srcTenant = row.tenant_id;
+    const rowKey = row.key ?? null;
 
     // permission checks
     if (!user?.is_platform_admin) {
-      if (!user?.is_tenant_admin && !user?.is_admin) return res.status(403).json({ error: "forbidden" });
-      if (srcTenant && srcTenant !== user?.tenant_id) return res.status(403).json({ error: "forbidden_tenant_mismatch" });
+      if (!user?.is_tenant_admin && !user?.is_admin)
+        return res.status(403).json({ error: "forbidden" });
+      if (srcTenant && srcTenant !== user?.tenant_id)
+        return res
+          .status(403)
+          .json({ error: "forbidden_tenant_mismatch" });
     }
 
-    // attempt restore
+    // check for duplicate active row with same key and tenant
+    if (rowKey) {
+      const dupRes = await db.query(
+        `SELECT id
+           FROM public.lead_source
+          WHERE key=$1
+            AND (tenant_id::text IS NULL OR tenant_id::text=$2)
+            AND id<>$3
+            AND deleted_at IS NULL
+          LIMIT 1`,
+        [rowKey, srcTenant, id]
+      );
+
+      if (dupRes.rows.length) {
+        const dupId = dupRes.rows[0].id;
+
+        console.log(
+          `[lead_source] auto soft-deleting conflicting active source ${dupId} (key=${rowKey})`
+        );
+
+        await db.query(
+          `UPDATE public.lead_source
+             SET deleted_at = now(),
+                 deleted_by = $2,
+                 is_active = false,
+                 updated_at = now()
+           WHERE id = $1`,
+          [dupId, user?.id ?? null]
+        );
+      }
+    }
+
+    // now restore this record
     await db.query(
       `UPDATE public.lead_source
-         SET deleted_at = NULL, deleted_by = NULL, is_active = true, updated_at = now()
-       WHERE id = $1`,
+         SET deleted_at = NULL,
+             deleted_by = NULL,
+             is_active = true,
+             updated_at = now()
+       WHERE id=$1`,
       [id]
     );
 
-    // return the row (fresh)
+    // return updated row
     const { rows } = await db.query(
       `SELECT id, tenant_id, key, name, description, is_active, config, created_by, created_at,
-              COALESCE(updated_at, created_at) as updated_at, deleted_at, deleted_by
-       FROM public.lead_source WHERE id=$1 LIMIT 1`,
+              COALESCE(updated_at, created_at) AS updated_at, deleted_at, deleted_by
+         FROM public.lead_source WHERE id=$1 LIMIT 1`,
       [id]
     );
-    return res.json({ data: rows[0] });
+
+    return res.json({
+      data: rows[0],
+      message: "Restored successfully (auto soft-deleted any conflict)",
+    });
   } catch (err: any) {
-    // explicit logging — will appear in your service logs
     console.error("[lead_source] restore error:", {
       message: err?.message,
       stack: err?.stack,
@@ -289,11 +340,14 @@ router.post("/:id/restore", sessionLoader.requireSession, async (req, res, next)
       hint: err?.hint,
     });
 
-    // friendly JSON to client with PG-specific details if present
-    const payload: any = { error: "restore_failed", message: err?.message ?? "unknown_error" };
+    const payload: any = {
+      error: "restore_failed",
+      message: err?.message ?? "unknown_error",
+    };
     if (err?.code) payload.pg_code = err.code;
     if (err?.detail) payload.pg_detail = err.detail;
     if (err?.hint) payload.pg_hint = err.hint;
+
     return res.status(500).json(payload);
   }
 });
