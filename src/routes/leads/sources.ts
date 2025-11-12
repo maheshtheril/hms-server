@@ -1,10 +1,12 @@
 /**
- * Lead Sources Routes — production ready
- * Includes: full CRUD (key, name, description, is_active, config)
+ * server/src/routes/leads/sources.ts
+ *
+ * Lead Sources Routes — production ready with soft-delete & restore
+ * - full CRUD (key, name, description, is_active, config)
  * - router.param('id') validates UUID early.
  * - Safe tenant checks for multi-tenant mode.
- * - Proper handling of description/is_active.
- * - Works even if updated_at is missing (fallback to created_at).
+ * - Soft-delete (deleted_at, deleted_by) and restore endpoint.
+ * - List excludes deleted rows by default; supports ?with_deleted=1
  */
 
 import { Router, Request, Response, NextFunction } from "express";
@@ -31,12 +33,12 @@ function coerceBool(v: any): boolean {
 
 function normalizeUserShape(raw: any): UserLike {
   return {
-    id: raw.id ?? raw.user_id ?? raw.userId,
-    tenant_id: raw.tenant_id ?? raw.tenantId ?? raw.tenant ?? null,
-    is_platform_admin: coerceBool(raw.is_platform_admin ?? raw.isPlatformAdmin ?? raw.platformAdmin),
-    is_tenant_admin: coerceBool(raw.is_tenant_admin ?? raw.isTenantAdmin ?? raw.tenantAdmin),
-    is_admin: coerceBool(raw.is_admin ?? raw.isAdmin),
-    active_company_id: raw.active_company_id ?? raw.company_id ?? raw.companyId ?? null,
+    id: raw?.id ?? raw?.user_id ?? raw?.userId,
+    tenant_id: raw?.tenant_id ?? raw?.tenantId ?? raw?.tenant ?? null,
+    is_platform_admin: coerceBool(raw?.is_platform_admin ?? raw?.isPlatformAdmin ?? raw?.platformAdmin),
+    is_tenant_admin: coerceBool(raw?.is_tenant_admin ?? raw?.isTenantAdmin ?? raw?.tenantAdmin),
+    is_admin: coerceBool(raw?.is_admin ?? raw?.isAdmin),
+    active_company_id: raw?.active_company_id ?? raw?.company_id ?? raw?.companyId ?? null,
     ...raw,
   } as UserLike;
 }
@@ -68,24 +70,31 @@ router.param("id", (req, res, next, id) => {
 });
 
 /* ---------------------- GET list ---------------------- */
+/**
+ * GET /api/leads/sources?q=...&with_deleted=1
+ * - tenant-scoped: returns tenant-specific + global (tenant_id IS NULL).
+ * - excludes soft-deleted rows by default.
+ */
 router.get("/", sessionLoader.loadSessionOptional, async (req, res, next) => {
   try {
     const q = String(req.query.q ?? "");
+    const withDeleted = String(req.query.with_deleted ?? "0") === "1";
     const user = getUser(req);
     const tenantId = safeUUID(user?.tenant_id) ?? null;
 
     const sql = `
-      SELECT id, tenant_id, key, name, description, is_active, config, created_at, updated_at
+      SELECT id, tenant_id, key, name, description, is_active, config, created_at, COALESCE(updated_at, created_at) as updated_at, deleted_at, deleted_by
       FROM public.lead_source
       WHERE (
         $1::text IS NULL OR tenant_id::text = $1 OR tenant_id IS NULL
       )
       AND (name ILIKE $2 OR key ILIKE $2)
+      AND ($3::int = 1 OR deleted_at IS NULL)
       ORDER BY name
       LIMIT 1000
     `;
 
-    const { rows } = await db.query(sql, [tenantId, `%${q}%`]);
+    const { rows } = await db.query(sql, [tenantId, `%${q}%`, withDeleted ? 1 : 0]);
     return res.json({ data: rows });
   } catch (err) {
     next(err);
@@ -96,7 +105,7 @@ router.get("/", sessionLoader.loadSessionOptional, async (req, res, next) => {
 router.post("/", sessionLoader.requireSession, async (req, res, next) => {
   try {
     const user = getUser(req);
-    if (!user?.is_platform_admin && !user?.is_tenant_admin)
+    if (!user?.is_platform_admin && !user?.is_tenant_admin && !user?.is_admin)
       return res.status(403).json({ error: "forbidden", reason: "requires_admin" });
 
     const key = (req.body?.key ?? req.body?.code ?? "").toString().trim().toUpperCase();
@@ -104,24 +113,27 @@ router.post("/", sessionLoader.requireSession, async (req, res, next) => {
     const description = req.body?.description ?? null;
     const is_active = coerceBool(req.body?.is_active ?? true);
     const config = req.body?.config ?? {};
+    const tenant_id = safeUUID(req.body?.tenant_id ?? user?.tenant_id) ?? null;
+    const created_by = safeUUID(user?.id) ?? null;
 
-    let tenant_id = safeUUID(req.body?.tenant_id ?? user?.tenant_id) ?? null;
-
-    if (!key || !name)
-      return res.status(400).json({ error: "key_and_name_required" });
+    if (!key || !name) return res.status(400).json({ error: "key_and_name_required" });
 
     const insert = `
       INSERT INTO public.lead_source
-        (tenant_id, key, name, description, is_active, config, created_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,now(),now())
-      RETURNING id, tenant_id, key, name, description, is_active, config, created_at, updated_at
+        (tenant_id, key, name, description, is_active, config, created_by, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,now(),now())
+      RETURNING id, tenant_id, key, name, description, is_active, config, created_by, created_at, updated_at
     `;
 
-    const { rows } = await db.query(insert, [tenant_id, key, name, description, is_active, config]);
-    return res.status(201).json({ data: rows[0] });
+    try {
+      const { rows } = await db.query(insert, [tenant_id, key, name, description, is_active, config, created_by]);
+      return res.status(201).json({ data: rows[0] });
+    } catch (e: any) {
+      if (e?.code === "23505")
+        return res.status(409).json({ error: "duplicate_key_or_name" });
+      throw e;
+    }
   } catch (e: any) {
-    if (e?.code === "23505")
-      return res.status(409).json({ error: "duplicate_key_or_name" });
     console.error("[lead_source] POST error:", e);
     res.status(500).json({ error: "internal_error", message: e.message });
   }
@@ -132,7 +144,7 @@ router.get("/:id", sessionLoader.loadSessionOptional, async (req, res, next) => 
   try {
     const id = (req.params as any)._validatedId;
     const { rows } = await db.query(
-      `SELECT id, tenant_id, key, name, description, is_active, config, created_at, updated_at
+      `SELECT id, tenant_id, key, name, description, is_active, config, created_by, created_at, COALESCE(updated_at, created_at) as updated_at, deleted_at, deleted_by
        FROM public.lead_source WHERE id=$1 LIMIT 1`,
       [id]
     );
@@ -157,7 +169,7 @@ router.put("/:id", sessionLoader.requireSession, async (req, res, next) => {
     const srcTenant = existing.rows[0].tenant_id;
 
     if (!user?.is_platform_admin) {
-      if (!user?.is_tenant_admin) return res.status(403).json({ error: "forbidden" });
+      if (!user?.is_tenant_admin && !user?.is_admin) return res.status(403).json({ error: "forbidden" });
       if (srcTenant && srcTenant !== user?.tenant_id)
         return res.status(403).json({ error: "forbidden_tenant_mismatch" });
     }
@@ -168,28 +180,35 @@ router.put("/:id", sessionLoader.requireSession, async (req, res, next) => {
     const is_active = coerceBool(req.body?.is_active ?? true);
     const config = req.body?.config ?? {};
 
-    if (!key || !name)
-      return res.status(400).json({ error: "key_and_name_required" });
+    if (!key || !name) return res.status(400).json({ error: "key_and_name_required" });
 
-    const { rows } = await db.query(
-  `UPDATE public.lead_source
-     SET key=$1, name=$2, description=$3, is_active=$4, config=$5, updated_at = now()
-   WHERE id=$6
-   RETURNING id, tenant_id, key, name, description, is_active, config, created_at, updated_at`,
-  [key, name, description, is_active, config, id]
-);
+    try {
+      const { rows } = await db.query(
+        `UPDATE public.lead_source
+           SET key=$1, name=$2, description=$3, is_active=$4, config=$5, updated_at = now()
+         WHERE id=$6
+         RETURNING id, tenant_id, key, name, description, is_active, config, created_by, created_at, updated_at, deleted_at, deleted_by`,
+        [key, name, description, is_active, config, id]
+      );
 
-
-    return res.json({ data: rows[0] });
+      if (!rows.length) return res.status(404).json({ error: "not_found" });
+      return res.json({ data: rows[0] });
+    } catch (e: any) {
+      if (e?.code === "23505")
+        return res.status(409).json({ error: "duplicate_key_or_name" });
+      throw e;
+    }
   } catch (e: any) {
-    if (e?.code === "23505")
-      return res.status(409).json({ error: "duplicate_key_or_name" });
     console.error("[lead_source] PUT error:", e);
     res.status(500).json({ error: "internal_error", message: e.message });
   }
 });
 
-/* ---------------------- DELETE ---------------------- */
+/* ---------------------- Soft DELETE ---------------------- */
+/**
+ * DELETE /api/leads/sources/:id
+ * Soft-deletes record (deleted_at, deleted_by), sets is_active=false
+ */
 router.delete("/:id", sessionLoader.requireSession, async (req, res, next) => {
   try {
     const user = getUser(req);
@@ -203,13 +222,61 @@ router.delete("/:id", sessionLoader.requireSession, async (req, res, next) => {
     const srcTenant = existing.rows[0].tenant_id;
 
     if (!user?.is_platform_admin) {
-      if (!user?.is_tenant_admin) return res.status(403).json({ error: "forbidden" });
+      if (!user?.is_tenant_admin && !user?.is_admin) return res.status(403).json({ error: "forbidden" });
       if (srcTenant && srcTenant !== user?.tenant_id)
         return res.status(403).json({ error: "forbidden_tenant_mismatch" });
     }
 
-    await db.query("DELETE FROM public.lead_source WHERE id=$1", [id]);
-    res.json({ ok: true });
+    const deletedBy = safeUUID(user?.id) ?? null;
+    await db.query(
+      `UPDATE public.lead_source
+         SET deleted_at = now(), deleted_by = $1, is_active = false, updated_at = now()
+       WHERE id = $2`,
+      [deletedBy, id]
+    );
+
+    return res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ---------------------- Restore ---------------------- */
+/**
+ * POST /api/leads/sources/:id/restore
+ * Clears deleted_at/deleted_by and re-activates the row
+ */
+router.post("/:id/restore", sessionLoader.requireSession, async (req, res, next) => {
+  try {
+    const user = getUser(req);
+    const id = (req.params as any)._validatedId;
+
+    const existing = await db.query(
+      "SELECT id, tenant_id FROM public.lead_source WHERE id=$1 LIMIT 1",
+      [id]
+    );
+    if (!existing.rows.length) return res.status(404).json({ error: "not_found" });
+    const srcTenant = existing.rows[0].tenant_id;
+
+    if (!user?.is_platform_admin) {
+      if (!user?.is_tenant_admin && !user?.is_admin) return res.status(403).json({ error: "forbidden" });
+      if (srcTenant && srcTenant !== user?.tenant_id)
+        return res.status(403).json({ error: "forbidden_tenant_mismatch" });
+    }
+
+    await db.query(
+      `UPDATE public.lead_source
+         SET deleted_at = NULL, deleted_by = NULL, is_active = true, updated_at = now()
+       WHERE id = $1`,
+      [id]
+    );
+
+    const { rows } = await db.query(
+      `SELECT id, tenant_id, key, name, description, is_active, config, created_by, created_at, COALESCE(updated_at, created_at) as updated_at, deleted_at, deleted_by
+       FROM public.lead_source WHERE id=$1 LIMIT 1`,
+      [id]
+    );
+    return res.json({ data: rows[0] });
   } catch (err) {
     next(err);
   }
