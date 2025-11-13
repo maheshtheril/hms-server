@@ -47,9 +47,11 @@ import leadIndustriesRouter from "./routes/leads/industries";
 import { leadsNewRouter } from "./routes/new/leads-new";
 import { sessionLoader } from "./middleware/sessionLoader";
 
-
-
-
+/* ---- NEW imports added ---- */
+import sessionRouter from "./routes/session";
+import companiesRouter from "./routes/hms/companies";
+import productsRouter from "./routes/hms/products";
+/* -------------------------- */
 
 
 /* ───────────────────────────── Express init ───────────────────────────── */
@@ -178,7 +180,11 @@ app.use("/api", me);
 app.use("/api", pipelines);
 app.use("/api", kanban);
 
-
+/* ---- Mount session + HMS companies/products routers ---- */
+app.use("/api/session", sessionRouter);                 // GET /api/session
+app.use("/api/hms/companies", companiesRouter);         // GET /api/hms/companies
+app.use("/api/hms/products", productsRouter);           // GET /api/hms/products
+/* ------------------------------------------------------ */
 
 /* ───────────────────────────── Admin namespace ───────────────────────────── */
 app.use("/api/admin", adminRoutes);
