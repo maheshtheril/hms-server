@@ -51,6 +51,8 @@ import { sessionLoader } from "./middleware/sessionLoader";
 import sessionRouter from "./routes/session";
 import companiesRouter from "./routes/hms/companies";
 import productsRouter from "./routes/hms/products";
+
+
 /* -------------------------- */
 
 
@@ -212,6 +214,7 @@ app.use("/api/leads/stages", leadStagesRouter);
 app.use("/api/leads/industries", leadIndustriesRouter);
 app.use("/api", leadsNewRouter);
 app.use("/api", leads);
+app.use("/api/hms/settings", hmsSettingsRouter);
 
 
 /* ───────────────────────────── Uploads, Tenants, Scheduler ───────────────────────────── */
