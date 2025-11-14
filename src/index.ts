@@ -51,6 +51,7 @@ import { sessionLoader } from "./middleware/sessionLoader";
 import sessionRouter from "./routes/session";
 import companiesRouter from "./routes/hms/companies";
 import productsRouter from "./routes/hms/products";
+import settingsRouter from "./routes/settings";
 
 
 /* -------------------------- */
@@ -186,6 +187,9 @@ app.use("/api", kanban);
 app.use("/api/session", sessionRouter);                 // GET /api/session
 app.use("/api/hms/companies", companiesRouter);         // GET /api/hms/companies
 app.use("/api/hms/products", productsRouter);           // GET /api/hms/products
+
+app.use("/api/settings", settingsRouter);
+
 /* ------------------------------------------------------ */
 
 /* ───────────────────────────── Admin namespace ───────────────────────────── */
