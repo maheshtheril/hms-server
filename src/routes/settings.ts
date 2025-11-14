@@ -1,7 +1,7 @@
 // server/src/routes/settings.ts
 import { Router, Request, Response } from "express";
 import { PoolClient } from "pg";
-import db from "../db"; // <-- same dependency you had; db.pool must be a pg.Pool
+import db from "../db"; // expects db.pool to be a pg.Pool
 
 const router = Router();
 
@@ -20,13 +20,14 @@ function fail(res: Response, err: any) {
 | Helper: Run a DB query WITH tenant context
 |-----------------------------------------------------------------------
 |
-| Uses db.pool.connect() to get a PoolClient (db.getClient() didn't exist).
+| Use `set_config` instead of `SET LOCAL ... = $1` so the tenant value
+| can be passed as a parameter safely.
 */
 async function withTenant<T>(tenantId: string | null, fn: (client: PoolClient) => Promise<T>) {
   const client = await db.pool.connect();
   try {
-    // set tenant for this session (local to transaction/connection)
-    await client.query("SET LOCAL app.tenant = $1", [tenantId]);
+    // Parameter-safe way to set a session-local config value
+    await client.query("SELECT set_config('app.tenant', $1, true)", [tenantId]);
     return await fn(client);
   } finally {
     client.release();
@@ -78,7 +79,7 @@ router.get("/effective", async (req: Request, res: Response) => {
 
     const value = await withTenant(tenantId, async (client) => {
       const out = await client.query(
-        `SELECT get_setting($1,$2,$3) AS v`,
+        `SELECT get_setting($1, $2, $3) AS v`,
         [key, tenantId, companyId]
       );
       return out.rows[0]?.v ?? null;
