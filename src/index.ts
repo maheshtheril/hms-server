@@ -56,6 +56,7 @@ import tenantTaxRatesRouter from "./routes/tenant/tax-rates";
 import companyTaxRatesRouter from "./routes/company/tax-rates";
 import tenantCurrenciesRouter from "./routes/tenant/currencies";
 import companyCurrenciesRouter from "./routes/company/currencies";
+import taxTypesRouter from "./routes/taxes/tax-types";
 
 
 /* -------------------------- */
@@ -193,6 +194,7 @@ app.use("/api/hms/companies", companiesRouter);         // GET /api/hms/companie
 app.use("/api/hms/products", productsRouter);           // GET /api/hms/products
 
 app.use("/api/settings", settingsRouter);
+app.use("/api/tenant/tax-types", taxTypesRouter);
 
 /* ------------------------------------------------------ */
 
