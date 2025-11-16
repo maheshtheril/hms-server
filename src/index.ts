@@ -52,11 +52,9 @@ import sessionRouter from "./routes/session";
 import companiesRouter from "./routes/hms/companies";
 import productsRouter from "./routes/hms/products";
 import settingsRouter from "./routes/settings";
-import tenantTaxRatesRouter from "./routes/tenant/tax-rates";
-import companyTaxRatesRouter from "./routes/company/tax-rates";
-import tenantCurrenciesRouter from "./routes/tenant/currencies";
-import companyCurrenciesRouter from "./routes/company/currencies";
-import taxTypesRouter from "./routes/taxes/tax-types";
+import globalCurrenciesRouter from "./routes/global/currencies";
+import globalTaxTypesRouter from "./routes/global/tax-types";
+import globalTaxRatesRouter from "./routes/global/tax-rates";
 
 
 /* -------------------------- */
@@ -194,7 +192,7 @@ app.use("/api/hms/companies", companiesRouter);         // GET /api/hms/companie
 app.use("/api/hms/products", productsRouter);           // GET /api/hms/products
 
 app.use("/api/settings", settingsRouter);
-app.use("/api/tenant/tax-types", taxTypesRouter);
+
 
 /* ------------------------------------------------------ */
 
@@ -233,10 +231,10 @@ app.use("/api/tenants", tenantsRouter);
 app.use("/api/tenant-signup", tenantSignup); // POST /
 app.use("/api/audit-logs", auditLogs);
 app.use("/api/scheduler", schedulerRouter);
-app.use("/api/tenant/tax-rates", tenantTaxRatesRouter);
-app.use("/api/company", companyTaxRatesRouter);
-app.use("/api/tenant/currencies", tenantCurrenciesRouter);
-app.use("/api/company", companyCurrenciesRouter); // endpoints: /api/company/:companyId/...
+app.use("/api/global/currencies", globalCurrenciesRouter);
+app.use("/api/global/tax-types", globalTaxTypesRouter);
+app.use("/api/global/tax-rates", globalTaxRatesRouter);
+
 
 
 /* ───────────────────────────── Leads custom fields ───────────────────────────── */
