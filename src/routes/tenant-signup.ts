@@ -65,14 +65,14 @@ function buildInsert(tableQ: string, colsAvail: Set<string>, wanted: Record<stri
 
 /* ───────────────── SIGNUP: tenant + company + owner user ─────────────────
  * Body (strings):
- *   org, tenantName, company, companyName, name, email, password
+ *   org, tenantName, company, companyName, name, email, password, country_id, apply_country_tax_defaults
  */
 router.post("/", async (req, res) => {
   const {
     org,
-    tenantName,   // alias (optional)
+    tenantName, // alias (optional)
     company,
-    companyName,  // alias (optional)
+    companyName, // alias (optional)
     name,
     email,
     password,
@@ -107,6 +107,10 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ ok: false, error: "weak_password", reasons: pw.reasons });
   }
 
+  // optional country and flag to apply country defaults
+  const country_id = req.body?.country_id ? String(req.body.country_id).trim() : null;
+  const applyCountryDefaults = Boolean(req.body?.apply_country_tax_defaults);
+
   const tenantId = randomUUID();
   const companyId = randomUUID();
   const userId = randomUUID();
@@ -120,8 +124,8 @@ router.post("/", async (req, res) => {
     // Discover columns
     const tenantCols = await listColumns(cx, "tenant");
     const companyCols = await listColumns(cx, "company");
-    const userCols    = await listColumns(cx, "app_user");
-    const mapCols     = await listColumns(cx, "user_companies").catch(() => new Set<string>());
+    const userCols = await listColumns(cx, "app_user");
+    const mapCols = await listColumns(cx, "user_companies").catch(() => new Set<string>());
 
     // REQUIRED columns
     for (const c of ["id", "slug", "name"]) {
@@ -177,9 +181,13 @@ router.post("/", async (req, res) => {
       id: companyId,
       tenant_id: tenantId,
       name: company_name,
-      enabled: true,        // safe: buildInsert filters
+      enabled: true, // safe: buildInsert filters
       created_at: now,
     };
+    // include country_id if the company table supports it and a value was provided
+    if (companyCols.has("country_id") && country_id) {
+      companyWanted["country_id"] = country_id;
+    }
     const companyIns = buildInsert("public.company", companyCols, companyWanted);
     await cx.query(companyIns.text, companyIns.values);
 
@@ -189,7 +197,7 @@ router.post("/", async (req, res) => {
       tenant_id: tenantId,
       email: email_lc,
       name: user_name,
-      password: passwordHash,      // column is "password"
+      password: passwordHash, // column is "password"
       is_admin: true,
       is_tenant_admin: true,
       is_active: true,
@@ -214,6 +222,45 @@ router.post("/", async (req, res) => {
         await cx.query(mapIns.text, mapIns.values);
       } catch (err: any) {
         if (err?.code !== "23505") throw err; // ignore duplicate
+      }
+    }
+
+    /* ─ Optionally apply country defaults into company_tax_maps (idempotent) ─
+       Copy rows from country_tax_mappings into company_tax_maps for this company.
+       Only run if requested and if the DB has company_tax_maps & company.country_id.
+    */
+    if (applyCountryDefaults && companyCols.has("country_id") && companyWanted["country_id"]) {
+      // Defensive: ensure company_tax_maps table exists
+      const tableCheck = await cx.query(`SELECT to_regclass('public.company_tax_maps') AS tbl`);
+      const exists = tableCheck.rows[0]?.tbl !== null;
+      if (exists) {
+        // Insert country defaults into company_tax_maps, but don't duplicate rows.
+        // Uses ON CONFLICT (company_id, tax_type_id) to upsert tax_rate_id and is_active.
+        const sql = `
+          INSERT INTO public.company_tax_maps
+            (id, tenant_id, company_id, country_id, tax_type_id, tax_rate_id, is_default, is_active, created_at, updated_at)
+          SELECT
+            gen_random_uuid(),              -- id
+            $1::uuid AS tenant_id,
+            $2::uuid AS company_id,
+            ctm.country_id,
+            ctm.tax_type_id,
+            ctm.tax_rate_id,
+            false AS is_default,
+            ctm.is_active AS is_active,
+            now() AS created_at,
+            now() AS updated_at
+          FROM public.country_tax_mappings ctm
+          WHERE ctm.country_id = $3::uuid AND ctm.is_active = true
+          ON CONFLICT (company_id, tax_type_id) DO UPDATE
+            SET tax_rate_id = EXCLUDED.tax_rate_id,
+                is_active   = EXCLUDED.is_active,
+                updated_at  = now();
+        `;
+        await cx.query(sql, [tenantId, companyId, companyWanted["country_id"]]);
+      } else {
+        // safe to continue — do not fail signup
+        console.warn("[tenant-signup] company_tax_maps table not present; skipping applyCountryDefaults");
       }
     }
 
@@ -245,10 +292,15 @@ router.post("/", async (req, res) => {
     return res.status(201).json({ ok: true, tenantId, companyId, userId });
   } catch (err: any) {
     if (began) {
-      try { await cx.query("ROLLBACK"); } catch {}
+      try {
+        await cx.query("ROLLBACK");
+      } catch {}
     }
     console.error("[tenant-signup] error:", {
-      message: err?.message, code: err?.code, detail: err?.detail, constraint: err?.constraint
+      message: err?.message,
+      code: err?.code,
+      detail: err?.detail,
+      constraint: err?.constraint,
     });
 
     if (err?.code === "23505") {
