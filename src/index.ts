@@ -55,6 +55,8 @@ import settingsRouter from "./routes/settings";
 import globalCurrenciesRouter from "./routes/global/currencies";
 import globalTaxTypesRouter from "./routes/global/tax-types";
 import globalTaxRatesRouter from "./routes/global/tax-rates";
+// add with other global imports
+import globalCountriesRouter from "./routes/global/countries";
 
 
 /* -------------------------- */
@@ -223,7 +225,7 @@ app.use("/api/leads/industries", leadIndustriesRouter);
 app.use("/api", leadsNewRouter);
 app.use("/api", leads);
 app.use("/api/hms/settings", hmsSettingsRouter);
-
+app.use("/api/global/countries", globalCountriesRouter);   
 
 /* ───────────────────────────── Uploads, Tenants, Scheduler ───────────────────────────── */
 app.use("/api/uploads", uploadsRouter);
