@@ -34,3 +34,21 @@ export function requireTenant(req: Request, res: Response, next: NextFunction) {
   req.tenantId = tenantId; // safe, non-conflicting
   next();
 }
+// src/middleware/tenant.ts
+// --- your existing code above ---
+
+// If you already have a function that performs tenant wrapping, export it as named:
+export const withTenant = (handler: any) => {
+  return async (req: any, res: any) => {
+    // ensure tenant loaded into req.tenant (example)
+    // if you already have logic, reuse it here
+    try {
+      // example: const tenant = await loadTenantFromReq(req);
+      // req.tenant = tenant;
+      return await handler(req, res);
+    } catch (err) {
+      // handle error or rethrow
+      throw err;
+    }
+  };
+};
