@@ -57,7 +57,9 @@ import globalTaxTypesRouter from "./routes/global/tax-types";
 import globalTaxRatesRouter from "./routes/global/tax-rates";
 // add with other global imports
 import globalCountriesRouter from "./routes/global/countries";
-
+import globalCompanySettingsRouter from "./routes/global/company-settings";
+import globalCompanyTaxesRouter from "./routes/global/company-taxes";
+import { requireTenant } from "./middleware/tenant"; 
 
 /* -------------------------- */
 
@@ -236,6 +238,8 @@ app.use("/api/scheduler", schedulerRouter);
 app.use("/api/global/currencies", globalCurrenciesRouter);
 app.use("/api/global/tax-types", globalTaxTypesRouter);
 app.use("/api/global/tax-rates", globalTaxRatesRouter);
+app.use("/api/global/company-settings", globalCompanySettingsRouter);
+app.use("/api/global/company-taxes", globalCompanyTaxesRouter);
 
 
 
