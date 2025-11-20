@@ -1,16 +1,29 @@
 // server/src/routes/global/tax-rates.ts
 import express from "express";
-import { pool, query } from "../../db";
+import { pool } from "../../db";
 import { body, validationResult } from "express-validator";
 
 const router = express.Router();
+
+// Helper to set tenant on the current connection (like admin/companies)
+const TENANT_UUID_SQL = `NULLIF(current_setting('app.tenant_id', true), '')::uuid`;
+
+async function setTenantOn(client: any, req: any) {
+  const tid = String(req.session?.tenant_id || req.headers["x-tenant-id"] || "").trim();
+  if (!tid) throw Object.assign(new Error("tenant_id_required"), { status: 400 });
+  await client.query(`SELECT set_config('app.tenant_id', $1, false)`, [tid]);
+}
 
 /**
  * GET /api/global/tax-rates
  * Optional: ?tax_type_id=... & ?active=true|false
  */
 router.get("/", async (req, res, next) => {
+  const client = await pool.connect();
   try {
+    // ensure tenant context for this connection if required by DB (throw if missing)
+    await setTenantOn(client, req);
+
     const { tax_type_id, active } = req.query;
     const where: string[] = [];
     const vals: any[] = [];
@@ -33,10 +46,15 @@ router.get("/", async (req, res, next) => {
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
       ORDER BY tt.name ASC, tr.rate DESC
     `;
-    const { rows } = await query(sql, vals);
+    const { rows } = await client.query(sql, vals);
     res.json({ ok: true, data: rows });
-  } catch (err) {
+  } catch (err: any) {
+    if (err?.status === 400 && err.message === "tenant_id_required") {
+      return res.status(400).json({ ok: false, error: "tenant_id_required" });
+    }
     next(err);
+  } finally {
+    client.release();
   }
 });
 
@@ -44,7 +62,10 @@ router.get("/", async (req, res, next) => {
  * GET /api/global/tax-rates/:id
  */
 router.get("/:id", async (req, res, next) => {
+  const client = await pool.connect();
   try {
+    await setTenantOn(client, req);
+
     const sql = `
       SELECT tr.id, tr.name, tr.rate, tr.is_active, tr.created_at, tr.updated_at,
              tt.id as tax_type_id, tt.name as tax_type_name
@@ -52,11 +73,16 @@ router.get("/:id", async (req, res, next) => {
       JOIN tax_types tt ON tt.id = tr.tax_type_id
       WHERE tr.id = $1 LIMIT 1
     `;
-    const { rows } = await query(sql, [req.params.id]);
+    const { rows } = await client.query(sql, [req.params.id]);
     if (!rows[0]) return res.status(404).json({ ok: false, error: "not_found" });
     res.json({ ok: true, data: rows[0] });
-  } catch (err) {
+  } catch (err: any) {
+    if (err?.status === 400 && err.message === "tenant_id_required") {
+      return res.status(400).json({ ok: false, error: "tenant_id_required" });
+    }
     next(err);
+  } finally {
+    client.release();
   }
 });
 
@@ -72,15 +98,17 @@ router.post(
     body("rate").isFloat({ min: 0 }).toFloat(),
   ],
   async (req, res, next) => {
+    const client = await pool.connect();
     try {
+      await setTenantOn(client, req);
+
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ ok: false, errors: errors.array() });
 
       const { tax_type_id, name, rate } = req.body;
-      const client = await pool.connect();
       try {
         await client.query("BEGIN");
-        // ensure tax type exists and active
+        // ensure tax type exists and active (tenant-scoped)
         const { rows: tt } = await client.query("SELECT id FROM tax_types WHERE id = $1 AND is_active = true LIMIT 1", [tax_type_id]);
         if (!tt.length) {
           await client.query("ROLLBACK");
@@ -98,11 +126,14 @@ router.post(
       } catch (err) {
         await client.query("ROLLBACK");
         throw err;
-      } finally {
-        client.release();
       }
-    } catch (err) {
+    } catch (err: any) {
+      if (err?.status === 400 && err.message === "tenant_id_required") {
+        return res.status(400).json({ ok: false, error: "tenant_id_required" });
+      }
       next(err);
+    } finally {
+      client.release();
     }
   }
 );
@@ -119,14 +150,16 @@ router.put(
     body("is_active").optional().isBoolean().toBoolean(),
   ],
   async (req, res, next) => {
+    const client = await pool.connect();
     try {
+      await setTenantOn(client, req);
+
       const id = req.params.id;
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ ok: false, errors: errors.array() });
 
-      // if tax_type_id is provided, ensure it's valid
       if (req.body.tax_type_id) {
-        const { rows: tt } = await query("SELECT id FROM tax_types WHERE id = $1 AND is_active = true LIMIT 1", [req.body.tax_type_id]);
+        const { rows: tt } = await client.query("SELECT id FROM tax_types WHERE id = $1 AND is_active = true LIMIT 1", [req.body.tax_type_id]);
         if (!tt.length) return res.status(400).json({ ok: false, error: "invalid_tax_type" });
       }
 
@@ -144,11 +177,16 @@ router.put(
 
       vals.push(id);
       const sql = `UPDATE tax_rates SET ${sets.join(", ")}, updated_at = now() WHERE id = $${idx} RETURNING id, tax_type_id, name, rate, is_active, created_at, updated_at`;
-      const { rows } = await query(sql, vals);
+      const { rows } = await client.query(sql, vals);
       if (!rows[0]) return res.status(404).json({ ok: false, error: "not_found" });
       res.json({ ok: true, data: rows[0] });
-    } catch (err) {
+    } catch (err: any) {
+      if (err?.status === 400 && err.message === "tenant_id_required") {
+        return res.status(400).json({ ok: false, error: "tenant_id_required" });
+      }
       next(err);
+    } finally {
+      client.release();
     }
   }
 );
@@ -158,12 +196,20 @@ router.put(
  * Soft-delete
  */
 router.delete("/:id", async (req, res, next) => {
+  const client = await pool.connect();
   try {
-    const { rows } = await query(`UPDATE tax_rates SET is_active = false, updated_at = now() WHERE id = $1 RETURNING id`, [req.params.id]);
+    await setTenantOn(client, req);
+
+    const { rows } = await client.query(`UPDATE tax_rates SET is_active = false, updated_at = now() WHERE id = $1 RETURNING id`, [req.params.id]);
     if (!rows[0]) return res.status(404).json({ ok: false, error: "not_found" });
     res.json({ ok: true });
-  } catch (err) {
+  } catch (err: any) {
+    if (err?.status === 400 && err.message === "tenant_id_required") {
+      return res.status(400).json({ ok: false, error: "tenant_id_required" });
+    }
     next(err);
+  } finally {
+    client.release();
   }
 });
 
