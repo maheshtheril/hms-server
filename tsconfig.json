@@ -1,27 +1,35 @@
 {
   "compilerOptions": {
-    /* ---------------- Core Targets ---------------- */
+    /* ------------ Core Targets ------------ */
     "target": "ES2022",
-    "lib": ["ES2022", "DOM"],              // ✅ Add DOM to support fetch, RequestInfo, etc.
+    "lib": ["ES2022", "DOM"],
     "module": "CommonJS",
     "moduleResolution": "Node",
-    "esModuleInterop": true,
-    "resolveJsonModule": true,
 
-    /* ---------------- Type Checking ---------------- */
+    /* ------------ Type Behavior ------------ */
     "strict": false,
-    "noImplicitAny": false,
     "skipLibCheck": true,
+    "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
 
-    /* ---------------- Environment & Output ---------------- */
-    "types": ["node"],                     // ✅ Node built-ins (fs, path, process, etc.)
-    "outDir": "dist",                      // compiled JS output directory
+    /* ------------ Custom Type Definitions ------------ */
+    "typeRoots": [
+      "./types",
+      "./node_modules/@types"
+    ],
 
-    /* ---------------- Future-Safe Options ---------------- */
-    "allowSyntheticDefaultImports": true,
-    "noEmitOnError": false
+    /* Allow ALL .d.ts inside typeRoots */
+    "types": ["node"],
+
+    /* ------------ Output ------------ */
+    "outDir": "dist"
   },
-  "include": ["src/**/*.ts"],
+
+  /* Load ALL source + ALL .d.ts files */
+  "include": [
+    "src/**/*.ts",
+    "types/**/*.d.ts"
+  ],
+
   "exclude": ["node_modules", "dist"]
 }

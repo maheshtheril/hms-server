@@ -60,6 +60,10 @@ import globalCountriesRouter from "./routes/global/countries";
 import globalCompanySettingsRouter from "./routes/global/company-settings";
 import globalCompanyTaxesRouter from "./routes/global/company-taxes";
 import { requireTenant } from "./middleware/tenant"; 
+import accountingRoutes from "./routes/accounting.routes";
+
+
+import invoiceRoutes from "./routes/invoiceRoutes";
 
 /* -------------------------- */
 
@@ -197,6 +201,8 @@ app.use("/api/hms/products", productsRouter);           // GET /api/hms/products
 
 app.use("/api/settings", settingsRouter);
 
+app.use("/api/accounting", accountingRoutes);
+app.use("/api", invoiceRoutes);
 
 /* ------------------------------------------------------ */
 
