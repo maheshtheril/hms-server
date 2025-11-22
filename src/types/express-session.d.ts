@@ -4,10 +4,7 @@ import type { PoolClient } from "pg";
 
 declare module "express-session" {
   interface SessionData {
-    /**
-     * Optional app-level session payload stored inside express-session.
-     * Use req.session.authSession to access.
-     */
+    // session-level payload persisted in the session store (e.g. pg sessions table)
     authSession?: {
       sid?: string | null;
       user_id?: string | null;
@@ -27,9 +24,7 @@ declare module "express-session" {
 declare global {
   namespace Express {
     interface Request {
-      /**
-       * lightweight identity handy in controllers (not the same as session store)
-       */
+      // lightweight identity attached by middleware
       user?: {
         id?: string;
         email?: string | null;
@@ -39,10 +34,7 @@ declare global {
         is_admin?: boolean;
       };
 
-      /**
-       * Auth/session context attached by our middleware.
-       * We avoid naming this `session` to prevent ts conflicts with express-session types.
-       */
+      // canonical auth/session context for this app
       authSession?: {
         sid?: string | null;
         user_id?: string | null;
@@ -57,12 +49,11 @@ declare global {
         last_seen?: string | null;
       };
 
-      /**
-       * optional per-request PG client if you use set_config('app.tenant_id', ...) approach
-       */
+      // optional per-request pg client
       dbClient?: PoolClient;
     }
   }
 }
 
+// ensure this file is treated as a module
 export {};

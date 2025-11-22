@@ -18,14 +18,14 @@
       "./node_modules/@types"
     ],
 
-    /* Allow ALL .d.ts inside typeRoots */
-    "types": ["node"],
+    /* Jest + Node globals available everywhere */
+    "types": ["node", "jest"],
 
     /* ------------ Output ------------ */
     "outDir": "dist"
   },
 
-  /* Load ALL source + ALL .d.ts files */
+  /* Load all application code + custom global typings + tests */
   "include": [
     "src/**/*.ts",
     "types/**/*.d.ts",
