@@ -28,7 +28,8 @@
   /* Load ALL source + ALL .d.ts files */
   "include": [
     "src/**/*.ts",
-    "types/**/*.d.ts"
+    "types/**/*.d.ts",
+    "tests"
   ],
 
   "exclude": ["node_modules", "dist"]

@@ -1,0 +1,5 @@
+{
+  "key": "manufacturing",
+  "name": "Manufacturing / MRP",
+  "wizardSteps": ["intro", "workcenters", "bom", "finish"]
+}

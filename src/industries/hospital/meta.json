@@ -1,0 +1,5 @@
+{
+  "key": "hospital",
+  "name": "Hospital / Healthcare",
+  "wizardSteps": ["intro", "departments", "billing", "finish"]
+}

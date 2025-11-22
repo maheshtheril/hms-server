@@ -1,0 +1,5 @@
+{
+  "key": "retail",
+  "name": "Retail / POS",
+  "wizardSteps": ["intro", "categories", "taxes", "finish"]
+}
