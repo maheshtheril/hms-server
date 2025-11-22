@@ -73,7 +73,7 @@ const app = express();
 app.set("trust proxy", 1); // required for secure cookies on Render
 
 /* ───────────────────────────── CORS ───────────────────────────── */
-// APP_ORIGIN may be comma-separated: "https://site1.com,http://localhost:3000"
+// APP_ORIGIN may be, comma-separated: "https://site1.com,http://localhost:3000"
 const rawOrigins = (process.env.APP_ORIGIN || "http://localhost:3000").split(",");
 const ALLOWED_ORIGINS = rawOrigins.map((s) => s.trim()).filter(Boolean);
 // === Debug routes (for Render diagnostics) ===
