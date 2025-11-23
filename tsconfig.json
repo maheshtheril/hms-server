@@ -6,6 +6,7 @@
     "module": "CommonJS",
     "moduleResolution": "Node",
     "rootDir": "src",
+
     /* ------------ Type Behavior ------------ */
     "strict": false,
     "skipLibCheck": true,
@@ -18,19 +19,25 @@
       "./node_modules/@types"
     ],
 
-    /* Jest + Node globals available everywhere */
+    /* Jest + Node globals available everywhere (local only) */
     "types": ["node", "jest"],
 
     /* ------------ Output ------------ */
     "outDir": "dist"
   },
 
-  /* Load all application code + custom global typings + tests */
+  /* ------------ Include: app source only ------------ */
   "include": [
     "src/**/*.ts",
-    "types/**/*.d.ts",
-    "tests"
+    "types/**/*.d.ts"
   ],
 
-  "exclude": ["node_modules", "dist"]
+  /* ------------ Exclude tests from production build ------------ */
+  "exclude": [
+    "node_modules",
+    "dist",
+    "tests",
+    "**/*.test.ts",
+    "**/*.e2e.test.ts"
+  ]
 }
