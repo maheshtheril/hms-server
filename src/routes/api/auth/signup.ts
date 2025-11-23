@@ -195,7 +195,14 @@ export async function signupHandler(req: Request, res: Response) {
       try {
         await client.query("ROLLBACK");
       } catch (_) {}
-      console.error("Signup TX error:", err);
+      console.error("Signup TX error:", {
+  message: err?.message,
+  code: err?.code,
+  detail: err?.detail,
+  stack: err?.stack,
+  constraint: err?.constraint
+});
+
       // return 500 for unknown errors
       return res.status(500).json({ error: "signup_failed" });
     }
