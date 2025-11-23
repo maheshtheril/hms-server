@@ -1,4 +1,5 @@
 // server/src/routes/api/auth/signup.ts
+import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import { pool } from "../../../db";
 import { createSession, buildSessionCookie } from "../../../lib/session";
@@ -6,6 +7,10 @@ import { enqueueProvisionJob } from "../../../lib/provisioningQueue";
 import rateLimitSignup from "../../../middleware/rateLimitSignup";
 import domainTenantPolicy from "../../../lib/domainTenantPolicy";
 import { createVerificationToken, sendVerificationEmail } from "../../../lib/emailVerification";
+
+const router = Router();
+
+console.info("[signup.ts] module loaded");
 
 /* -------------------- PASSWORD POLICY -------------------- */
 const PASSWORD_POLICY = {
@@ -72,18 +77,23 @@ async function tryInsertTenantWithUniqueSlug(client: any, baseSlug: string, name
 /* ============================================================
    SIGNUP HANDLER — FIXED / HARDENED
    ============================================================ */
-export async function signupHandler(req, res) {
+export async function signupHandler(req: Request, res: Response) {
+  console.info("[signup] invoked", { method: req.method, url: req.url, headers: { origin: req.headers.origin, host: req.headers.host, "content-type": req.headers["content-type"] } });
+
   let client: any | null = null;
   try {
     /* -------- 1. RATE LIMIT -------- */
     const rl = await rateLimitSignup(req);
+    console.info("[signup] rateLimit result:", rl);
     if (isRateLimitFail(rl)) {
       return res.status(429).json({ error: "too_many_attempts", retryAfter: rl.retryAfter });
     }
 
     /* -------- 2. PARSE INPUT -------- */
     const { name, email, password, company, countryId, industry } =
-      req.body || (await parseBody(req));
+      (req as any).body || (await parseBody(req));
+
+    console.info("[signup] parsed body present?", !!(name || email || password || company || countryId));
 
     if (!name || !email || !password || !company || !countryId) {
       return res.status(400).json({ error: "missing_fields" });
@@ -101,7 +111,10 @@ export async function signupHandler(req, res) {
     }
 
     /* -------- 4. DOMAIN TENANT RULE -------- */
-    const dp = await domainTenantPolicy(emailLC).catch(() => null);
+    const dp = await domainTenantPolicy(emailLC).catch((e) => {
+      console.error("[signup] domainTenantPolicy failed:", e);
+      return null;
+    });
     if (dp && !dp.ok) {
       return res.status(dp.status ?? 403).json({ error: dp.error });
     }
@@ -244,10 +257,10 @@ export async function signupHandler(req, res) {
 }
 
 /* ------------- RAW BODY PARSER ------------- */
-async function parseBody(req) {
+async function parseBody(req: Request) {
   return new Promise((resolve, reject) => {
     let data = "";
-    req.on("data", (c) => (data += c));
+    req.on("data", (c: Buffer) => (data += c.toString()));
     req.on("end", () => {
       try {
         resolve(JSON.parse(data || "{}"));
@@ -258,3 +271,8 @@ async function parseBody(req) {
     req.on("error", reject);
   });
 }
+
+// Attach to router and export default for easy mounting
+router.post("/", signupHandler);
+
+export default router;

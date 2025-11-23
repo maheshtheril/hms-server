@@ -61,6 +61,7 @@ import globalCompanySettingsRouter from "./routes/global/company-settings";
 import globalCompanyTaxesRouter from "./routes/global/company-taxes";
 import { requireTenant } from "./middleware/tenant"; 
 import accountingRoutes from "./routes/accounting.routes";
+import signupRouter from "./routes/api/auth/signup";
 
 
 import invoiceRoutes from "./routes/invoiceRoutes";
@@ -153,6 +154,7 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 app.use(sessionLoader);
 
+app.use("/api/auth/signup", signupRouter);
 
 /* ───────────────────────────── Request logger ───────────────────────────── */
 app.use((req, _res, next) => {
