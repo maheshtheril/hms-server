@@ -62,7 +62,7 @@ import globalCompanyTaxesRouter from "./routes/global/company-taxes";
 import { requireTenant } from "./middleware/tenant"; 
 import accountingRoutes from "./routes/accounting.routes";
 import signupRouter from "./routes/api/auth/signup";
-
+import coreRouter from "./routes/core";
 
 import invoiceRoutes from "./routes/invoiceRoutes";
 
@@ -155,7 +155,7 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(sessionLoader);
 
 app.use("/api/auth/signup", signupRouter);
-
+app.use("/api", coreRouter);
 /* ───────────────────────────── Request logger ───────────────────────────── */
 app.use((req, _res, next) => {
   console.log(`[IN] ${req.method} ${req.path}`);
