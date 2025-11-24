@@ -248,7 +248,7 @@ app.use("/api/global/tax-types", globalTaxTypesRouter);
 app.use("/api/global/tax-rates", globalTaxRatesRouter);
 app.use("/api/global/company-settings", globalCompanySettingsRouter);
 app.use("/api/global/company-taxes", globalCompanyTaxesRouter);
-app.use("/api/user/companies", userCompaniesRouter);
+app.use("/api", userCompaniesRouter);
 
 
 

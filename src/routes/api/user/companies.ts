@@ -1,68 +1,59 @@
-// server/src/routes/api/user/companies.ts
+// src/routes/api/user/companies.ts
 import { Router } from "express";
-import { q } from "../../../db";            // matches your other route imports
+import { q } from "../../../db"; // adjust relative path if needed
 import { requireAuth } from "../../../middleware/requireAuth";
 
 const router = Router();
 
 /**
  * GET /api/user/companies
- *
- * Returns companies relevant to the authenticated session.
- * - If session has company_id -> returns that single company.
- * - Otherwise returns enabled companies for tenant_id.
- *
- * Optional query params:
- * - limit (number) - max rows to return (default 100)
- * - q (string) - simple name search (ILIKE '%q%')
+ * - Uses req.authSession (set by requireAuth) — expects { user_id, tenant_id, company_id }
+ * - Prefers listing companies by tenant_id (multi-tenant). If tenant_id is missing,
+ *   falls back to listing the company_id associated with the user.
  */
-router.get("/", requireAuth, async (req: any, res) => {
+router.get("/user/companies", requireAuth, async (req: any, res) => {
   try {
-    const auth = req.authSession;
-    if (!auth || !auth.user_id) return res.status(401).json({ error: "unauthenticated" });
+    const authSession = req.authSession;
+    if (!authSession?.user_id) {
+      console.warn("user/companies: unauthenticated request - missing authSession.user_id");
+      return res.status(401).json({ error: "unauthenticated" });
+    }
 
-    // parse query params
-    const limit = Math.min(1000, Math.max(1, Number(req.query.limit) || 100));
-    const searchQ = (req.query.q || "").toString().trim();
+    const tenantId = authSession.tenant_id;
+    const userCompanyId = authSession.company_id;
 
-    // If session contains explicit company_id, return that company only
-    if (auth.company_id) {
-      const { rows } = await q(
-        `SELECT id, name, logo_url, tenant_id, enabled, metadata
+    // If tenant present, list companies for that tenant (common pattern).
+    // If not, return the single company the user belongs to (if present).
+    let rows;
+    if (tenantId) {
+      const qRes = await q(
+        `SELECT id, name, COALESCE(logo_url, '') AS logo_url, tenant_id
+           FROM public.company
+          WHERE tenant_id = $1
+          ORDER BY name
+          LIMIT 100`,
+        [tenantId]
+      );
+      rows = qRes.rows;
+    } else if (userCompanyId) {
+      const qRes = await q(
+        `SELECT id, name, COALESCE(logo_url, '') AS logo_url, tenant_id
            FROM public.company
           WHERE id = $1
           LIMIT 1`,
-        [auth.company_id]
+        [userCompanyId]
       );
-      return res.json({ companies: rows });
+      rows = qRes.rows;
+    } else {
+      // nothing to show
+      rows = [];
     }
 
-    // Require tenant_id otherwise we can't scope companies safely
-    const tenantId = auth.tenant_id;
-    if (!tenantId) return res.status(400).json({ error: "no_tenant_in_session" });
-
-    // Build query — tenant-scoped, only enabled companies by default
-    let sql = `
-      SELECT id, name, logo_url, tenant_id, enabled, metadata
-        FROM public.company
-       WHERE tenant_id = $1
-         AND (enabled IS DISTINCT FROM false)
-    `;
-    const params: any[] = [tenantId];
-
-    if (searchQ) {
-      params.push(`%${searchQ}%`);
-      sql += ` AND name ILIKE $${params.length} `;
-    }
-
-    params.push(limit);
-    sql += ` ORDER BY name ASC LIMIT $${params.length}`;
-
-    const { rows } = await q(sql, params);
     return res.json({ companies: rows });
   } catch (err) {
     console.error("GET /api/user/companies error:", err);
-    return res.status(500).json({ error: "server_error" });
+    // send a small helpful error but avoid leaking stack traces in production
+    return res.status(500).json({ error: "server_error", message: String(err?.message || err) });
   }
 });
 
