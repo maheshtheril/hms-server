@@ -37,8 +37,14 @@ router.get("/user/companies", requireAuth, async (req: any, res) => {
 
     return res.json({ companies: rows });
   } catch (err:any) {
-    console.error("GET /api/user/companies error:", err);
-    return res.status(500).json({ error: "server_error", message: String(err?.message || err) });
+        console.error("GET /api/user/companies error:", err);
+    // temporary: include stack in response so you can paste it here (remove in production)
+    return res.status(500).json({
+      error: "server_error",
+      message: String(err?.message || err),
+      stack: process.env.NODE_ENV === "production" ? undefined : String(err?.stack || "")
+    });
+
   }
 });
 
