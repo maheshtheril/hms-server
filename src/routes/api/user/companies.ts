@@ -7,13 +7,21 @@ const router = Router();
 
 router.get("/user/companies", requireAuth, async (req: any, res) => {
   try {
-    const authSession = req.authSession;
-    if (!authSession?.user_id) return res.status(401).json({ error: "unauthenticated" });
+    // tolerate multiple middleware shapes (requireSession, requireAuth, etc.)
+    const authSession = (req as any).authSession || (req as any).session || (req as any).company || null;
+    const userId = authSession?.user_id || (req as any).session?.user_id;
+    if (!userId) return res.status(401).json({ error: "unauthenticated" });
 
-    const tenantId = authSession.tenant_id;
-    const userCompanyId = authSession.company_id;
+    const tenantId = authSession?.tenant_id || (req as any).session?.tenant_id;
+    // prefer active_company_id from resolved company/session shape
+    const userCompanyId =
+      authSession?.company_id ||
+      (req as any).session?.active_company_id ||
+      (req as any).company?.active_company_id ||
+      null;
 
-    let rows = [];
+    let rows: Array<any> = [];
+
     if (tenantId) {
       const r = await q(
         `SELECT id, name, COALESCE(logo_url, '') AS logo_url, tenant_id
@@ -23,7 +31,7 @@ router.get("/user/companies", requireAuth, async (req: any, res) => {
          LIMIT 100`,
         [tenantId]
       );
-      rows = r.rows;
+      rows = r.rows ?? [];
     } else if (userCompanyId) {
       const r = await q(
         `SELECT id, name, COALESCE(logo_url, '') AS logo_url, tenant_id
@@ -32,19 +40,18 @@ router.get("/user/companies", requireAuth, async (req: any, res) => {
          LIMIT 1`,
         [userCompanyId]
       );
-      rows = r.rows;
+      rows = r.rows ?? [];
     }
 
     return res.json({ companies: rows });
-  } catch (err:any) {
-        console.error("GET /api/user/companies error:", err);
-    // temporary: include stack in response so you can paste it here (remove in production)
+  } catch (err: any) {
+    console.error("GET /api/user/companies error:", err);
+    // temporary: include stack in non-production for triage
     return res.status(500).json({
       error: "server_error",
       message: String(err?.message || err),
       stack: process.env.NODE_ENV === "production" ? undefined : String(err?.stack || "")
     });
-
   }
 });
 
