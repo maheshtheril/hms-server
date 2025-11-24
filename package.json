@@ -8,12 +8,12 @@
   },
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "build": "rimraf dist && tsc", 
+    "build": "rimraf dist && tsc",
     "start": "node dist/index.js"
   },
   "dependencies": {
     "axios": "^1.13.1",
-    "bcryptjs": "^3.0.2",
+    "bcryptjs": "^3.0.3",
     "bullmq": "^5.62.0",
     "connect-pg-simple": "^10.0.0",
     "cookie": "^1.0.2",

@@ -9,6 +9,8 @@ export const COOKIE_NAME = "erp_session";
 /**
  * ISSUE a new session to DB (SID).
  * Now supports companyId.
+ *
+ * Uses `absolute_expiry` DB column (existing schema) instead of `expires_at`.
  */
 export async function issueSession(
   userId: string,
@@ -17,8 +19,9 @@ export async function issueSession(
 ): Promise<string> {
   const sid = crypto.randomUUID();
 
+  // Store absolute_expiry = now() + ttl
   await q(
-    `INSERT INTO sessions (sid, user_id, tenant_id, company_id, created_at, last_seen, expires_at)
+    `INSERT INTO sessions (sid, user_id, tenant_id, company_id, created_at, last_seen, absolute_expiry)
      VALUES ($1, $2, $3, $4, now(), now(), now() + ($5 || ' seconds')::interval)`,
     [sid, userId, tenantId ?? null, companyId ?? null, SESSION_TTL_SECONDS]
   );
@@ -74,9 +77,15 @@ export async function touchSession(sid: string): Promise<void> {
 
 /**
  * Fetch session
+ *
+ * Returns the session row (including absolute_expiry) or null.
+ * NOTE: callers may want to check absolute_expiry to reject expired sessions.
  */
 export async function getSession(sid: string): Promise<any | null> {
-  const { rows }: QueryResult = await q("SELECT * FROM sessions WHERE sid = $1", [sid]);
+  const { rows }: QueryResult = await q(
+    "SELECT * FROM sessions WHERE sid = $1",
+    [sid]
+  );
   return rows[0] ?? null;
 }
 
