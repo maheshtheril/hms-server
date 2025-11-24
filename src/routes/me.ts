@@ -11,17 +11,10 @@ const router = Router();
  * Return the logged-in user's profile.
  */
 router.get("/me", requireAuth, async (req: any, res) => {
-  // The session is attached to req.authSession by requireAuth.
-  // We can trust it's valid here, but we will access the data correctly.
+  // 🐛 FIX: req.session is likely undefined and causes a crash.
+  // Use req.authSession instead.
   const authSession = req.authSession;
-  
-  // NOTE: The unauthenticated check is technically redundant because requireAuth
-  // should have handled it, but let's make sure we use the right variable.
-  if (!authSession?.user_id) {
-     // This should only happen if requireAuth failed to stop the request
-     return res.status(401).json({ error: "unauthenticated" }); 
-  }
-
+  if (!authSession?.user_id) return res.status(401).json({ error: "unauthenticated" });
 
   const { rows } = await q(
     `SELECT id, email, name, is_admin, tenant_id, company_id
@@ -34,14 +27,13 @@ router.get("/me", requireAuth, async (req: any, res) => {
   res.json({ user: rows[0] || null });
 });
 
-// ❌ NEW ROUTE ADDED HERE: Fixes GET /api/user/companies 404
 /**
  * GET /api/user/companies
  * Returns a list of companies/tenants the current user belongs to.
- * This is crucial for initial data loading/context switching after login/signup.
  */
 router.get("/user/companies", requireAuth, async (req: any, res) => {
-    // FIX: Use req.authSession instead of req.session
+    // 🐛 FIX: req.session is likely undefined and causes a crash.
+    // Use req.authSession instead.
     const authSession = req.authSession;
     if (!authSession?.user_id) return res.status(401).json({ error: "unauthenticated" });
 
