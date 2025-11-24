@@ -1,20 +1,21 @@
 // src/routes/api/user/companies.ts
 import { Router } from "express";
-import { q } from "../../../db"; // adjust to ../../db or ../../../db depending on actual file layout
+import { q } from "../../../db"; // adjust path if your db file is elsewhere
 import { requireAuth } from "../../../middleware/requireAuth";
 
 const router = Router();
 
 /**
  * GET /
- * Returns companies for the current user's tenant, or the user's company if tenant_id missing.
- * Mounted at /api/user/companies (so handler path is "/").
+ * Mounted at /api/user/companies
  */
 router.get("/", requireAuth, async (req: any, res) => {
   try {
     const authSession = req.authSession;
+    console.debug("GET /api/user/companies - authSession:", authSession);
+
     if (!authSession?.user_id) {
-      console.warn("GET /api/user/companies - unauthenticated request");
+      console.warn("GET /api/user/companies - unauthenticated");
       return res.status(401).json({ error: "unauthenticated" });
     }
 
@@ -22,9 +23,10 @@ router.get("/", requireAuth, async (req: any, res) => {
     const userCompanyId = authSession.company_id;
 
     let rows = [];
+
     if (tenantId) {
       const qRes = await q(
-        `SELECT id, name, COALESCE(logo_url, '') AS logo_url, tenant_id, enabled, industry
+        `SELECT id, name, COALESCE(logo_url, '') AS logo_url, tenant_id
            FROM public.company
           WHERE tenant_id = $1
           ORDER BY name
@@ -34,7 +36,7 @@ router.get("/", requireAuth, async (req: any, res) => {
       rows = qRes.rows || [];
     } else if (userCompanyId) {
       const qRes = await q(
-        `SELECT id, name, COALESCE(logo_url, '') AS logo_url, tenant_id, enabled, industry
+        `SELECT id, name, COALESCE(logo_url, '') AS logo_url, tenant_id
            FROM public.company
           WHERE id = $1
           LIMIT 1`,
@@ -44,9 +46,9 @@ router.get("/", requireAuth, async (req: any, res) => {
     }
 
     return res.json({ companies: rows });
-  } catch (err) {
-    console.error("GET /api/user/companies error:", err);
-    // dev-friendly message — remove or shorten in production
+  } catch (err: any) {
+    console.error("GET /api/user/companies error:", err && err.message ? err.message : err);
+    // In dev we show message; in prod remove err.message
     return res.status(500).json({ error: "server_error", message: String(err?.message || err) });
   }
 });
