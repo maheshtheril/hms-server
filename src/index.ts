@@ -63,7 +63,7 @@ import { requireTenant } from "./middleware/tenant";
 import accountingRoutes from "./routes/accounting.routes";
 import signupRouter from "./routes/api/auth/signup";
 import coreRouter from "./routes/core";
-
+import userCompaniesRouter from "./routes/api/user/companies";
 import invoiceRoutes from "./routes/invoiceRoutes";
 
 /* -------------------------- */
@@ -248,6 +248,7 @@ app.use("/api/global/tax-types", globalTaxTypesRouter);
 app.use("/api/global/tax-rates", globalTaxRatesRouter);
 app.use("/api/global/company-settings", globalCompanySettingsRouter);
 app.use("/api/global/company-taxes", globalCompanyTaxesRouter);
+app.use("/api/user/companies", userCompaniesRouter);
 
 
 
