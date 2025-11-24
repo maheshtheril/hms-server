@@ -1,3 +1,4 @@
+// server/src/routes/api/onboarding/hms.ts
 import { pool } from "../../../db";
 import { getSession } from "../../../lib/session";
 
@@ -5,12 +6,12 @@ import { getSession } from "../../../lib/session";
  * POST /api/onboarding/hms
  * Body expected: { subIndustry?: string, departments?: string[], billingMode: string }
  *
- * Notes:
- * - subIndustry is now optional (defaults to "hospital")
- * - departments coerced to array
- * - improved logging for easier debugging
+ * Improvements:
+ * - Prefer middleware-populated session (req.authSession / req.session)
+ * - Fallback to common cookie names and try getSession()
+ * - Better logging and a lightweight X-Debug-Session header for triage
  */
-export async function hmsOnboardingHandler(req, res) {
+export async function hmsOnboardingHandler(req: any, res: any) {
   try {
     // accept both JSON body shapes safely
     const body = req.body || {};
@@ -19,15 +20,55 @@ export async function hmsOnboardingHandler(req, res) {
     const billingMode = body.billingMode ? String(body.billingMode) : "";
 
     if (!billingMode) {
-      return res.status(400).json({ error: "missing_fields", message: "billingMode is required" });
+      return res
+        .status(400)
+        .json({ error: "missing_fields", message: "billingMode is required" });
     }
 
-    const sid = req.cookies?.erp_session;
-    const session = sid ? await getSession(sid) : null;
+    // ===== SESSION RESOLUTION =====
+    // 1) Prefer middleware-resolved session (sessionLoader / requireSession etc.)
+    let session = (req as any).authSession || (req as any).session || null;
 
+    // 2) If not present, try common cookie names and call getSession for each
+    if (!session) {
+      const parsedCookies = req.cookies ?? {};
+      const possibleNames = ["sid", "ssr_sid", "SESSION_ID", "session_id", "erp_session"];
+      for (const name of possibleNames) {
+        const val = parsedCookies[name];
+        if (!val) continue;
+        try {
+          const s = await getSession(String(val));
+          if (s) {
+            session = s;
+            break;
+          }
+        } catch (e) {
+          // Continue to next cookie name if getSession fails for this one
+          console.warn(`[hmsOnboardingHandler] getSession failed for cookie ${name}:`, (e as Error).message || e);
+        }
+      }
+    }
+
+    // If still no session, log minimal debug and return 401
     if (!session || !session.user_id || !session.company_id) {
+      console.warn(
+        "[hmsOnboardingHandler] unauthenticated request: cookies:",
+        Object.keys(req.cookies || {}),
+        "hasMiddlewareSession:",
+        !!((req as any).authSession || (req as any).session)
+      );
       return res.status(401).json({ error: "not_authenticated" });
     }
+
+    // Attach lightweight debug header (no secrets) to help diagnostics
+    res.setHeader(
+      "X-Debug-Session",
+      JSON.stringify({
+        tenant_id: session.tenant_id ?? null,
+        user_id: session.user_id ?? null,
+        company_id: session.company_id ?? null,
+      })
+    );
 
     const tenantId = session.tenant_id;
     const companyId = session.company_id;
@@ -48,7 +89,7 @@ export async function hmsOnboardingHandler(req, res) {
              hms_billing_mode = $3,
              updated_at = now()
          WHERE company_id = $4`,
-        [ subIndustry, JSON.stringify(departments || []), billingMode, companyId ]
+        [subIndustry, JSON.stringify(departments || []), billingMode, companyId]
       );
 
       /* ===============================
@@ -57,7 +98,6 @@ export async function hmsOnboardingHandler(req, res) {
 
       // Departments
       for (const dep of departments || []) {
-        // ensure non-empty name
         const name = (dep || "").toString().trim();
         if (!name) continue;
 
