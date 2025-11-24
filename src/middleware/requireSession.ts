@@ -1,6 +1,7 @@
 // server/src/middleware/requireSession.ts
 import type { Request, Response, NextFunction, RequestHandler } from "express";
 import * as cookie from "cookie";
+import cookieSignature from "cookie-signature";
 import { pool } from "../db";
 import { findSessionBySid, touchSession } from "../services/sessionService";
 
@@ -32,19 +33,42 @@ const asBool = (v: any) =>
 // ✅ Non-async RequestHandler wrapper; do async work inside
 const requireSession: RequestHandler = (req, res, next) => {
   (async () => {
-    const r = req as Request & {
+    // Use unknown intermediate to satisfy TypeScript when widening request shape
+    const r = req as unknown as Request & {
       session?: SessionShape;
+      authSession?: SessionShape;
       company?: CompanyCtx;
       cookies?: Record<string, string>;
       signedCookies?: Record<string, string>;
+      headers?: Record<string, any>;
     };
 
     // Prefer cookie-parser if present; fall back to manual parse
     const parsed =
       (r as any).cookies ?? (r.headers?.cookie ? cookie.parse(r.headers.cookie) : {});
 
-    const sid =
+    // Accept a variety of cookie names
+    let sid =
       parsed?.sid || parsed?.ssr_sid || parsed?.SESSION_ID || parsed?.session_id || null;
+
+    // If cookie looks signed (s:...), try to unsign using SESSION_SECRET
+    if (typeof sid === "string" && sid.startsWith("s:")) {
+      const secret = process.env.SESSION_SECRET || process.env.COOKIE_SECRET || "";
+      if (secret) {
+        try {
+          const raw = cookieSignature.unsign(sid.slice(2), secret);
+          if (raw !== false) sid = raw;
+          else {
+            console.warn("[requireSession] failed to unsign sid cookie with SESSION_SECRET");
+            // keep signed value for findSessionBySid as a fallback
+          }
+        } catch (e) {
+          console.warn("[requireSession] cookie unsign error:", (e as Error).message || e);
+        }
+      } else {
+        console.warn("[requireSession] sid appears signed but SESSION_SECRET not set");
+      }
+    }
 
     if (!sid) {
       // Helpful debug log for missing cookie (useful for mobile / CORS issues)
@@ -71,6 +95,9 @@ const requireSession: RequestHandler = (req, res, next) => {
       active_company_id:
         (s as any).active_company_id != null ? String((s as any).active_company_id) : null,
     };
+
+    // compatibility alias for handlers that expect req.authSession
+    r.authSession = r.session;
 
     const tenantId = r.session.tenant_id;
     const userId = r.session.user_id;
@@ -128,7 +155,7 @@ const requireSession: RequestHandler = (req, res, next) => {
 
       if (!active) {
         const cookieActive =
-          r.signedCookies?.active_company_id ?? parsed?.active_company_id ?? null;
+          (r as any).signedCookies?.active_company_id ?? parsed?.active_company_id ?? null;
 
         if (cookieActive && UUID_RE.test(String(cookieActive))) {
           const ok = await cx.query(
@@ -186,6 +213,7 @@ const requireSession: RequestHandler = (req, res, next) => {
 
     // fire-and-forget
     touchSession(String(sid)).catch(() => {});
+
     next();
   })().catch(next);
 };
