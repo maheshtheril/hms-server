@@ -307,7 +307,7 @@ async function parseBody(req: Request) {
   });
 }
 
-// Attach to router and export default for easy mounting
+// Attach to router and export default for /;;;;;easy mounting
 router.post("/", signupHandler);
 
 export default router;
