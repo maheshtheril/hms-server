@@ -66,6 +66,29 @@ import coreRouter from "./routes/core";
 import userCompaniesRouter from "./routes/api/user/companies";
 import invoiceRoutes from "./routes/invoiceRoutes";
 import { hmsOnboardingHandler } from "./routes/api/onboarding/hms";
+// new HMS API routers (generated)
+import labOrdersRouter from "./routes/hms/lab/lab.orders";
+import labSamplesRouter from "./routes/hms/lab/lab.samples";
+import labResultsRouter from "./routes/hms/lab/lab.results";
+import labWorklistRouter from "./routes/hms/lab/lab.worklist";
+
+import imagingOrdersRouter from "./routes/hms/imaging/imaging.orders";
+import imagingStudiesRouter from "./routes/hms/imaging/imaging.studies"; // if created
+import imagingRouter from "./routes/hms/imaging"; // optional aggregate
+
+import encountersRouter from "./routes/hms/clinical/encounters";
+import vitalsRouter from "./routes/hms/clinical/vitals";
+import triageRouter from "./routes/hms/clinical/triage";
+import notesRouter from "./routes/hms/clinical/notes";
+import diagnosisRouter from "./routes/hms/clinical/diagnosis";
+import proceduresRouter from "./routes/hms/procedures";
+
+import medOrdersRouter from "./routes/hms/pharmacy/medication.orders";
+import medAdminRouter from "./routes/hms/pharmacy/medication.admin";
+
+import billingRulesRouter from "./routes/hms/billing/billing.rules";
+
+import aiTasksRouter from "./routes/hms/ai/ai.tasks";
 
 /* -------------------------- */
 
@@ -252,6 +275,47 @@ app.use("/api/global/company-taxes", globalCompanyTaxesRouter);
 app.use("/api", userCompaniesRouter);
 app.post("/api/onboarding/hms", hmsOnboardingHandler);
 
+// ---- HMS: LAB (LIS)
+app.use("/api/hms/lab/orders", labOrdersRouter);      // POST /api/hms/lab/orders
+app.use("/api/hms/lab/samples", labSamplesRouter);    // POST /api/hms/lab/samples
+app.use("/api/hms/lab/results", labResultsRouter);    // POST /api/hms/lab/results
+app.use("/api/hms/lab/worklist", labWorklistRouter);  // GET  /api/hms/lab/worklist
+
+// ---- HMS: IMAGING (RIS / PACS metadata)
+app.use("/api/hms/imaging/orders", imagingOrdersRouter);   // POST /api/hms/imaging/orders
+app.use("/api/hms/imaging/studies", imagingStudiesRouter); // GET/POST studies, series, images
+// optionally provide an aggregate imaging router:
+app.use("/api/hms/imaging", imagingRouter);
+
+// ---- HMS: CLINICAL
+app.use("/api/hms/encounters", encountersRouter); // POST /api/hms/encounters
+app.use("/api/hms/vitals", vitalsRouter);         // POST /api/hms/vitals
+app.use("/api/hms/triage", triageRouter);         // POST /api/hms/triage
+app.use("/api/hms/notes", notesRouter);           // POST /api/hms/notes
+app.use("/api/hms/diagnosis", diagnosisRouter);   // POST /api/hms/diagnosis
+
+// ---- HMS: PROCEDURES
+app.use("/api/hms/procedures", proceduresRouter); // full CRUD for procedures
+
+// ---- HMS: PHARMACY
+app.use("/api/hms/pharmacy/orders", medOrdersRouter); // POST medication orders
+app.use("/api/hms/pharmacy/admin", medAdminRouter);  // POST medication administration (MAR)
+
+// ---- HMS: BILLING
+app.use("/api/hms/billing/rules", billingRulesRouter); // billing rule CRUD
+
+// ---- HMS: AI
+app.use("/api/hms/ai/tasks", aiTasksRouter); // AI task enqueue / status
+
+// ---- Existing mounts you already have (for reference)
+app.use("/api/hms/companies", companiesRouter);
+app.use("/api/hms/products", productsRouter);
+app.use("/api/hms/settings", hmsSettingsRouter);
+app.use("/api/hms/patients", hmsPatientsRouter);
+app.use("/api/hms/clinicians", hmsClinicians);
+app.use("/api/hms/clinicians", hmsCliniciansRouter);
+app.use("/api/hms/roles", rolesRouter);
+app.use("/api/hms/specializations", specsRouter);
 
 
 /* ───────────────────────────── Leads custom fields ───────────────────────────── */
