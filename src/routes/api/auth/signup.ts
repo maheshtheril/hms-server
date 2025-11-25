@@ -2,7 +2,8 @@
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import { pool } from "../../../db";
-import { createSession, buildSessionCookie } from "../../../lib/session";
+import { createSession } from "../../../lib/session";
+import { COOKIE_NAME, SESSION_TTL_SECONDS } from "../../../lib/session";
 import { enqueueProvisionJob } from "../../../lib/provisioningQueue";
 import rateLimitSignup from "../../../middleware/rateLimitSignup";
 import domainTenantPolicy from "../../../lib/domainTenantPolicy";
@@ -65,7 +66,6 @@ async function tryInsertTenantWithUniqueSlug(client: any, baseSlug: string, name
     } catch (err: any) {
       // If unique violation on slug, continue; else rethrow
       if (err && err.code === "23505") {
-        // continue to next candidate
         continue;
       }
       throw err;
@@ -75,10 +75,14 @@ async function tryInsertTenantWithUniqueSlug(client: any, baseSlug: string, name
 }
 
 /* ============================================================
-   SIGNUP HANDLER — FIXED / HARDENED
+   SIGNUP HANDLER — hardened and ensures user_companies mapping
    ============================================================ */
 export async function signupHandler(req: Request, res: Response) {
-  console.info("[signup] invoked", { method: req.method, url: req.url, headers: { origin: req.headers.origin, host: req.headers.host, "content-type": req.headers["content-type"] } });
+  console.info("[signup] invoked", {
+    method: req.method,
+    url: req.url,
+    headers: { origin: req.headers.origin, host: req.headers.host, "content-type": req.headers["content-type"] },
+  });
 
   let client: any | null = null;
   try {
@@ -143,7 +147,7 @@ export async function signupHandler(req: Request, res: Response) {
     let companyId: string;
     let userId: string;
 
-    /* -------- 8. TRANSACTION (tenant + company + user) -------- */
+    /* -------- 8. TRANSACTION (tenant + company + user + mapping) -------- */
     try {
       await client.query("BEGIN");
 
@@ -153,7 +157,6 @@ export async function signupHandler(req: Request, res: Response) {
       try {
         tenantIns = await tryInsertTenantWithUniqueSlug(client, baseSlug, company);
       } catch (err) {
-        // If slug insertion fails due to unexpected reason, rethrow to rollback
         throw err;
       }
       tenantId = tenantIns.id;
@@ -182,7 +185,6 @@ export async function signupHandler(req: Request, res: Response) {
         );
         userId = u.rows[0].id;
       } catch (err: any) {
-        // If someone else created the same email in race window, return 409
         if (err && err.code === "23505") {
           await client.query("ROLLBACK");
           return res.status(409).json({ error: "email_exists" });
@@ -190,20 +192,27 @@ export async function signupHandler(req: Request, res: Response) {
         throw err;
       }
 
+      // USER <-> COMPANY mapping: ensure it exists before commit so session routines find it
+      await client.query(
+        `INSERT INTO user_companies (id, tenant_id, user_id, company_id, is_default, created_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, true, now())
+         ON CONFLICT (tenant_id, user_id, company_id) DO NOTHING`,
+        [tenantId, userId, companyId]
+      );
+
       await client.query("COMMIT");
     } catch (err) {
       try {
         await client.query("ROLLBACK");
       } catch (_) {}
       console.error("Signup TX error:", {
-  message: err?.message,
-  code: err?.code,
-  detail: err?.detail,
-  stack: err?.stack,
-  constraint: err?.constraint
-});
+        message: err?.message,
+        code: err?.code,
+        detail: err?.detail,
+        stack: err?.stack,
+        constraint: err?.constraint,
+      });
 
-      // return 500 for unknown errors
       return res.status(500).json({ error: "signup_failed" });
     }
 
@@ -232,14 +241,29 @@ export async function signupHandler(req: Request, res: Response) {
       }
     })();
 
-    /* -------- 11. SESSION COOKIE -------- */
+    /* -------- 11. SESSION COOKIE (after commit) -------- */
     try {
       const sid = await createSession({ userId, tenantId, companyId });
-      const cookieHeader = buildSessionCookie(sid);
-      res.setHeader("Set-Cookie", cookieHeader);
+
+      // Prefer Express helper so headers are handled correctly
+      const cookieName = process.env.SESSION_COOKIE_NAME || COOKIE_NAME;
+      const isProd = process.env.NODE_ENV === "production";
+
+      // If this file is mounted as part of an Express app that has `res.cookie`, use it.
+      // Using res.cookie avoids clobbering other Set-Cookie headers.
+      res.cookie(cookieName, sid, {
+        httpOnly: true,
+        secure: isProd,
+        sameSite: isProd ? "none" : "lax",
+        path: "/",
+        maxAge: SESSION_TTL_SECONDS * 1000,
+        // domain: process.env.SESSION_COOKIE_DOMAIN || undefined
+      });
+
+      console.info("[signup] issued session", { sid, userId, tenantId, companyId });
     } catch (err) {
       console.error("session cookie error:", err);
-      // don't fail signup
+      // don't fail signup — we still return success
     }
 
     /* -------- 12. SUCCESS -------- */
