@@ -244,6 +244,9 @@ export async function signupHandler(req: Request, res: Response) {
 
     /* -------- 11. SESSION COOKIE (after commit) -------- */
     try {
+      
+      console.info("[signup] createSession args:", { userId, tenantId, companyId });
+
       const sid = await createSession({ userId, tenantId, companyId });
 
       // Prefer Express helper so headers are handled correctly
@@ -251,7 +254,7 @@ export async function signupHandler(req: Request, res: Response) {
       const isProd = process.env.NODE_ENV === "production";
 
       // If this file is mounted as part of an Express app that has `res.cookie`, use it.
-      // Using res.cookie avoids clobbering other Set-Cookie headers.
+      // Using res.cookie avoids clobbering other Set-Cookie headers..
       res.cookie(cookieName, sid, {
         httpOnly: true,
         secure: isProd,
