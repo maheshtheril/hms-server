@@ -89,6 +89,9 @@ import medAdminRouter from "./routes/hms/pharmacy/medication.admin";
 import billingRulesRouter from "./routes/hms/billing/billing.rules";
 
 import aiTasksRouter from "./routes/hms/ai/ai.tasks";
+import tenantDashboardRouter from "./routes/tenant/dashboard";
+import companyDashboardRouter from "./routes/company/dashboard";
+
 
 /* -------------------------- */
 
@@ -170,6 +173,8 @@ app.options("*", (req, res) => {
 });
 app.use("/api/kpis", kpisRouter); 
 
+app.use("/api/tenant/dashboard", tenantDashboardRouter);
+app.use("/api/company/dashboard", companyDashboardRouter);
 
 /* ───────────────────────────── Parsers BEFORE routes ───────────────────────────── */
 app.use(cookieParser());
