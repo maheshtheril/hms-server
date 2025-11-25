@@ -140,13 +140,13 @@ router.get("/", requireSession, async (req: any, res) => {
       const opdToday =
         (await safeCount(
           client,
-          `SELECT count(*) FROM public.hms_appointments
+          `SELECT count(*) FROM public.hms_appointment
             WHERE company_id = $1 AND date(start_at)=current_date`,
           [c.id]
         )) ??
         (await safeCount(
           client,
-          `SELECT count(*) FROM public.hms_encounters
+          `SELECT count(*) FROM public.hms_encounter
             WHERE company_id = $1 AND date(created_at)=current_date`,
           [c.id]
         ));
@@ -154,7 +154,7 @@ router.get("/", requireSession, async (req: any, res) => {
       const surgeriesToday =
         (await safeCount(
           client,
-          `SELECT count(*) FROM public.hms_procedures
+          `SELECT count(*) FROM public.hms_procedure
             WHERE company_id = $1 AND date(scheduled_at)=current_date`,
           [c.id]
         )) ?? 0;
@@ -162,13 +162,13 @@ router.get("/", requireSession, async (req: any, res) => {
       const pendingLab =
         (await safeCount(
           client,
-          `SELECT count(*) FROM public.hms_lab_results
+          `SELECT count(*) FROM public.hms_lab_result
             WHERE company_id = $1 AND status IN ('pending','requested')`,
           [c.id]
         )) ??
         (await safeCount(
           client,
-          `SELECT count(*) FROM public.hms_lab_orders
+          `SELECT count(*) FROM public.hms_lab_order
             WHERE company_id = $1 AND status IN ('pending','collected')`,
           [c.id]
         )) ??
@@ -200,14 +200,14 @@ router.get("/", requireSession, async (req: any, res) => {
         (await safeCount(
           client,
           `SELECT COALESCE(SUM(total_amount),0)
-             FROM public.invoices
+             FROM public.invoice
              WHERE company_id = $1 AND created_at >= now() - interval '30 days'`,
           [c.id]
         )) ??
         (await safeCount(
           client,
           `SELECT COALESCE(SUM(amount),0)
-             FROM public.hms_invoices
+             FROM public.hms_invoice
              WHERE company_id = $1 AND created_at >= now() - interval '30 days'`,
           [c.id]
         )) ??
