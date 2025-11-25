@@ -193,9 +193,10 @@ export async function signupHandler(req: Request, res: Response) {
       }
 
       // USER <-> COMPANY mapping: ensure it exists before commit so session routines find it
+      // NOTE: user_companies uses composite PK (tenant_id, user_id, company_id) — no 'id' column
       await client.query(
-        `INSERT INTO user_companies (id, tenant_id, user_id, company_id, is_default, created_at)
-         VALUES (gen_random_uuid(), $1, $2, $3, true, now())
+        `INSERT INTO user_companies (tenant_id, user_id, company_id, is_default, created_at)
+         VALUES ($1, $2, $3, true, now())
          ON CONFLICT (tenant_id, user_id, company_id) DO NOTHING`,
         [tenantId, userId, companyId]
       );
