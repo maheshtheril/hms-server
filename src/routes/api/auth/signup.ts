@@ -162,6 +162,7 @@ export async function signupHandler(req: Request, res: Response) {
       tenantId = tenantIns.id;
 
       // --- FIX: normalize countryId (frontend may send ISO like "IN"; DB expects UUID) ---
+      // Uses table `countries` which exists in your schema.
       const isUuid = (s: any) =>
         typeof s === "string" &&
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
@@ -170,20 +171,24 @@ export async function signupHandler(req: Request, res: Response) {
 
       if (!isUuid(resolvedCountryId)) {
         try {
+          const qVal = String(resolvedCountryId || "").trim();
+
+          // prefer exact 2-letter iso match, then iso3, then name
           const r = await client.query(
             `SELECT id
-             FROM global_countries
-             WHERE UPPER(iso2) = UPPER($1)
-                OR UPPER(code) = UPPER($1)
-                OR UPPER(name) = UPPER($1)
+             FROM countries
+             WHERE UPPER(TRIM(iso2)) = UPPER($1)
+                OR UPPER(TRIM(iso3)) = UPPER($1)
+                OR UPPER(TRIM(name)) = UPPER($1)
              LIMIT 1`,
-            [String(resolvedCountryId).trim()]
+            [qVal]
           );
+
           if (r.rowCount > 0) {
             resolvedCountryId = r.rows[0].id;
             console.info("[signup] countryId resolved:", countryId, "→", resolvedCountryId);
           } else {
-            console.warn("[signup] cannot resolve countryId:", countryId);
+            console.warn("[signup] cannot resolve countryId in countries table:", countryId);
           }
         } catch (err) {
           console.error("[signup] country lookup failed:", err);
@@ -274,7 +279,6 @@ export async function signupHandler(req: Request, res: Response) {
 
     /* -------- 11. SESSION COOKIE (after commit) -------- */
     try {
-      
       console.info("[signup] createSession args:", { userId, tenantId, companyId });
 
       const sid = await createSession({ userId, tenantId, companyId });
