@@ -161,11 +161,41 @@ export async function signupHandler(req: Request, res: Response) {
       }
       tenantId = tenantIns.id;
 
+      // --- FIX: normalize countryId (frontend may send ISO like "IN"; DB expects UUID) ---
+      const isUuid = (s: any) =>
+        typeof s === "string" &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+
+      let resolvedCountryId = countryId;
+
+      if (!isUuid(resolvedCountryId)) {
+        try {
+          const r = await client.query(
+            `SELECT id
+             FROM global_countries
+             WHERE UPPER(iso2) = UPPER($1)
+                OR UPPER(code) = UPPER($1)
+                OR UPPER(name) = UPPER($1)
+             LIMIT 1`,
+            [String(resolvedCountryId).trim()]
+          );
+          if (r.rowCount > 0) {
+            resolvedCountryId = r.rows[0].id;
+            console.info("[signup] countryId resolved:", countryId, "→", resolvedCountryId);
+          } else {
+            console.warn("[signup] cannot resolve countryId:", countryId);
+          }
+        } catch (err) {
+          console.error("[signup] country lookup failed:", err);
+        }
+      }
+      // --- END country normalization ---
+
       // COMPANY
       const c = await client.query(
         `INSERT INTO company (tenant_id, name, country_id)
          VALUES ($1, $2, $3) RETURNING id`,
-        [tenantId, company, countryId]
+        [tenantId, company, resolvedCountryId]
       );
       companyId = c.rows[0].id;
 
