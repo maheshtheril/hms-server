@@ -65,7 +65,8 @@ import signupRouter from "./routes/api/auth/signup";
 import coreRouter from "./routes/core";
 import userCompaniesRouter from "./routes/api/user/companies";
 import invoiceRoutes from "./routes/invoiceRoutes";
-import { hmsOnboardingHandler } from "./routes/api/onboarding/hms";
+import hmsOnboardingRouter from "./routes/api/onboarding/hms";
+
 // new HMS API routers (generated)
 import labOrdersRouter from "./routes/hms/lab/lab.orders";
 import labSamplesRouter from "./routes/hms/lab/lab.samples";
@@ -278,7 +279,8 @@ app.use("/api/global/tax-rates", globalTaxRatesRouter);
 app.use("/api/global/company-settings", globalCompanySettingsRouter);
 app.use("/api/global/company-taxes", globalCompanyTaxesRouter);
 app.use("/api", userCompaniesRouter);
-app.post("/api/onboarding/hms", hmsOnboardingHandler);
+app.use("/api/onboarding/hms", hmsOnboardingRouter);
+
 
 // ---- HMS: LAB (LIS)
 app.use("/api/hms/lab/orders", labOrdersRouter);      // POST /api/hms/lab/orders

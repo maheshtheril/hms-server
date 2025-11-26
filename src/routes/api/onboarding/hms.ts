@@ -1,5 +1,8 @@
+// server/src/routes/onboarding/hms.ts
+import { Router, Request, Response } from "express";
 import { pool } from "../../../db";
 import { getSession } from "../../../lib/session";
+ // optional; your project may differ
 
 /**
  * POST /api/onboarding/hms
@@ -7,7 +10,13 @@ import { getSession } from "../../../lib/session";
  *
  * Fully aligned with actual DB schema.
  */
-export async function hmsOnboardingHandler(req: any, res: any) {
+
+const router = Router();
+
+/**
+ * Core handler (keeps your provided logic)
+ */
+async function hmsOnboardingHandler(req: any, res: any) {
   try {
     const body = req.body || {};
     const subIndustry = (body.subIndustry || "hospital").toString();
@@ -21,7 +30,7 @@ export async function hmsOnboardingHandler(req: any, res: any) {
       });
     }
 
-    // Use session from middleware, fallback to cookies
+    // Use session from middleware, fallback to cookies -> getSession
     let session =
       (req as any).authSession ||
       (req as any).session ||
@@ -39,7 +48,9 @@ export async function hmsOnboardingHandler(req: any, res: any) {
               session = s;
               break;
             }
-          } catch {}
+          } catch (err) {
+            // ignore and continue to next key
+          }
         }
       }
     }
@@ -48,14 +59,19 @@ export async function hmsOnboardingHandler(req: any, res: any) {
       return res.status(401).json({ error: "not_authenticated" });
     }
 
-    res.setHeader(
-      "X-Debug-Session",
-      JSON.stringify({
-        tenant_id: session.tenant_id,
-        user_id: session.user_id,
-        company_id: session.company_id,
-      })
-    );
+    // Debug header to help devs see what session was used
+    try {
+      res.setHeader(
+        "X-Debug-Session",
+        JSON.stringify({
+          tenant_id: session.tenant_id,
+          user_id: session.user_id,
+          company_id: session.company_id,
+        })
+      );
+    } catch (_) {
+      // ignore header set failures
+    }
 
     const tenantId = session.tenant_id;
     const companyId = session.company_id;
@@ -66,10 +82,7 @@ export async function hmsOnboardingHandler(req: any, res: any) {
     try {
       await client.query("BEGIN");
 
-      /* ===========================================
-         1) Update company_settings (matches schema)
-         =========================================== */
-
+      /* 1) Update company_settings (matches schema) */
       await client.query(
         `
         UPDATE company_settings
@@ -83,10 +96,7 @@ export async function hmsOnboardingHandler(req: any, res: any) {
         [subIndustry, JSON.stringify(departments), billingMode, companyId]
       );
 
-      /* ===========================================
-         2) Departments (actual table: hms_departments)
-         =========================================== */
-
+      /* 2) Departments (actual table: hms_departments) */
       for (const dep of departments) {
         const name = (dep || "").toString().trim();
         if (!name) continue;
@@ -103,13 +113,8 @@ export async function hmsOnboardingHandler(req: any, res: any) {
         );
       }
 
-      /* ===========================================
-         3) Pharmacy Categories 
-            (actual table: hms_product_category)
-         =========================================== */
-
+      /* 3) Pharmacy Categories (hms_product_category) */
       const productCategories = ["Medicines", "Consumables"];
-
       for (const c of productCategories) {
         await client.query(
           `
@@ -123,13 +128,8 @@ export async function hmsOnboardingHandler(req: any, res: any) {
         );
       }
 
-      /* ===========================================
-         4) Lab Groups 
-            (actual table: hms_lab_test_group)
-         =========================================== */
-
+      /* 4) Lab Groups (hms_lab_test_group) */
       const labGroups = ["Blood Tests", "Urine Tests", "Imaging Reports"];
-
       for (const g of labGroups) {
         await client.query(
           `
@@ -143,11 +143,7 @@ export async function hmsOnboardingHandler(req: any, res: any) {
         );
       }
 
-      /* ===========================================
-         5) Default Ward / Bed 
-            (actual tables: hms_ward, hms_bed)
-         =========================================== */
-
+      /* 5) Default Ward / Bed (hms_ward, hms_bed) */
       if (subIndustry === "hospital") {
         await client.query(
           `
@@ -189,3 +185,16 @@ export async function hmsOnboardingHandler(req: any, res: any) {
     return res.status(500).json({ error: "server_error" });
   }
 }
+
+/**
+ * Route registration:
+ * - Protect with requireSession if you want strict middleware-based auth;
+ * - Handler itself will still attempt to resolve session from cookies if middleware is not used.
+ *
+ * Mount this router under /api/onboarding/hms in your main server file.
+ */
+
+// If you want middleware-based protection, uncomment the next line and ensure requireSession exists & sets req.session:
+router.post("/", /* requireSession, */ hmsOnboardingHandler);
+
+export default router;
