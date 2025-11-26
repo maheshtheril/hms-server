@@ -15,7 +15,7 @@ import type { Request, Response, NextFunction } from "express";
  */
 
 /* env defaults */
-const COOKIE_NAME = process.env.COOKIE_NAME_SID || process.env.SESSION_COOKIE_NAME || "sid";
+const COOKIE_NAME = process.env.COOKIE_NAME_SID || process.env.SESSION_COOKIE_NAME || process.env.SESSION_COOKIE || "erp_session";
 const SESSIONS_TABLE_ENV = process.env.SESSIONS_TABLE || "sessions";
 const SAFE_TABLE_NAME = /^[a-zA-Z0-9_]+$/.test(SESSIONS_TABLE_ENV) ? SESSIONS_TABLE_ENV : "sessions";
 
