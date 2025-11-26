@@ -4,13 +4,14 @@ import type { QueryResult } from "pg";
 import { q } from "../db";
 
 export const SESSION_TTL_SECONDS = 14 * 24 * 60 * 60; // 14 days
-export const COOKIE_NAME = "erp_session";
+export const COOKIE_NAME = process.env.SESSION_COOKIE_NAME || "erp_session";
 
 /**
  * ISSUE a new session to DB (SID).
- * Now supports companyId.
+ * Uses `absolute_expiry` DB column (existing schema).
  *
- * Uses `absolute_expiry` DB column (existing schema) instead of `expires_at`.
+ * Note: We use a parameterized interval expression `make_interval(secs => $1)`
+ * to avoid string concatenation that can be brittle or fail with type mismatches.
  */
 export async function issueSession(
   userId: string,
@@ -19,10 +20,10 @@ export async function issueSession(
 ): Promise<string> {
   const sid = crypto.randomUUID();
 
-  // Store absolute_expiry = now() + ttl
+  // Insert session; absolute_expiry = now() + SESSION_TTL_SECONDS seconds
   await q(
     `INSERT INTO sessions (sid, user_id, tenant_id, company_id, created_at, last_seen, absolute_expiry)
-     VALUES ($1, $2, $3, $4, now(), now(), now() + ($5 || ' seconds')::interval)`,
+     VALUES ($1, $2, $3, $4, now(), now(), now() + make_interval(secs => $5))`,
     [sid, userId, tenantId ?? null, companyId ?? null, SESSION_TTL_SECONDS]
   );
 
@@ -31,6 +32,7 @@ export async function issueSession(
 
 /**
  * createSession wrapper used in routes.
+ * (kept name createSession to match existing callers)
  */
 export async function createSession({
   userId,
@@ -55,12 +57,9 @@ export function buildSessionCookie(sid: string): string {
   // Expires header (HTTP date) for compatibility with some clients
   const expires = new Date(Date.now() + maxAge * 1000).toUTCString();
 
-  // In production we set Secure and SameSite=None to allow cross-site usage (if you need it),
-  // but ensure you serve over HTTPS. For non-prod we use SameSite=Lax and no Secure so local dev works.
   const securePart = isProd ? "; Secure" : "";
   const sameSitePart = isProd ? "; SameSite=None" : "; SameSite=Lax";
 
-  // Optional Domain attribute: you can set via env if you host under a known domain
   const cookieDomain = process.env.SESSION_COOKIE_DOMAIN
     ? `; Domain=${process.env.SESSION_COOKIE_DOMAIN}`
     : "";
@@ -69,21 +68,26 @@ export function buildSessionCookie(sid: string): string {
 }
 
 /**
- * Touch last_seen
+ * Touch last_seen (update last_seen timestamp)
  */
 export async function touchSession(sid: string): Promise<void> {
-  await q("UPDATE sessions SET last_seen = now() WHERE sid = $1", [sid]);
+  try {
+    await q("UPDATE sessions SET last_seen = now() WHERE sid = $1", [sid]);
+  } catch (err) {
+    console.error("[session.touchSession] error:", err);
+    throw err;
+  }
 }
 
 /**
- * Fetch session
- *
+ * Fetch session (only non-expired).
  * Returns the session row (including absolute_expiry) or null.
- * NOTE: callers may want to check absolute_expiry to reject expired sessions.
  */
 export async function getSession(sid: string): Promise<any | null> {
+  if (!sid) return null;
+
   const { rows }: QueryResult = await q(
-    "SELECT * FROM sessions WHERE sid = $1",
+    `SELECT * FROM sessions WHERE sid = $1 AND (absolute_expiry IS NULL OR absolute_expiry > now()) LIMIT 1`,
     [sid]
   );
   return rows[0] ?? null;
@@ -93,6 +97,7 @@ export async function getSession(sid: string): Promise<any | null> {
  * Revoke session
  */
 export async function revokeSession(sid: string): Promise<void> {
+  if (!sid) return;
   await q("DELETE FROM sessions WHERE sid = $1", [sid]);
 }
 
@@ -102,3 +107,15 @@ export async function revokeSession(sid: string): Promise<void> {
 export async function revokeAllSessionsForUser(userId: string): Promise<void> {
   await q("DELETE FROM sessions WHERE user_id = $1", [userId]);
 }
+
+export default {
+  issueSession,
+  createSession,
+  buildSessionCookie,
+  touchSession,
+  getSession,
+  revokeSession,
+  revokeAllSessionsForUser,
+  SESSION_TTL_SECONDS,
+  COOKIE_NAME,
+};

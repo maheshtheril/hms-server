@@ -1,200 +1,292 @@
-// server/src/routes/onboarding/hms.ts
+// server/src/routes/api/onboarding/hms.ts
 import { Router, Request, Response } from "express";
 import { pool } from "../../../db";
 import { getSession } from "../../../lib/session";
- // optional; your project may differ
-
-/**
- * POST /api/onboarding/hms
- * Body: { subIndustry?: string, departments?: string[], billingMode: string }
- *
- * Fully aligned with actual DB schema.
- */
 
 const router = Router();
 
-/**
- * Core handler (keeps your provided logic)
- */
-async function hmsOnboardingHandler(req: any, res: any) {
-  try {
-    const body = req.body || {};
-    const subIndustry = (body.subIndustry || "hospital").toString();
-    const departments = Array.isArray(body.departments) ? body.departments : [];
-    const billingMode = body.billingMode ? String(body.billingMode) : "";
+/* ---------------------------------------------------------
+   UTIL — get session from middleware or cookie fallback
+--------------------------------------------------------- */
+async function resolveSession(req: any) {
+  if (req.authSession) return req.authSession;
+  if (req.session) return req.session;
 
-    if (!billingMode) {
-      return res.status(400).json({
-        error: "missing_fields",
-        message: "billingMode is required",
-      });
-    }
+  const cookies = req.cookies ?? {};
+  const keys = ["sid", "session_id", "SESSION_ID", "erp_session"];
 
-    // Use session from middleware, fallback to cookies -> getSession
-    let session =
-      (req as any).authSession ||
-      (req as any).session ||
-      null;
-
-    if (!session) {
-      const cookies = req.cookies ?? {};
-      const sessionKeys = ["sid", "session_id", "SESSION_ID", "erp_session"];
-
-      for (const key of sessionKeys) {
-        if (cookies[key]) {
-          try {
-            const s = await getSession(cookies[key]);
-            if (s) {
-              session = s;
-              break;
-            }
-          } catch (err) {
-            // ignore and continue to next key
-          }
-        }
-      }
-    }
-
-    if (!session?.user_id || !session?.company_id) {
-      return res.status(401).json({ error: "not_authenticated" });
-    }
-
-    // Debug header to help devs see what session was used
+  for (const k of keys) {
+    if (!cookies[k]) continue;
     try {
-      res.setHeader(
-        "X-Debug-Session",
-        JSON.stringify({
-          tenant_id: session.tenant_id,
-          user_id: session.user_id,
-          company_id: session.company_id,
-        })
-      );
-    } catch (_) {
-      // ignore header set failures
-    }
+      const s = await getSession(cookies[k]);
+      if (s) return s;
+    } catch (e) {}
+  }
+
+  return null;
+}
+
+/* ---------------------------------------------------------
+   STEP 1 — START ONBOARDING
+--------------------------------------------------------- */
+router.post("/start", async (req: Request, res: Response) => {
+  try {
+    const session = await resolveSession(req);
+    if (!session) return res.status(401).json({ error: "not_authenticated" });
+
+    const companyId = session.company_id;
+
+    await pool.query(
+      `
+      UPDATE company_settings
+      SET profile = COALESCE(profile, '{}'::jsonb) 
+                    || '{"hms_onboarding":{"started":true}}'::jsonb,
+          updated_at = now()
+      WHERE company_id = $1
+    `,
+      [companyId]
+    );
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("HMS onboarding START error:", err);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+/* ---------------------------------------------------------
+   STEP 2 — DEPARTMENTS
+--------------------------------------------------------- */
+router.post("/departments", async (req: Request, res: Response) => {
+  try {
+    const session = await resolveSession(req);
+    if (!session) return res.status(401).json({ error: "not_authenticated" });
+
+    const { departments } = req.body;
+    if (!Array.isArray(departments))
+      return res.status(400).json({ error: "invalid_departments" });
 
     const tenantId = session.tenant_id;
     const companyId = session.company_id;
     const userId = session.user_id;
 
     const client = await pool.connect();
-
     try {
       await client.query("BEGIN");
 
-      /* 1) Update company_settings (matches schema) */
-      await client.query(
-        `
-        UPDATE company_settings
-        SET
-          hms_sub_industry = $1,
-          hms_departments = $2,
-          hms_billing_mode = $3,
-          updated_at = now()
-        WHERE company_id = $4
-        `,
-        [subIndustry, JSON.stringify(departments), billingMode, companyId]
-      );
-
-      /* 2) Departments (actual table: hms_departments) */
-      for (const dep of departments) {
-        const name = (dep || "").toString().trim();
+      for (const d of departments) {
+        const name = String(d || "").trim();
         if (!name) continue;
 
         await client.query(
           `
           INSERT INTO hms_departments
             (id, tenant_id, company_id, name, is_active, created_by)
-          VALUES
-            (gen_random_uuid(), $1, $2, $3, true, $4)
+          VALUES (gen_random_uuid(), $1, $2, $3, true, $4)
           ON CONFLICT (company_id, name) DO NOTHING
         `,
           [tenantId, companyId, name, userId]
         );
       }
 
-      /* 3) Pharmacy Categories (hms_product_category) */
-      const productCategories = ["Medicines", "Consumables"];
-      for (const c of productCategories) {
-        await client.query(
-          `
-          INSERT INTO hms_product_category
-            (id, tenant_id, company_id, name)
-          VALUES
-            (gen_random_uuid(), $1, $2, $3)
-          ON CONFLICT DO NOTHING
-        `,
-          [tenantId, companyId, c]
-        );
-      }
-
-      /* 4) Lab Groups (hms_lab_test_group) */
-      const labGroups = ["Blood Tests", "Urine Tests", "Imaging Reports"];
-      for (const g of labGroups) {
-        await client.query(
-          `
-          INSERT INTO hms_lab_test_group
-            (id, tenant_id, company_id, name)
-          VALUES
-            (gen_random_uuid(), $1, $2, $3)
-          ON CONFLICT (company_id, name) DO NOTHING
-        `,
-          [tenantId, companyId, g]
-        );
-      }
-
-      /* 5) Default Ward / Bed (hms_ward, hms_bed) */
-      if (subIndustry === "hospital") {
-        await client.query(
-          `
-          INSERT INTO hms_ward
-            (id, tenant_id, company_id, name)
-          VALUES
-            (gen_random_uuid(), $1, $2, 'General Ward')
-          ON CONFLICT (company_id, name) DO NOTHING
-        `,
-          [tenantId, companyId]
-        );
-
-        await client.query(
-          `
-          INSERT INTO hms_bed
-            (id, tenant_id, company_id, ward_id, bed_no, status)
-          SELECT gen_random_uuid(), $1, $2, w.id, '1', 'available'
-          FROM hms_ward w
-          WHERE w.company_id = $2
-            AND w.name = 'General Ward'
-          LIMIT 1
-        `,
-          [tenantId, companyId]
-        );
-      }
-
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK");
-      console.error("HMS onboarding error (db tx):", err);
-      return res.status(500).json({ error: "onboarding_failed" });
+      console.error("HMS onboarding DEPARTMENTS error:", err);
+      return res.status(500).json({ error: "server_error" });
     } finally {
       client.release();
     }
 
     return res.json({ ok: true });
   } catch (err) {
-    console.error("HMS onboarding server error:", err);
+    console.error("departments outer error:", err);
     return res.status(500).json({ error: "server_error" });
   }
-}
+});
 
-/**
- * Route registration:
- * - Protect with requireSession if you want strict middleware-based auth;
- * - Handler itself will still attempt to resolve session from cookies if middleware is not used.
- *
- * Mount this router under /api/onboarding/hms in your main server file.
- */
+/* ---------------------------------------------------------
+   STEP 3 — STAFF (optional)
+--------------------------------------------------------- */
+router.post("/staff", async (req: Request, res: Response) => {
+  try {
+    const session = await resolveSession(req);
+    if (!session) return res.status(401).json({ error: "not_authenticated" });
 
-// If you want middleware-based protection, uncomment the next line and ensure requireSession exists & sets req.session:
-router.post("/", /* requireSession, */ hmsOnboardingHandler);
+    const { staff } = req.body;
+    if (!Array.isArray(staff)) return res.status(400).json({ error: "invalid_staff" });
 
+    const tenantId = session.tenant_id;
+    const companyId = session.company_id;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      for (const s of staff) {
+        const name = String(s?.name || "").trim();
+        const role = s?.role || null;
+        if (!name) continue;
+
+        await client.query(
+          `
+          INSERT INTO hms_staff (id, tenant_id, company_id, name, role)
+          VALUES (gen_random_uuid(), $1, $2, $3, $4)
+        `,
+          [tenantId, companyId, name, role]
+        );
+      }
+
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("HMS onboarding STAFF error:", err);
+      return res.status(500).json({ error: "server_error" });
+    } finally {
+      client.release();
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("staff outer error:", err);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+/* ---------------------------------------------------------
+   STEP 4 — BILLING MODE
+--------------------------------------------------------- */
+router.post("/billing", async (req: Request, res: Response) => {
+  try {
+    const session = await resolveSession(req);
+    if (!session) return res.status(401).json({ error: "not_authenticated" });
+
+    const { mode } = req.body;
+    if (!["cash", "insurance", "mixed"].includes(mode))
+      return res.status(400).json({ error: "invalid_billing_mode" });
+
+    const companyId = session.company_id;
+
+    await pool.query(
+      `
+      UPDATE company_settings
+      SET profile = COALESCE(profile, '{}'::jsonb)
+                    || jsonb_build_object('hms_billing_mode', $1),
+          updated_at = now()
+      WHERE company_id = $2
+    `,
+      [mode, companyId]
+    );
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("HMS onboarding BILLING error:", err);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+/* ---------------------------------------------------------
+   STEP 5 — COMPLETE ONBOARDING (FINAL)
+--------------------------------------------------------- */
+router.post("/complete", async (req: Request, res: Response) => {
+  try {
+    const session = await resolveSession(req);
+    if (!session) return res.status(401).json({ error: "not_authenticated" });
+
+    const tenantId = session.tenant_id;
+    const companyId = session.company_id;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      /* --------------------------------------------
+         Create default Ward + Bed (idempotent)
+      -------------------------------------------- */
+      await client.query(
+        `
+        INSERT INTO hms_ward (id, tenant_id, company_id, name)
+        VALUES (gen_random_uuid(), $1, $2, 'General Ward')
+        ON CONFLICT (company_id, name) DO NOTHING
+      `,
+        [tenantId, companyId]
+      );
+
+      await client.query(
+        `
+        INSERT INTO hms_bed (id, tenant_id, company_id, ward_id, bed_no, status)
+        SELECT gen_random_uuid(), $1, $2, w.id, '1', 'available'
+        FROM hms_ward w
+        WHERE w.company_id = $2 AND w.name = 'General Ward'
+        LIMIT 1
+      `,
+        [tenantId, companyId]
+      );
+
+      /* --------------------------------------------
+         Insert default Product Categories
+      -------------------------------------------- */
+      const categories = ["Medicines", "Consumables"];
+      for (const c of categories) {
+        await client.query(
+          `
+          INSERT INTO hms_product_category (id, tenant_id, company_id, name)
+          VALUES (gen_random_uuid(), $1, $2, $3)
+          ON CONFLICT DO NOTHING
+        `,
+          [tenantId, companyId, c]
+        );
+      }
+
+      /* --------------------------------------------
+         Insert default Lab Groups
+      -------------------------------------------- */
+      const labGroups = ["Blood Tests", "Urine Tests", "Imaging Reports"];
+      for (const g of labGroups) {
+        await client.query(
+          `
+          INSERT INTO hms_lab_test_group (id, tenant_id, company_id, name)
+          VALUES (gen_random_uuid(), $1, $2, $3)
+          ON CONFLICT DO NOTHING
+        `,
+          [tenantId, companyId, g]
+        );
+      }
+
+      /* --------------------------------------------
+         Mark onboarding as completed
+      -------------------------------------------- */
+      await client.query(
+        `
+        UPDATE company_settings
+        SET profile = COALESCE(profile, '{}'::jsonb)
+                      || '{"hms_onboarding":{"completed":true}}'::jsonb,
+            updated_at = now()
+        WHERE company_id = $1
+      `,
+        [companyId]
+      );
+
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("HMS onboarding COMPLETE error:", err);
+      return res.status(500).json({ error: "server_error" });
+    } finally {
+      client.release();
+    }
+
+    return res.json({
+      ok: true,
+      redirect: "/tenant/dashboard",
+    });
+  } catch (err) {
+    console.error("complete outer error:", err);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+/* ---------------------------------------------------------
+   EXPORT ROUTER
+--------------------------------------------------------- */
 export default router;
