@@ -64,7 +64,7 @@ async function tryInsertTenantWithUniqueSlug(client: any, baseSlug: string, name
       );
       return { id: r.rows[0].id, slug: candidate };
     } catch (err: any) {
-      if (err.code === "23505") continue; // slug conflict
+      if (err && err.code === "23505") continue; // slug conflict
       throw err;
     }
   }
@@ -205,6 +205,73 @@ export async function signupHandler(req: Request, res: Response) {
         );
       }
 
+      /* ------------------- company_settings (ensure present) ------------------- */
+      // company_settings.currency_id is NOT NULL in your schema. Try to resolve sensible currency:
+      let currencyId: string | null = null;
+      try {
+        const curByCountry = await client.query(
+          `SELECT id FROM currencies WHERE country_id = $1 LIMIT 1`,
+          [resolvedCountryId]
+        );
+        if (curByCountry.rowCount > 0) currencyId = curByCountry.rows[0].id;
+        else {
+          const anyCur = await client.query(`SELECT id FROM currencies LIMIT 1`);
+          if (anyCur.rowCount > 0) currencyId = anyCur.rows[0].id;
+        }
+      } catch (e) {
+        // ignore lookup errors; we'll fail if still null
+      }
+
+      if (!currencyId) {
+        // If there's absolutely no currency row, create a minimal placeholder currency linked to country.
+        // This is defensive — ideally your DB already has currency rows.
+        const created = await client.query(
+          `INSERT INTO currencies (id, country_id, code, name, created_at, updated_at)
+           VALUES (gen_random_uuid(), $1, 'XXX', 'Default', now(), now())
+           RETURNING id`,
+          [resolvedCountryId]
+        );
+        currencyId = created.rows[0].id;
+      }
+
+      await client.query(
+        `
+        INSERT INTO company_settings (
+          id, tenant_id, company_id,
+          currency_id,
+          default_tax_type_id,
+          default_tax_rate_id,
+          rounding_precision,
+          numbering_prefix,
+          numbering_next,
+          address_country_id,
+          auto_load_taxes_from_country,
+          created_at, updated_at,
+          hms_sub_industry,
+          hms_departments,
+          hms_billing_mode
+        )
+        VALUES (
+          gen_random_uuid(),
+          $1, $2,
+          $3,
+          NULL,
+          NULL,
+          2,
+          'INV',
+          1,
+          $4,
+          true,
+          now(), now(),
+          NULL,
+          NULL,
+          NULL
+        )
+        ON CONFLICT (company_id) DO NOTHING
+        `,
+        [tenantId, companyId, currencyId, resolvedCountryId]
+      );
+
       /* ------------------- User ------------------------- */
       try {
         const u = await client.query(
@@ -218,7 +285,7 @@ export async function signupHandler(req: Request, res: Response) {
         );
         userId = u.rows[0].id;
       } catch (err: any) {
-        if (err.code === "23505") {
+        if (err && err.code === "23505") {
           await client.query("ROLLBACK");
           return res.status(409).json({ error: "email_exists" });
         }
