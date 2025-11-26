@@ -12,6 +12,23 @@ const router = Router();
 
 console.info("[signup.ts] module loaded");
 
+/* -------------------------------
+   DEBUG: query wrapper to expose full pg error props
+   ------------------------------- */
+async function q(client: any, text: string, params: any[] = []) {
+  try {
+    return await client.query(text, params);
+  } catch (err: any) {
+    try {
+      // Force include non-enumerable pg props for actionable logs
+      console.error("[pg][query_error]", text, params, JSON.stringify(err, Object.getOwnPropertyNames(err)));
+    } catch (e) {
+      console.error("[pg][query_error] fallback", text, params, err);
+    }
+    throw err;
+  }
+}
+
 /* ---------------------------------------------------------
    PASSWORD POLICY
 --------------------------------------------------------- */
@@ -52,13 +69,13 @@ function slugifyBase(s: string) {
 }
 
 /* ---------------------------------------------------------
-   TRY INSERT TENANT WITH UNIQUE SLUG
+   TRY INSERT TENANT WITH UNIQUE SLUG (uses q)
 --------------------------------------------------------- */
 async function tryInsertTenantWithUniqueSlug(client: any, baseSlug: string, name: string) {
   for (let i = 0; i < 7; i++) {
     const candidate = i === 0 ? baseSlug : `${baseSlug}-${i + 1}`;
     try {
-      const r = await client.query(
+      const r = await q(client,
         `INSERT INTO tenant (slug, name) VALUES ($1, $2) RETURNING id`,
         [candidate, name]
       );
@@ -83,7 +100,7 @@ async function resolveCountryUUID(client: any, countryId: string): Promise<strin
 
   const qVal = String(countryId).trim().toUpperCase();
 
-  const r = await client.query(
+  const r = await q(client,
     `
     SELECT id FROM countries
     WHERE UPPER(TRIM(iso2)) = $1
@@ -97,6 +114,63 @@ async function resolveCountryUUID(client: any, countryId: string): Promise<strin
   if (r.rowCount > 0) return r.rows[0].id;
 
   throw new Error(`Invalid countryId: ${countryId}`);
+}
+
+/* ---------------------------------------------------------
+   Resolve default currency for a country:
+   - prefer explicit mapping in country_default_currency -> currencies
+   - fallback to USD/EUR if present
+   - final fallback to any active currency
+   NOTE: we DO NOT create new currency rows here.
+--------------------------------------------------------- */
+async function resolveCurrencyForCountry(client: any, countryId: string): Promise<string | null> {
+  // 1) try explicit mapping
+  try {
+    const mapped = await q(client,
+      `SELECT cur.id, cur.code
+       FROM country_default_currency cdc
+       JOIN currencies cur ON cur.id = cdc.currency_id
+       WHERE cdc.country_id = $1 AND cdc.is_active = true AND cur.is_active = true
+       ORDER BY cdc.created_at DESC
+       LIMIT 1
+      `,
+      [countryId]
+    );
+    if (mapped.rowCount > 0) {
+      console.debug("[signup] resolved currency from country_default_currency:", mapped.rows[0].code);
+      return mapped.rows[0].id;
+    }
+  } catch (err) {
+    console.error("[signup] error while checking country_default_currency:", err);
+    // continue to fallbacks
+  }
+
+  // 2) prefer USD or EUR if present
+  try {
+    const prefer = await q(client,
+      `SELECT id, code FROM currencies WHERE is_active = true AND code IN ('USD','EUR') ORDER BY CASE WHEN code='USD' THEN 0 WHEN code='EUR' THEN 1 ELSE 2 END LIMIT 1`
+    );
+    if (prefer.rowCount > 0) {
+      console.debug("[signup] falling back to preferred currency:", prefer.rows[0].code);
+      return prefer.rows[0].id;
+    }
+  } catch (err) {
+    console.error("[signup] error while checking preferred currencies:", err);
+  }
+
+  // 3) last resort: return any active currency
+  try {
+    const anyCur = await q(client, `SELECT id, code FROM currencies WHERE is_active = true LIMIT 1`);
+    if (anyCur.rowCount > 0) {
+      console.debug("[signup] falling back to any active currency:", anyCur.rows[0].code);
+      return anyCur.rows[0].id;
+    }
+  } catch (err) {
+    console.error("[signup] error while fetching any active currency:", err);
+  }
+
+  // nothing available — let caller decide
+  return null;
 }
 
 /* ============================================================
@@ -155,10 +229,7 @@ export async function signupHandler(req: Request, res: Response) {
     /* ---------------------------------------------------------
        6) PRECHECK: EMAIL EXISTS
     --------------------------------------------------------- */
-    const existing = await client.query(
-      `SELECT id FROM app_user WHERE LOWER(email)=LOWER($1) LIMIT 1`,
-      [emailLC]
-    );
+    const existing = await q(client, `SELECT id FROM app_user WHERE LOWER(email)=LOWER($1) LIMIT 1`, [emailLC]);
     if (existing.rowCount > 0) {
       return res.status(409).json({ error: "email_exists" });
     }
@@ -176,7 +247,7 @@ export async function signupHandler(req: Request, res: Response) {
     let userId: string;
 
     try {
-      await client.query("BEGIN");
+      await q(client, "BEGIN");
 
       /* ------------------- Tenant ----------------------- */
       const baseSlug = slugifyBase(company) || `org-${Math.random().toString(36).slice(2)}`;
@@ -184,10 +255,11 @@ export async function signupHandler(req: Request, res: Response) {
       tenantId = tenantRow.id;
 
       /* ------------------- Country ID Fix --------------- */
+      console.debug("[signup] resolveCountryUUID input countryId:", countryId);
       const resolvedCountryId = await resolveCountryUUID(client, countryId);
 
       /* ------------------- Company ---------------------- */
-      const c = await client.query(
+      const c = await q(client,
         `
         INSERT INTO company (tenant_id, name, country_id)
         VALUES ($1, $2, $3)
@@ -199,42 +271,27 @@ export async function signupHandler(req: Request, res: Response) {
 
       // Update industry (optional)
       if (industry) {
-        await client.query(
-          `UPDATE company SET industry = $1 WHERE id = $2`,
-          [industry, companyId]
-        );
+        await q(client, `UPDATE company SET industry = $1 WHERE id = $2`, [industry, companyId]);
       }
 
       /* ------------------- company_settings (ensure present) ------------------- */
-      // company_settings.currency_id is NOT NULL in your schema. Try to resolve sensible currency:
+      // company_settings.currency_id may be NOT NULL — resolve via mapping table (no creation)
       let currencyId: string | null = null;
       try {
-        const curByCountry = await client.query(
-          `SELECT id FROM currencies WHERE country_id = $1 LIMIT 1`,
-          [resolvedCountryId]
-        );
-        if (curByCountry.rowCount > 0) currencyId = curByCountry.rows[0].id;
-        else {
-          const anyCur = await client.query(`SELECT id FROM currencies LIMIT 1`);
-          if (anyCur.rowCount > 0) currencyId = anyCur.rows[0].id;
-        }
-      } catch (e) {
-        // ignore lookup errors; we'll fail if still null
+        currencyId = await resolveCurrencyForCountry(client, resolvedCountryId);
+      } catch (err) {
+        // log but continue — we'll handle null below
+        console.error("[signup] currency resolution error:", err);
       }
 
       if (!currencyId) {
-        // If there's absolutely no currency row, create a minimal placeholder currency linked to country.
-        // This is defensive — ideally your DB already has currency rows.
-        const created = await client.query(
-          `INSERT INTO currencies (id, country_id, code, name, created_at, updated_at)
-           VALUES (gen_random_uuid(), $1, 'XXX', 'Default', now(), now())
-           RETURNING id`,
-          [resolvedCountryId]
-        );
-        currencyId = created.rows[0].id;
+        // No currency mapping and no active currencies found — abort gracefully with clear message.
+        // This avoids creating placeholder currencies that break master-data expectations.
+        await q(client, "ROLLBACK").catch(() => {});
+        return res.status(500).json({ error: "no_currency_available", message: "No active currencies found. Seed the currencies and country_default_currency tables." });
       }
 
-      await client.query(
+      await q(client,
         `
         INSERT INTO company_settings (
           id, tenant_id, company_id,
@@ -274,7 +331,7 @@ export async function signupHandler(req: Request, res: Response) {
 
       /* ------------------- User ------------------------- */
       try {
-        const u = await client.query(
+        const u = await q(client,
           `
           INSERT INTO app_user
               (tenant_id, company_id, email, name, password, is_tenant_admin, is_active)
@@ -286,14 +343,14 @@ export async function signupHandler(req: Request, res: Response) {
         userId = u.rows[0].id;
       } catch (err: any) {
         if (err && err.code === "23505") {
-          await client.query("ROLLBACK");
+          await q(client, "ROLLBACK").catch(() => {});
           return res.status(409).json({ error: "email_exists" });
         }
         throw err;
       }
 
       /* ------------------- USER ↔ COMPANY mapping ------- */
-      await client.query(
+      await q(client,
         `
         INSERT INTO user_companies (tenant_id, user_id, company_id, is_default, created_at)
         VALUES ($1, $2, $3, true, now())
@@ -302,10 +359,15 @@ export async function signupHandler(req: Request, res: Response) {
         [tenantId, userId, companyId]
       );
 
-      await client.query("COMMIT");
+      await q(client, "COMMIT");
     } catch (err) {
-      await client.query("ROLLBACK");
-      console.error("Signup TX error:", err);
+      // Ensure transaction is rolled back and we log the full error shape.
+      await q(client, "ROLLBACK").catch(() => {});
+      try {
+        console.error("Signup TX error (full):", JSON.stringify(err, Object.getOwnPropertyNames(err)));
+      } catch (e) {
+        console.error("Signup TX error (fallback):", err);
+      }
       return res.status(500).json({ error: "signup_failed" });
     }
 
