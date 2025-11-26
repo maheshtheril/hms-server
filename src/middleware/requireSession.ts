@@ -1,5 +1,5 @@
 // server/src/middleware/requireSession.ts
-import type { Request, Response, NextFunction, RequestHandler } from "express";
+import type { Request, Response, RequestHandler } from "express";
 import * as cookie from "cookie";
 import { pool } from "../db";
 import { findSessionBySid, touchSession } from "../services/sessionService";
@@ -40,16 +40,26 @@ const requireSession: RequestHandler = (req, res, next) => {
     };
 
     // Prefer cookie-parser if present; fall back to manual parse
-    const parsed =
-      (r as any).cookies ?? (r.headers?.cookie ? cookie.parse(r.headers.cookie) : {});
+    const parsed = (r as any).cookies ?? (r.headers?.cookie ? cookie.parse(r.headers.cookie) : {});
 
+    // Respect an env-configured session cookie name, fallback to sensible default
+    const cookieName = process.env.SESSION_COOKIE_NAME || process.env.COOKIE_NAME_SID || "erp_session";
+
+    // Accept configured cookie name first, then legacy names
     const sid =
-      parsed?.sid || parsed?.ssr_sid || parsed?.SESSION_ID || parsed?.session_id || null;
+      parsed?.[cookieName] ||
+      parsed?.sid ||
+      parsed?.ssr_sid ||
+      parsed?.SESSION_ID ||
+      parsed?.session_id ||
+      null;
 
     if (!sid) {
       // Helpful debug log for missing cookie (useful for mobile / CORS issues)
       console.warn(
-        "[requireSession] missing sid cookie. parsed cookies:",
+        "[requireSession] missing session cookie. checked cookieName:",
+        cookieName,
+        "parsed cookies:",
         parsed,
         "origin:",
         req.headers.origin
