@@ -4,10 +4,7 @@ import bcrypt from "bcryptjs";
 import { pool } from "../../../db";
 import { createSession } from "../../../lib/session";
 import { COOKIE_NAME, SESSION_TTL_SECONDS } from "../../../lib/session";
-
-// 🔥 RATE LIMITER DISABLED
-// import rateLimitSignup from "../../../middleware/rateLimitSignup";
-
+import rateLimitSignup from "../../../middleware/rateLimitSignup";
 import domainTenantPolicy from "../../../lib/domainTenantPolicy";
 import { createVerificationToken, sendVerificationEmail } from "../../../lib/emailVerification";
 
@@ -15,17 +12,26 @@ const router = Router();
 
 console.info("[signup.ts] module loaded");
 
-/* ------------------------------- */
+/* -------------------------------
+   DEBUG: query wrapper to expose full pg error props
+   ------------------------------- */
 async function q(client: any, text: string, params: any[] = []) {
   try {
     return await client.query(text, params);
   } catch (err: any) {
-    console.error("[pg][query_error]", text, params, JSON.stringify(err, Object.getOwnPropertyNames(err)));
+    try {
+      // Force include non-enumerable pg props for actionable logs
+      console.error("[pg][query_error]", text, params, JSON.stringify(err, Object.getOwnPropertyNames(err)));
+    } catch (e) {
+      console.error("[pg][query_error] fallback", text, params, err);
+    }
     throw err;
   }
 }
 
-/* ---------------- Password Policy ---------------- */
+/* ---------------------------------------------------------
+   PASSWORD POLICY
+--------------------------------------------------------- */
 const PASSWORD_POLICY = {
   minLength: 12,
   requireUpper: true,
@@ -36,17 +42,23 @@ const PASSWORD_POLICY = {
 };
 
 function checkPassword(pw: any): string[] {
-  const r: string[] = [];
-  if (!pw) return ["Password is required."];
-  if (pw.length < PASSWORD_POLICY.minLength) r.push(`Password must be at least ${PASSWORD_POLICY.minLength} characters.`);
-  if (!/[A-Z]/.test(pw)) r.push("At least one uppercase required.");
-  if (!/[a-z]/.test(pw)) r.push("At least one lowercase required.");
-  if (!/[0-9]/.test(pw)) r.push("At least one number required.");
-  if (!PASSWORD_POLICY.regexSymbol.test(pw)) r.push("At least one special symbol required.");
-  return r;
+  const reasons: string[] = [];
+  if (typeof pw !== "string" || !pw) {
+    reasons.push("Password is required.");
+    return reasons;
+  }
+  if (pw.length < PASSWORD_POLICY.minLength)
+    reasons.push(`Password must be at least ${PASSWORD_POLICY.minLength} characters.`);
+  if (PASSWORD_POLICY.requireUpper && !/[A-Z]/.test(pw)) reasons.push("At least one uppercase letter required.");
+  if (PASSWORD_POLICY.requireLower && !/[a-z]/.test(pw)) reasons.push("At least one lowercase letter required.");
+  if (PASSWORD_POLICY.requireDigit && !/[0-9]/.test(pw)) reasons.push("At least one number required.");
+  if (PASSWORD_POLICY.requireSymbol && !PASSWORD_POLICY.regexSymbol.test(pw)) reasons.push("At least one special symbol required.");
+  return reasons;
 }
 
-/* ---------------- Slugify ---------------- */
+/* ---------------------------------------------------------
+   CLEAN SLUGIFY
+--------------------------------------------------------- */
 function slugifyBase(s: string) {
   return String(s || "")
     .toLowerCase()
@@ -56,60 +68,116 @@ function slugifyBase(s: string) {
     .slice(0, 60);
 }
 
-/* ---------------- Unique Slug Insert ---------------- */
+/* ---------------------------------------------------------
+   TRY INSERT TENANT WITH UNIQUE SLUG (uses q)
+--------------------------------------------------------- */
 async function tryInsertTenantWithUniqueSlug(client: any, baseSlug: string, name: string) {
   for (let i = 0; i < 7; i++) {
     const candidate = i === 0 ? baseSlug : `${baseSlug}-${i + 1}`;
     try {
-      const r = await q(client, `INSERT INTO tenant (slug, name) VALUES ($1, $2) RETURNING id`, [candidate, name]);
+      const r = await q(client,
+        `INSERT INTO tenant (slug, name) VALUES ($1, $2) RETURNING id`,
+        [candidate, name]
+      );
       return { id: r.rows[0].id, slug: candidate };
     } catch (err: any) {
-      if (err.code === "23505") continue;
+      if (err && err.code === "23505") continue; // slug conflict
       throw err;
     }
   }
   throw new Error("Unable to create unique tenant slug");
 }
 
-/* ---------------- Country Resolve ---------------- */
-const isUuid = (s: any) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+/* ---------------------------------------------------------
+   HELPER: Country lookup (your actual table = countries)
+--------------------------------------------------------- */
+const isUuid = (s: any) =>
+  typeof s === "string" &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 
 async function resolveCountryUUID(client: any, countryId: string): Promise<string> {
-  if (isUuid(countryId)) return countryId;
+  if (!countryId) throw new Error("empty_countryId");
+
+  if (isUuid(countryId)) {
+    // If it's already a UUID, verify it exists in countries table
+    const r = await q(client, `SELECT id FROM countries WHERE id = $1 LIMIT 1`, [countryId]);
+    if (r.rowCount > 0) return countryId;
+    throw new Error(`invalid_country_uuid:${countryId}`);
+  }
 
   const qVal = String(countryId).trim().toUpperCase();
-  const r = await q(
-    client,
-    `SELECT id FROM countries WHERE UPPER(TRIM(iso2))=$1 OR UPPER(TRIM(iso3))=$1 OR UPPER(TRIM(name))=$1 LIMIT 1`,
+
+  const r = await q(client,
+    `
+    SELECT id FROM countries
+    WHERE UPPER(TRIM(iso2)) = $1
+       OR UPPER(TRIM(iso3)) = $1
+       OR UPPER(TRIM(name)) = $1
+    LIMIT 1
+  `,
     [qVal]
   );
+
   if (r.rowCount > 0) return r.rows[0].id;
 
   throw new Error(`Invalid countryId: ${countryId}`);
 }
 
-/* ---------------- Currency Resolve ---------------- */
+/* ---------------------------------------------------------
+   Resolve default currency for a country:
+   - prefer explicit mapping in country_default_currency -> currencies
+   - fallback to USD/EUR if present
+   - final fallback to any active currency
+   NOTE: we DO NOT create new currency rows here.
+--------------------------------------------------------- */
 async function resolveCurrencyForCountry(client: any, countryId: string): Promise<string | null> {
-  const mapped = await q(
-    client,
-    `SELECT cur.id
-     FROM country_default_currency cdc
-     JOIN currencies cur ON cur.id = cdc.currency_id
-     WHERE cdc.country_id = $1 AND cdc.is_active=true AND cur.is_active=true
-     ORDER BY cdc.created_at DESC LIMIT 1`,
-    [countryId]
-  );
-  if (mapped.rowCount > 0) return mapped.rows[0].id;
+  // 1) try explicit mapping
+  try {
+    const mapped = await q(client,
+      `SELECT cur.id, cur.code
+       FROM country_default_currency cdc
+       JOIN currencies cur ON cur.id = cdc.currency_id
+       WHERE cdc.country_id = $1 AND cdc.is_active = true AND cur.is_active = true
+       ORDER BY cdc.created_at DESC
+       LIMIT 1
+      `,
+      [countryId]
+    );
+    if (mapped.rowCount > 0) {
+      console.debug("[signup] resolved currency from country_default_currency:", mapped.rows[0].code);
+      return mapped.rows[0].id;
+    }
+  } catch (err) {
+    console.error("[signup] error while checking country_default_currency:", err);
+    // continue to fallbacks
+  }
 
-  const prefer = await q(
-    client,
-    `SELECT id FROM currencies WHERE is_active=true AND code IN ('USD','EUR') 
-     ORDER BY CASE WHEN code='USD' THEN 0 WHEN code='EUR' THEN 1 END LIMIT 1`
-  );
-  if (prefer.rowCount > 0) return prefer.rows[0].id;
+  // 2) prefer USD or EUR if present
+  try {
+    const prefer = await q(client,
+      `SELECT id, code FROM currencies WHERE is_active = true AND code IN ('USD','EUR') ORDER BY CASE WHEN code='USD' THEN 0 WHEN code='EUR' THEN 1 ELSE 2 END LIMIT 1`
+    );
+    if (prefer.rowCount > 0) {
+      console.debug("[signup] falling back to preferred currency:", prefer.rows[0].code);
+      return prefer.rows[0].id;
+    }
+  } catch (err) {
+    console.error("[signup] error while checking preferred currencies:", err);
+  }
 
-  const any = await q(client, `SELECT id FROM currencies WHERE is_active=true LIMIT 1`);
-  return any.rowCount > 0 ? any.rows[0].id : null;
+  // 3) last resort: return any active currency
+  try {
+    const anyCur = await q(client, `SELECT id, code FROM currencies WHERE is_active = true LIMIT 1`);
+    if (anyCur.rowCount > 0) {
+      console.debug("[signup] falling back to any active currency:", anyCur.rows[0].code);
+      return anyCur.rows[0].id;
+    }
+  } catch (err) {
+    console.error("[signup] error while fetching any active currency:", err);
+  }
+
+  // nothing available — let caller decide
+  return null;
 }
 
 /* ============================================================
@@ -118,115 +186,225 @@ async function resolveCurrencyForCountry(client: any, countryId: string): Promis
 export async function signupHandler(req: Request, res: Response) {
   console.info("[signup] invoked");
 
-  let client: any;
+  // DEV: dump headers/body so you can see what frontend sent (temporary)
+  try {
+    console.debug("[signup] headers:", {
+      "content-type": (req.headers["content-type"] || "").toString(),
+      "x-forwarded-for": req.headers["x-forwarded-for"] || null,
+      host: req.headers.host || null,
+    });
+    console.debug("[signup] req.body (raw):", JSON.stringify((req as any).body || null));
+  } catch (_) {}
+
+  let client: any | null = null;
 
   try {
-    // 🔥 RATE LIMITER DISABLED — ALWAYS ALLOW
-    // const rl = await rateLimitSignup(req);
+    /* ---------------------------------------------------------
+       1) RATE LIMIT
+    --------------------------------------------------------- */
+    const rl = await rateLimitSignup(req);
+    if (rl && (rl as any).ok === false) {
+      // cast to any to avoid TS complaining about missing retryAfter on typed object
+      return res.status(429).json({ error: "too_many_attempts", retryAfter: (rl as any).retryAfter ?? 60 });
+    }
 
-    /* ---------------- Parse Input ---------------- */
-    const { name, email, password, company, countryId, industry } = req.body || {};
+    /* ---------------------------------------------------------
+       2) PARSE INPUT
+    --------------------------------------------------------- */
+    const { name, email, password, company, countryId, industry } =
+      (req as any).body || {};
 
-    if (!name || !email || !password || !company || !countryId)
-      return res.status(400).json({ error: "missing_fields" });
+    // Detailed missing-fields for dev clarity
+    if (!name || !email || !password || !company || !countryId) {
+      const missing: string[] = [];
+      if (!name) missing.push("name");
+      if (!email) missing.push("email");
+      if (!password) missing.push("password");
+      if (!company) missing.push("company");
+      if (!countryId) missing.push("countryId");
+      return res.status(400).json({ error: "missing_fields", missing });
+    }
 
-    const emailLC = String(email).trim().toLowerCase();
-    if (!/^\S+@\S+\.\S+$/.test(emailLC))
+    const emailLC = String(email).toLowerCase().trim();
+    if (!/^\S+@\S+\.\S+$/.test(emailLC)) {
       return res.status(400).json({ error: "invalid_email" });
+    }
 
-    const pwErr = checkPassword(password);
-    if (pwErr.length) return res.status(400).json({ error: "weak_password", reasons: pwErr });
+    /* ---------------------------------------------------------
+       3) PASSWORD CHECK
+    --------------------------------------------------------- */
+    const pwErrors = checkPassword(password);
+    if (pwErrors.length) {
+      return res.status(400).json({ error: "weak_password", reasons: pwErrors });
+    }
 
-    const dp = await domainTenantPolicy(emailLC).catch(() => null);
-    if (dp && !dp.ok) return res.status(dp.status ?? 403).json({ error: dp.error });
+    /* ---------------------------------------------------------
+       4) DOMAIN POLICY
+    --------------------------------------------------------- */
+    const dPolicy = await domainTenantPolicy(emailLC).catch(() => null);
+    if (dPolicy && !dPolicy.ok) {
+      return res.status(dPolicy.status ?? 403).json({ error: dPolicy.error });
+    }
 
+    /* ---------------------------------------------------------
+       5) DB CONNECTION
+    --------------------------------------------------------- */
     client = await pool.connect();
 
-    /* ---------------- Check Email Exists ---------------- */
-    const ex = await q(client, `SELECT id FROM app_user WHERE LOWER(email)=LOWER($1) LIMIT 1`, [emailLC]);
-    if (ex.rowCount > 0) return res.status(409).json({ error: "email_exists" });
+    /* ---------------------------------------------------------
+       6) PRECHECK: EMAIL EXISTS
+    --------------------------------------------------------- */
+    const existing = await q(client, `SELECT id FROM app_user WHERE LOWER(email)=LOWER($1) LIMIT 1`, [emailLC]);
+    if (existing.rowCount > 0) {
+      return res.status(409).json({ error: "email_exists" });
+    }
 
+    /* ---------------------------------------------------------
+       7) HASH PASSWORD
+    --------------------------------------------------------- */
     const hash = await bcrypt.hash(password, 12);
 
+    /* ---------------------------------------------------------
+       8) MAIN TRANSACTION
+    --------------------------------------------------------- */
     let tenantId: string;
     let companyId: string;
     let userId: string;
 
-    /* ---------------- Transaction ---------------- */
     try {
       await q(client, "BEGIN");
 
+      /* ------------------- Tenant ----------------------- */
       const baseSlug = slugifyBase(company) || `org-${Math.random().toString(36).slice(2)}`;
-      const t = await tryInsertTenantWithUniqueSlug(client, baseSlug, company);
-      tenantId = t.id;
+      const tenantRow = await tryInsertTenantWithUniqueSlug(client, baseSlug, company);
+      tenantId = tenantRow.id;
 
-      const resolvedCountryId = await resolveCountryUUID(client, countryId);
+      /* ------------------- Country ID Fix --------------- */
+      console.debug("[signup] resolveCountryUUID input countryId:", countryId);
+      let resolvedCountryId: string;
+      try {
+        resolvedCountryId = await resolveCountryUUID(client, countryId);
+      } catch (err: any) {
+        // give clear error if user supplied a UUID that doesn't exist OR other invalid input
+        console.error("[signup] country resolution failed:", err?.message || err);
+        await q(client, "ROLLBACK").catch(() => {});
+        return res.status(400).json({ error: "invalid_country", message: String(err?.message || err) });
+      }
 
-      const c = await q(
-        client,
-        `INSERT INTO company (tenant_id, name, country_id)
-         VALUES ($1,$2,$3) RETURNING id`,
+      /* ------------------- Company ---------------------- */
+      const c = await q(client,
+        `
+        INSERT INTO company (tenant_id, name, country_id)
+        VALUES ($1, $2, $3)
+        RETURNING id
+      `,
         [tenantId, company, resolvedCountryId]
       );
       companyId = c.rows[0].id;
 
-      if (industry)
-        await q(client, `UPDATE company SET industry=$1 WHERE id=$2`, [industry, companyId]);
-
-      const currencyId = await resolveCurrencyForCountry(client, resolvedCountryId);
-      if (!currencyId) {
-        await q(client, "ROLLBACK").catch(() => {});
-        return res.status(500).json({
-          error: "no_currency_available",
-          message: "Seed currencies and country_default_currency first.",
-        });
+      // Update industry (optional)
+      if (industry) {
+        await q(client, `UPDATE company SET industry = $1 WHERE id = $2`, [industry, companyId]);
       }
 
-      await q(
-        client,
-        `INSERT INTO company_settings (
-            id, tenant_id, company_id, currency_id,
-            default_tax_type_id, default_tax_rate_id,
-            rounding_precision, numbering_prefix, numbering_next,
-            address_country_id, auto_load_taxes_from_country,
-            created_at, updated_at
-        ) VALUES (
-            gen_random_uuid(), $1, $2, $3,
-            NULL, NULL,
-            2, 'INV', 1,
-            $4, true,
-            now(), now()
-        ) ON CONFLICT (company_id) DO NOTHING`,
+      /* ------------------- company_settings (ensure present) ------------------- */
+      // company_settings.currency_id may be NOT NULL — resolve via mapping table (no creation)
+      let currencyId: string | null = null;
+      try {
+        currencyId = await resolveCurrencyForCountry(client, resolvedCountryId);
+      } catch (err) {
+        console.error("[signup] currency resolution error:", err);
+      }
+
+      if (!currencyId) {
+        // No currency mapping and no active currencies found — abort gracefully with clear message.
+        await q(client, "ROLLBACK").catch(() => {});
+        return res.status(500).json({ error: "no_currency_available", message: "No active currencies found. Seed the currencies and country_default_currency tables." });
+      }
+
+      await q(client,
+        `
+        INSERT INTO company_settings (
+          id, tenant_id, company_id,
+          currency_id,
+          default_tax_type_id,
+          default_tax_rate_id,
+          rounding_precision,
+          numbering_prefix,
+          numbering_next,
+          address_country_id,
+          auto_load_taxes_from_country,
+          created_at, updated_at,
+          hms_sub_industry,
+          hms_departments,
+          hms_billing_mode
+        )
+        VALUES (
+          gen_random_uuid(),
+          $1, $2,
+          $3,
+          NULL,
+          NULL,
+          2,
+          'INV',
+          1,
+          $4,
+          true,
+          now(), now(),
+          NULL,
+          NULL,
+          NULL
+        )
+        ON CONFLICT (company_id) DO NOTHING
+        `,
         [tenantId, companyId, currencyId, resolvedCountryId]
       );
 
-      const u = await q(
-        client,
-        `INSERT INTO app_user
-         (tenant_id, company_id, email, name, password, is_tenant_admin, is_active)
-         VALUES ($1,$2,$3,$4,$5,true,true)
-         RETURNING id`,
-        [tenantId, companyId, emailLC, name, hash]
-      );
-      userId = u.rows[0].id;
+      /* ------------------- User ------------------------- */
+      try {
+        const u = await q(client,
+          `
+          INSERT INTO app_user
+              (tenant_id, company_id, email, name, password, is_tenant_admin, is_active)
+          VALUES ($1, $2, $3, $4, $5, true, true)
+          RETURNING id
+        `,
+          [tenantId, companyId, emailLC, name, hash]
+        );
+        userId = u.rows[0].id;
+      } catch (err: any) {
+        if (err && err.code === "23505") {
+          await q(client, "ROLLBACK").catch(() => {});
+          return res.status(409).json({ error: "email_exists" });
+        }
+        throw err;
+      }
 
-      await q(
-        client,
-        `INSERT INTO user_companies
-         (tenant_id, user_id, company_id, is_default, created_at)
-         VALUES ($1,$2,$3,true,now())
-         ON CONFLICT (tenant_id, user_id, company_id) DO NOTHING`,
+      /* ------------------- USER ↔ COMPANY mapping ------- */
+      await q(client,
+        `
+        INSERT INTO user_companies (tenant_id, user_id, company_id, is_default, created_at)
+        VALUES ($1, $2, $3, true, now())
+        ON CONFLICT (tenant_id, user_id, company_id) DO NOTHING
+      `,
         [tenantId, userId, companyId]
       );
 
       await q(client, "COMMIT");
     } catch (err) {
+      // Ensure transaction is rolled back and we log the full error shape.
       await q(client, "ROLLBACK").catch(() => {});
-      console.error("Signup TX error:", err);
+      try {
+        console.error("Signup TX error (full):", JSON.stringify(err, Object.getOwnPropertyNames(err)));
+      } catch (e) {
+        console.error("Signup TX error (fallback):", err);
+      }
       return res.status(500).json({ error: "signup_failed" });
     }
 
-    /* ---------------- Email verification (background) ---------------- */
+    /* ---------------------------------------------------------
+       9) EMAIL VERIFICATION (async)
+    --------------------------------------------------------- */
     (async () => {
       try {
         const token = await createVerificationToken(userId, emailLC);
@@ -234,16 +412,19 @@ export async function signupHandler(req: Request, res: Response) {
       } catch (_) {}
     })();
 
-    /* ---------------- Session Cookie ---------------- */
+    /* ---------------------------------------------------------
+       10) CREATE SESSION COOKIE
+    --------------------------------------------------------- */
     try {
       const sid = await createSession({ userId, tenantId, companyId });
+
       const cookieName = process.env.SESSION_COOKIE_NAME || COOKIE_NAME;
-      const prod = process.env.NODE_ENV === "production";
+      const isProd = process.env.NODE_ENV === "production";
 
       res.cookie(cookieName, sid, {
         httpOnly: true,
-        secure: prod,
-        sameSite: prod ? "none" : "lax",
+        secure: isProd,
+        sameSite: isProd ? "none" : "lax",
         maxAge: SESSION_TTL_SECONDS * 1000,
         path: "/",
       });
@@ -251,6 +432,9 @@ export async function signupHandler(req: Request, res: Response) {
       console.error("session cookie error:", err);
     }
 
+    /* ---------------------------------------------------------
+       11) RETURN SUCCESS → redirect to onboarding
+    --------------------------------------------------------- */
     return res.status(201).json({
       ok: true,
       tenantId,
@@ -266,5 +450,24 @@ export async function signupHandler(req: Request, res: Response) {
   }
 }
 
+/* ---------------------------------------------------------
+   RAW BODY PARSER (fallback)
+--------------------------------------------------------- */
+async function parseBody(req: Request) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (c: Buffer) => (data += c.toString()));
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(data || "{}"));
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
 router.post("/", signupHandler);
+
 export default router;
