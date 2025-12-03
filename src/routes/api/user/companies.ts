@@ -5,15 +5,27 @@ import { requireAuth } from "../../../middleware/requireAuth";
 
 const router = Router();
 
+// GET /api/user/companies
 router.get("/user/companies", requireAuth, async (req: any, res) => {
   try {
+    // Debugging helpers (remove after fix)
+    // Log cookies and auth shape so we can confirm the browser sent the sid.
+    console.log("GET /api/user/companies - cookies:", req.cookies || req.headers?.cookie || "no cookies");
+    console.log("GET /api/user/companies - auth/session shapes:", {
+      authSession: req.authSession,
+      session: req.session,
+      company: req.company,
+    });
+
     // tolerate multiple middleware shapes (requireSession, requireAuth, etc.)
     const authSession = (req as any).authSession || (req as any).session || (req as any).company || null;
     const userId = authSession?.user_id || (req as any).session?.user_id;
-    if (!userId) return res.status(401).json({ error: "unauthenticated" });
+    if (!userId) {
+      // explicit 401 payload to match client expectation
+      return res.status(401).json({ error: "unauthenticated" });
+    }
 
     const tenantId = authSession?.tenant_id || (req as any).session?.tenant_id;
-    // prefer active_company_id from resolved company/session shape
     const userCompanyId =
       authSession?.company_id ||
       (req as any).session?.active_company_id ||
@@ -43,14 +55,17 @@ router.get("/user/companies", requireAuth, async (req: any, res) => {
       rows = r.rows ?? [];
     }
 
-    return res.json({ companies: rows });
+    // Return companies + active company id for client default selection
+    return res.json({
+      companies: rows,
+      active_company_id: userCompanyId ?? null,
+    });
   } catch (err: any) {
     console.error("GET /api/user/companies error:", err);
-    // temporary: include stack in non-production for triage
     return res.status(500).json({
       error: "server_error",
       message: String(err?.message || err),
-      stack: process.env.NODE_ENV === "production" ? undefined : String(err?.stack || "")
+      stack: process.env.NODE_ENV === "production" ? undefined : String(err?.stack || ""),
     });
   }
 });
