@@ -36,6 +36,24 @@ export type ResolvedInvoiceLine = {
   taxes: ResolvedTaxLine[];
 };
 
+/** Explicit shapes so TypeScript stops treating rows as `unknown` */
+type TaxTypeRow = {
+  id: string;
+  name?: string | null;
+  description?: string | null;
+  metadata?: any;
+};
+
+type TaxRateRow = {
+  id: string;
+  name?: string | null;
+  percentage?: number | null;
+  fixed_amount?: number | null;
+  country_id?: string | null;
+  state_id?: string | null;
+  metadata?: any;
+};
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   // you can add ssl or other options here if needed
@@ -90,25 +108,46 @@ export async function resolveTaxesForInvoice({
     const taxMaps = taxMapsRes.rows;
 
     // collect ids for prefetch
-    const taxRateIds = Array.from(new Set(taxMaps.map((r: any) => r.tax_rate_id).filter(Boolean)));
-    const taxTypeIds = Array.from(new Set(taxMaps.map((r: any) => r.tax_type_id).filter(Boolean)));
+    const taxRateIds = Array.from(
+      new Set(taxMaps.map((r: any) => r.tax_rate_id).filter(Boolean))
+    );
+    const taxTypeIds = Array.from(
+      new Set(taxMaps.map((r: any) => r.tax_type_id).filter(Boolean))
+    );
 
     // load tax_types
     const taxTypesRes =
       taxTypeIds.length > 0
-        ? await client.query(`SELECT id, name, description, metadata FROM public.tax_types WHERE id = ANY($1::uuid[])`, [taxTypeIds])
+        ? await client.query(
+            `SELECT id, name, description, metadata FROM public.tax_types WHERE id = ANY($1::uuid[])`,
+            [taxTypeIds]
+          )
         : { rows: [] as any[] };
-    const taxTypesById = new Map(taxTypesRes.rows.map((r: any) => [r.id, r]));
+
+    const taxTypesById = new Map<string, TaxTypeRow>(
+      taxTypesRes.rows.map((r: any) => [r.id as string, r as TaxTypeRow])
+    );
 
     // load tax_rates
     const taxRatesRes =
       taxRateIds.length > 0
-        ? await client.query(`SELECT id, name, percentage, fixed_amount, country_id, state_id, metadata FROM public.tax_rates WHERE id = ANY($1::uuid[])`, [taxRateIds])
+        ? await client.query(
+            `SELECT id, name, percentage, fixed_amount, country_id, state_id, metadata
+             FROM public.tax_rates
+             WHERE id = ANY($1::uuid[])`,
+            [taxRateIds]
+          )
         : { rows: [] as any[] };
-    const taxRatesById = new Map(taxRatesRes.rows.map((r: any) => [r.id, r]));
+
+    const taxRatesById = new Map<string, TaxRateRow>(
+      taxRatesRes.rows.map((r: any) => [r.id as string, r as TaxRateRow])
+    );
 
     // fetch company rounding precision (fallback to 2)
-    const cs = await client.query(`SELECT rounding_precision FROM public.company_settings WHERE company_id = $1 LIMIT 1`, [companyId]);
+    const cs = await client.query(
+      `SELECT rounding_precision FROM public.company_settings WHERE company_id = $1 LIMIT 1`,
+      [companyId]
+    );
     const rounding_precision: number = cs.rows[0]?.rounding_precision ?? 2;
 
     const results: ResolvedInvoiceLine[] = [];
@@ -120,7 +159,12 @@ export async function resolveTaxesForInvoice({
 
       // candidates: filter taxMaps by country (if map has country and billingCountryId provided)
       const candidates = taxMaps.filter((m: any) => {
-        if (m.country_id && billingCountryId && String(m.country_id) !== String(billingCountryId)) return false;
+        if (
+          m.country_id &&
+          billingCountryId &&
+          String(m.country_id) !== String(billingCountryId)
+        )
+          return false;
         return m.is_active;
       });
 
@@ -128,10 +172,13 @@ export async function resolveTaxesForInvoice({
       const nonCompound: any[] = [];
       const compound: any[] = [];
       for (const c of candidates) {
-        const tr = taxRatesById.get(c.tax_rate_id);
-        const tt = taxTypesById.get(c.tax_type_id);
-        const isCompound = Boolean(tt?.metadata?.is_compound || tr?.metadata?.is_compound || false);
-        if (isCompound) compound.push(c); else nonCompound.push(c);
+        const tr = taxRatesById.get(c.tax_rate_id as string);
+        const tt = taxTypesById.get(c.tax_type_id as string);
+        const isCompound = Boolean(
+          tt?.metadata?.is_compound || tr?.metadata?.is_compound || false
+        );
+        if (isCompound) compound.push(c);
+        else nonCompound.push(c);
       }
 
       const ordered = [...nonCompound, ...compound];
@@ -140,8 +187,9 @@ export async function resolveTaxesForInvoice({
       const appliedTaxes: ResolvedTaxLine[] = [];
 
       for (const m of ordered) {
-        const tr = taxRatesById.get(m.tax_rate_id);
-        const tt = taxTypesById.get(m.tax_type_id);
+        const tr = taxRatesById.get(m.tax_rate_id as string);
+        const tt = taxTypesById.get(m.tax_type_id as string);
+
         if (!tr || !tt) {
           // skip silently but log note in notes field
           appliedTaxes.push({
@@ -174,7 +222,9 @@ export async function resolveTaxesForInvoice({
           is_percentage = true;
         }
 
-        const isCompound = Boolean(tt?.metadata?.is_compound || tr?.metadata?.is_compound || false);
+        const isCompound = Boolean(
+          tt?.metadata?.is_compound || tr?.metadata?.is_compound || false
+        );
         const baseForThis = isCompound ? subTotalForCompoundCalc : base;
 
         let taxAmount = 0;
@@ -187,9 +237,9 @@ export async function resolveTaxesForInvoice({
         const rounded = Number(taxAmount.toFixed(rounding_precision));
         appliedTaxes.push({
           tax_type_id: m.tax_type_id,
-          tax_type_name: tt?.name,
+          tax_type_name: tt.name || undefined,
           tax_rate_id: m.tax_rate_id,
-          tax_rate_name: tr?.name,
+          tax_rate_name: tr.name || undefined,
           rate,
           is_percentage,
           is_compound: isCompound,
@@ -202,7 +252,10 @@ export async function resolveTaxesForInvoice({
         subTotalForCompoundCalc = +(subTotalForCompoundCalc + rounded);
       }
 
-      const totalTax = appliedTaxes.reduce((s, t) => s + (t.tax_amount || 0), 0);
+      const totalTax = appliedTaxes.reduce(
+        (s, t) => s + (t.tax_amount || 0),
+        0
+      );
       const totalAmount = +(base + totalTax);
 
       results.push({
