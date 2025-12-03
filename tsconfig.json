@@ -19,8 +19,8 @@
       "./node_modules/@types"
     ],
 
-    /* Jest + Node globals available everywhere (local only) */
-    "types": ["node", "jest"],
+    /* Removed JEST — production build must NOT load testing types */
+    "types": ["node"],
 
     /* ------------ Output ------------ */
     "outDir": "dist"
