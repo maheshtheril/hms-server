@@ -2,7 +2,7 @@
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import { pool } from "../../../db";
-import { createSession, COOKIE_NAME, SESSION_TTL_SECONDS, buildSessionCookie } from "../../../lib/session";
+import { createSession, buildSessionCookie } from "../../../lib/session";
 import rateLimitSignup from "../../../middleware/rateLimitSignup";
 import domainTenantPolicy from "../../../lib/domainTenantPolicy";
 import { createVerificationToken, sendVerificationEmail } from "../../../lib/emailVerification";
