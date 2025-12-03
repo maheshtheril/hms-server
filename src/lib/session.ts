@@ -9,6 +9,42 @@ export const SESSION_TTL_SECONDS = 14 * 24 * 60 * 60; // 14 days
 export const COOKIE_NAME = process.env.SESSION_COOKIE_NAME || "sid";
 
 /**
+ * Resolve cookie domain:
+ * - Prefer SESSION_COOKIE_DOMAIN env if set
+ * - Otherwise, if running on Render and hostname ends with .onrender.com,
+ *   default to ".onrender.com" so cookies work across hms-server-njlg & hmsweb.
+ * - Otherwise no Domain attribute (host-only).
+ */
+function resolveCookieDomain(): string {
+  const fromEnv = (process.env.SESSION_COOKIE_DOMAIN || "").trim();
+  if (fromEnv) return fromEnv;
+
+  const hostEnv =
+    process.env.RENDER_EXTERNAL_HOSTNAME ||
+    process.env.BACKEND_URL ||
+    "";
+
+  if (!hostEnv) return "";
+
+  try {
+    const url =
+      hostEnv.includes("://") ? new URL(hostEnv) : new URL(`https://${hostEnv}`);
+    const hostname = url.hostname;
+
+    if (hostname.endsWith(".onrender.com")) {
+      // ✅ share cookie across all *.onrender.com services
+      return ".onrender.com";
+    }
+
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+const COOKIE_DOMAIN = resolveCookieDomain();
+
+/**
  * ISSUE a new session to DB (SID).
  * Uses `absolute_expiry` DB column (existing schema).
  *
@@ -31,17 +67,19 @@ export async function issueSession(
 }
 
 /**
- * createSession wrapper used in routes.
+ * Typed input for createSession
  */
-export async function createSession({
-  userId,
-  tenantId,
-  companyId,
-}: {
+export type CreateSessionInput = {
   userId: string;
   tenantId?: string | null;
   companyId?: string | null;
-}): Promise<string> {
+};
+
+/**
+ * createSession wrapper used in routes.
+ */
+export async function createSession(input: CreateSessionInput): Promise<string> {
+  const { userId, tenantId, companyId } = input;
   return issueSession(userId, tenantId ?? null, companyId ?? null);
 }
 
@@ -53,6 +91,7 @@ export async function createSession({
  *   - SameSite=None (in production)
  *   - Secure (in production)
  *   - HttpOnly
+ *   - Domain resolves to ".onrender.com" on Render by default
  */
 export function buildSessionCookie(sid: string): string {
   const maxAge = SESSION_TTL_SECONDS;
@@ -64,12 +103,10 @@ export function buildSessionCookie(sid: string): string {
   const securePart = isProd ? "; Secure" : "";
   const sameSitePart = isProd ? "; SameSite=None" : "; SameSite=Lax";
 
-  const cookieDomain = process.env.SESSION_COOKIE_DOMAIN
-    ? `; Domain=${process.env.SESSION_COOKIE_DOMAIN}`
-    : "";
+  const domainPart = COOKIE_DOMAIN ? `; Domain=${COOKIE_DOMAIN}` : "";
 
   // 👉 Name is COOKIE_NAME = "sid" (unless overridden by env)
-  return `${COOKIE_NAME}=${sid}; Path=/; HttpOnly; Max-Age=${maxAge}; Expires=${expires}${securePart}${sameSitePart}${cookieDomain}`;
+  return `${COOKIE_NAME}=${sid}; Path=/; HttpOnly; Max-Age=${maxAge}; Expires=${expires}${securePart}${sameSitePart}${domainPart}`;
 }
 
 /**
