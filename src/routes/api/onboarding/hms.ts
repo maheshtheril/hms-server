@@ -50,9 +50,13 @@ router.post("/", async (req: Request, res: Response) => {
           .filter((d) => d.length > 0)
       : [];
 
-    // sanitize billing mode
+    if (!depsArray.length) {
+      return res.status(400).json({ error: "invalid_departments" });
+    }
+
+    // sanitize billing mode (default to "cash")
     const allowedModes = ["cash", "insurance", "mixed"] as const;
-    const mode = allowedModes.includes(billingMode as any) ? billingMode : null;
+    const mode = allowedModes.includes(billingMode as any) ? billingMode : "cash";
 
     const tenantId = session.tenant_id;
     const companyId = session.company_id;
@@ -61,15 +65,15 @@ router.post("/", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "no_company_in_session" });
     }
 
-    // Update HMS-specific fields on company_settings
+    // ✅ FIX: cast text[] → jsonb properly using to_jsonb($1::text[])
     await pool.query(
       `
       UPDATE company_settings
       SET
         hms_sub_industry = 'hospital',
-        hms_departments = $1,
-        hms_billing_mode = $2,
-        updated_at = now()
+        hms_departments   = to_jsonb($1::text[]),
+        hms_billing_mode  = $2,
+        updated_at        = now()
       WHERE company_id = $3
     `,
       [depsArray, mode, companyId]
@@ -91,6 +95,7 @@ router.post("/", async (req: Request, res: Response) => {
 
 /* ---------------------------------------------------------
    STEP 1 — START ONBOARDING
+   (legacy multi-step; can be kept or deleted if unused)
 --------------------------------------------------------- */
 router.post("/start", async (req: Request, res: Response) => {
   try {
