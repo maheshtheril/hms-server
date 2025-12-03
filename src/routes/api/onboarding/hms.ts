@@ -27,6 +27,69 @@ async function resolveSession(req: any) {
 }
 
 /* ---------------------------------------------------------
+   NEW: SINGLE-ENDPOINT HMS ONBOARDING
+   Matches frontend: POST /api/onboarding/hms
+   Body: { departments: string[], billingMode: "cash"|"insurance"|"mixed" }
+--------------------------------------------------------- */
+router.post("/", async (req: Request, res: Response) => {
+  try {
+    const session = await resolveSession(req);
+    if (!session) {
+      return res.status(401).json({ error: "not_authenticated" });
+    }
+
+    const { departments, billingMode } = (req.body || {}) as {
+      departments?: string[];
+      billingMode?: string;
+    };
+
+    // sanitize departments
+    const depsArray = Array.isArray(departments)
+      ? departments
+          .map((d) => String(d || "").trim())
+          .filter((d) => d.length > 0)
+      : [];
+
+    // sanitize billing mode
+    const allowedModes = ["cash", "insurance", "mixed"] as const;
+    const mode = allowedModes.includes(billingMode as any) ? billingMode : null;
+
+    const tenantId = session.tenant_id;
+    const companyId = session.company_id;
+
+    if (!companyId) {
+      return res.status(400).json({ error: "no_company_in_session" });
+    }
+
+    // Update HMS-specific fields on company_settings
+    await pool.query(
+      `
+      UPDATE company_settings
+      SET
+        hms_sub_industry = 'hospital',
+        hms_departments = $1,
+        hms_billing_mode = $2,
+        updated_at = now()
+      WHERE company_id = $3
+    `,
+      [depsArray, mode, companyId]
+    );
+
+    return res.json({
+      ok: true,
+      tenantId,
+      companyId,
+      departments: depsArray,
+      billingMode: mode,
+      redirect: "/tenant/dashboard",
+    });
+  } catch (err) {
+    console.error("[HMS onboarding /] error:", err);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+/* ---------------------------------------------------------
    STEP 1 — START ONBOARDING
 --------------------------------------------------------- */
 router.post("/start", async (req: Request, res: Response) => {
