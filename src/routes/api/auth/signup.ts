@@ -2,8 +2,7 @@
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import { pool } from "../../../db";
-import { createSession } from "../../../lib/session";
-import { COOKIE_NAME, SESSION_TTL_SECONDS } from "../../../lib/session";
+import { createSession, COOKIE_NAME, SESSION_TTL_SECONDS } from "../../../lib/session";
 import rateLimitSignup from "../../../middleware/rateLimitSignup";
 import domainTenantPolicy from "../../../lib/domainTenantPolicy";
 import { createVerificationToken, sendVerificationEmail } from "../../../lib/emailVerification";
@@ -75,7 +74,8 @@ async function tryInsertTenantWithUniqueSlug(client: any, baseSlug: string, name
   for (let i = 0; i < 7; i++) {
     const candidate = i === 0 ? baseSlug : `${baseSlug}-${i + 1}`;
     try {
-      const r = await q(client,
+      const r = await q(
+        client,
         `INSERT INTO tenant (slug, name) VALUES ($1, $2) RETURNING id`,
         [candidate, name]
       );
@@ -107,7 +107,8 @@ async function resolveCountryUUID(client: any, countryId: string): Promise<strin
 
   const qVal = String(countryId).trim().toUpperCase();
 
-  const r = await q(client,
+  const r = await q(
+    client,
     `
     SELECT id FROM countries
     WHERE UPPER(TRIM(iso2)) = $1
@@ -133,7 +134,8 @@ async function resolveCountryUUID(client: any, countryId: string): Promise<strin
 async function resolveCurrencyForCountry(client: any, countryId: string): Promise<string | null> {
   // 1) try explicit mapping
   try {
-    const mapped = await q(client,
+    const mapped = await q(
+      client,
       `SELECT cur.id, cur.code
        FROM country_default_currency cdc
        JOIN currencies cur ON cur.id = cdc.currency_id
@@ -154,7 +156,8 @@ async function resolveCurrencyForCountry(client: any, countryId: string): Promis
 
   // 2) prefer USD or EUR if present
   try {
-    const prefer = await q(client,
+    const prefer = await q(
+      client,
       `SELECT id, code FROM currencies WHERE is_active = true AND code IN ('USD','EUR') ORDER BY CASE WHEN code='USD' THEN 0 WHEN code='EUR' THEN 1 ELSE 2 END LIMIT 1`
     );
     if (prefer.rowCount > 0) {
@@ -292,7 +295,8 @@ export async function signupHandler(req: Request, res: Response) {
       }
 
       /* ------------------- Company ---------------------- */
-      const c = await q(client,
+      const c = await q(
+        client,
         `
         INSERT INTO company (tenant_id, name, country_id)
         VALUES ($1, $2, $3)
@@ -322,7 +326,8 @@ export async function signupHandler(req: Request, res: Response) {
         return res.status(500).json({ error: "no_currency_available", message: "No active currencies found. Seed the currencies and country_default_currency tables." });
       }
 
-      await q(client,
+      await q(
+        client,
         `
         INSERT INTO company_settings (
           id, tenant_id, company_id,
@@ -362,7 +367,8 @@ export async function signupHandler(req: Request, res: Response) {
 
       /* ------------------- User ------------------------- */
       try {
-        const u = await q(client,
+        const u = await q(
+          client,
           `
           INSERT INTO app_user
               (tenant_id, company_id, email, name, password, is_tenant_admin, is_active)
@@ -381,7 +387,8 @@ export async function signupHandler(req: Request, res: Response) {
       }
 
       /* ------------------- USER ↔ COMPANY mapping ------- */
-      await q(client,
+      await q(
+        client,
         `
         INSERT INTO user_companies (tenant_id, user_id, company_id, is_default, created_at)
         VALUES ($1, $2, $3, true, now())
@@ -418,7 +425,8 @@ export async function signupHandler(req: Request, res: Response) {
     try {
       const sid = await createSession({ userId, tenantId, companyId });
 
-      const cookieName = process.env.SESSION_COOKIE_NAME || COOKIE_NAME;
+      // 🔒 Use the exact same cookie name as sessionLoader/lib/session
+      const cookieName = COOKIE_NAME;
       const isProd = process.env.NODE_ENV === "production";
 
       res.cookie(cookieName, sid, {
@@ -451,7 +459,7 @@ export async function signupHandler(req: Request, res: Response) {
 }
 
 /* ---------------------------------------------------------
-   RAW BODY PARSER (fallback)
+   RAW BODY PARSER (fallback) — currently unused, but kept
 --------------------------------------------------------- */
 async function parseBody(req: Request) {
   return new Promise((resolve, reject) => {

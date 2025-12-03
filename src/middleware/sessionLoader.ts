@@ -1,29 +1,22 @@
 // server/src/middleware/sessionLoader.ts
 import { PoolClient } from "pg";
-import { pool } from "../db"; // adjust if your db exports differently
+import { pool } from "../db";
 import { parse as parseCookie } from "cookie";
 import type { Request, Response, NextFunction } from "express";
 
-/**
- * sessionLoader middleware (type-compatible)
- *
- * Notes:
- * - This file intentionally matches the existing `Express.Request.user` type
- *   used elsewhere in your codebase (so TypeScript won't complain).
- * - If your db module exports default (db.pool), change the import above:
- *     import db from "../db"; const pool = db.pool;
- */
+/* ------------------ ALWAYS USE sid ------------------ */
+const COOKIE_NAME = "sid";
 
-/* env defaults */
-const COOKIE_NAME = process.env.COOKIE_NAME_SID || process.env.SESSION_COOKIE_NAME || process.env.SESSION_COOKIE || "erp_session";
+/* ------------------ SESSION TABLE ------------------ */
 const SESSIONS_TABLE_ENV = process.env.SESSIONS_TABLE || "sessions";
-const SAFE_TABLE_NAME = /^[a-zA-Z0-9_]+$/.test(SESSIONS_TABLE_ENV) ? SESSIONS_TABLE_ENV : "sessions";
+const SAFE_TABLE_NAME = /^[a-zA-Z0-9_]+$/.test(SESSIONS_TABLE_ENV)
+  ? SESSIONS_TABLE_ENV
+  : "sessions";
 
-/* ---- Make our Request.user match the existing project shape ---- */
+/* ---- request type ---- */
 declare global {
   namespace Express {
     interface Request {
-      // Keep exact shape mentioned in your error
       user?: {
         id: string;
         email: string;
@@ -52,26 +45,25 @@ declare global {
   }
 }
 
-/* safe release helper */
 function safeRelease(client?: PoolClient | null) {
   try {
     if (client) client.release();
   } catch (_) {}
 }
 
-export async function loadSessionOptional(req: Request, res: Response, next: NextFunction) {
+export async function loadSessionOptional(
+  req: Request,
+  res: Response,
+  next: NextFunction
+) {
   let client: PoolClient | null = null;
   let releaseHookAttached = false;
 
   try {
-    if (!req || !req.headers) {
-      req.authSession = undefined;
-      return next();
-    }
-
     const cookies = parseCookie(req.headers.cookie || "");
     let sid = cookies[COOKIE_NAME] || null;
 
+    // Fallback to alternative cookie names only for compatibility
     if (!sid) {
       const alt = ["session_id", "SESSION_ID", "erp_session", "sid"];
       for (const k of alt) {
@@ -82,20 +74,14 @@ export async function loadSessionOptional(req: Request, res: Response, next: Nex
       }
     }
 
-    if (!sid && typeof req.headers.authorization === "string" && req.headers.authorization.startsWith("Bearer ")) {
-      sid = req.headers.authorization.split(" ")[1];
-    }
-
     if (!sid) {
       req.authSession = undefined;
       return next();
     }
 
-    // Acquire DB client
-    client = await (pool as any).connect();
+    client = await pool.connect();
     req.dbClient = client;
 
-    // Attach release hook
     const releaseClient = () => {
       if (releaseHookAttached) {
         safeRelease(req.dbClient);
@@ -120,32 +106,18 @@ export async function loadSessionOptional(req: Request, res: Response, next: Nex
       WHERE s.sid = $1
       LIMIT 1
     `;
+
     const { rows } = await client.query(q, [sid]);
     const row = rows?.[0];
-    if (!row) {
-      req.authSession = undefined;
-      return next();
-    }
 
-    if (row.is_active === false) {
+    if (!row || row.is_active === false) {
       req.authSession = undefined;
       return next();
     }
 
     const tenantId = row.session_tenant_id ?? row.user_tenant_id ?? null;
     const companyId = row.company_id ?? null;
-    const userId = row.user_id ?? null;
 
-    try {
-      await client.query(
-        "SELECT set_config('app.tenant_id', $1, true), set_config('app.company_id', $2, true), set_config('app.current_user_id', $3, true)",
-        [tenantId, companyId, userId]
-      );
-    } catch (err) {
-      console.warn("[sessionLoader] set_config failed:", err);
-    }
-
-    // Attach authSession (lightweight)
     req.authSession = {
       sid: row.sid,
       user_id: row.user_id,
@@ -160,7 +132,6 @@ export async function loadSessionOptional(req: Request, res: Response, next: Nex
       last_seen: row.last_seen,
     };
 
-    // IMPORTANT: set req.user with the exact expected shape (so TypeScript matches)
     req.user = {
       id: String(row.user_id),
       email: row.email,
@@ -168,34 +139,29 @@ export async function loadSessionOptional(req: Request, res: Response, next: Nex
       is_admin: !!row.is_admin,
       is_platform_admin: !!row.is_platform_admin,
       is_tenant_admin: !!row.is_tenant_admin,
-      // roles and tenant_id are optional; keep tenant_id consistent with naming used elsewhere
-      roles: undefined,
       tenant_id: tenantId ?? undefined,
+      roles: undefined,
     };
 
     return next();
   } catch (err: any) {
-    console.error("[sessionLoader] loadSessionOptional error:", err?.stack ?? err);
-    try {
-      safeRelease(client ?? req.dbClient);
-      req.dbClient = undefined;
-    } catch (_) {}
+    console.error("[sessionLoader] error:", err);
+    safeRelease(client);
     req.authSession = undefined;
     return next();
   }
 }
 
-export async function requireSession(req: Request, res: Response, next: NextFunction) {
-  try {
-    await loadSessionOptional(req, res, () => Promise.resolve());
-    if (!req.authSession || !req.authSession.user_id) {
-      return res.status(401).json({ error: "unauthenticated" });
-    }
-    return next();
-  } catch (err: any) {
-    console.error("[sessionLoader] requireSession error:", err?.stack ?? err);
-    return res.status(500).json({ error: "internal_server_error" });
+export async function requireSession(
+  req: Request,
+  res: Response,
+  next: NextFunction
+) {
+  await loadSessionOptional(req, res, () => {});
+  if (!req.authSession?.user_id) {
+    return res.status(401).json({ error: "unauthenticated" });
   }
+  return next();
 }
 
 export const sessionLoader = loadSessionOptional;
