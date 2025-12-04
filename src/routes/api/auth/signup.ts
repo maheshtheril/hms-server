@@ -1,8 +1,9 @@
 // server/src/routes/api/auth/signup.ts
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
+import crypto from "crypto";
 import { pool } from "../../../db";
-import { createSession, buildSessionCookie } from "../../../lib/session";
+import { createSession, buildSessionCookie, buildClearSessionCookie, SESSION_TTL_SECONDS } from "../../../lib/session";
 import rateLimitSignup from "../../../middleware/rateLimitSignup";
 import domainTenantPolicy from "../../../lib/domainTenantPolicy";
 import { createVerificationToken, sendVerificationEmail } from "../../../lib/emailVerification";
@@ -375,31 +376,42 @@ export async function signupHandler(req: Request, res: Response) {
       } catch (_) {}
     })();
 
-    /* 10) SESSION COOKIE — USE buildSessionCookie */
+    /* 10) SESSION COOKIE — CREATE SESSION (direct, robust) */
     try {
-      // call createSession using the canonical camelCase keys expected by lib/session.ts
-      const sid = await createSession({
-        userId,
-        tenantId,
-        companyId,
-      });
+      // create SID first (use node crypto)
+      const sid = crypto.randomUUID ? crypto.randomUUID() : require("crypto").randomUUID();
 
-      console.info("[signup] created session sid:", sid);
-
-      // read back session row to ensure tenant/company were persisted
+      // Attempt direct DB insert using pool.query so we know it's the correct helper/signature
       try {
-        const s = await pool.query(
-          "SELECT sid, tenant_id, company_id, user_id, created_at FROM sessions WHERE sid = $1",
-          [sid]
-        );
-        console.info("[signup] session row readback:", s.rows[0]);
-      } catch (e) {
-        console.error("[signup] session readback failed:", e);
+        const insertSql = `
+          INSERT INTO sessions (sid, user_id, tenant_id, company_id, created_at, last_seen, absolute_expiry)
+          VALUES ($1, $2, $3, $4, now(), now(), now() + make_interval(secs => $5))
+          RETURNING sid, tenant_id, company_id, user_id, created_at
+        `;
+        const insertRes = await pool.query(insertSql, [sid, userId, tenantId ?? null, companyId ?? null, SESSION_TTL_SECONDS]);
+        if (!insertRes || !insertRes.rows || insertRes.rowCount !== 1) {
+          console.error("[signup] session insert did not return row", insertRes);
+          return res.status(500).json({ error: "session_insert_failed" });
+        }
+        console.info("[signup] session inserted (direct):", insertRes.rows[0]);
+      } catch (dbErr) {
+        console.error("[signup] direct session insert failed:", dbErr);
+        return res.status(500).json({ error: "session_insert_failed", detail: String(dbErr?.message || dbErr) });
       }
 
-      // single source of truth (uses SESSION_COOKIE_DOMAIN, NODE_ENV, etc.)
-      const cookieHeader = buildSessionCookie(sid);
-      res.setHeader("Set-Cookie", cookieHeader);
+      // Now build cookie header and explicitly clear old cookie then set new one so browsers will overwrite
+      // First clear (helps in some old-cookie edge cases)
+      // Set both clear and set headers to be robust
+      res.setHeader("Set-Cookie", [buildClearSessionCookie(), buildSessionCookie(sid)]);
+
+      // Confirm readback (sanity)
+      try {
+        const sBack = await pool.query("SELECT sid, tenant_id, company_id, user_id, created_at FROM sessions WHERE sid = $1", [sid]);
+        console.info("[signup] session readback after insert:", sBack.rows[0]);
+      } catch (rbErr) {
+        console.error("[signup] session readback failed after insert:", rbErr);
+        return res.status(500).json({ error: "session_readback_failed", detail: String(rbErr?.message || rbErr) });
+      }
 
       // return sid so client has authoritative session if cookie doesn't land
       return res.status(201).json({
@@ -411,15 +423,8 @@ export async function signupHandler(req: Request, res: Response) {
         redirect: "/tenant/onboarding/hms",
       });
     } catch (err) {
-      console.error("session cookie error:", err);
-      // as a fallback, return success without sid (logs will show the issue)
-      return res.status(201).json({
-        ok: true,
-        tenantId,
-        companyId,
-        userId,
-        redirect: "/tenant/onboarding/hms",
-      });
+      console.error("session cookie error (unexpected):", err);
+      return res.status(500).json({ error: "session_error", detail: String(err?.message || err) });
     }
   } catch (err) {
     console.error("[signup] handler error:", err);
