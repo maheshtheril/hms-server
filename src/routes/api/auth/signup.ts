@@ -3,7 +3,7 @@ import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import { pool } from "../../../db";
-import { createSession, buildSessionCookie, buildClearSessionCookie, SESSION_TTL_SECONDS } from "../../../lib/session";
+import { buildSessionCookie, buildClearSessionCookie, SESSION_TTL_SECONDS } from "../../../lib/session";
 import rateLimitSignup from "../../../middleware/rateLimitSignup";
 import domainTenantPolicy from "../../../lib/domainTenantPolicy";
 import { createVerificationToken, sendVerificationEmail } from "../../../lib/emailVerification";
@@ -161,6 +161,27 @@ async function resolveCurrencyForCountry(client: any, countryId: string): Promis
   }
 
   return null;
+}
+
+/* ------------------ Cookie helpers (express res.cookie) ------------------ */
+// Keep name consistent with other auth routes
+const COOKIE_NAME =
+  (process.env.SESSION_COOKIE_NAME ||
+    process.env.COOKIE_NAME_SID ||
+    process.env.COOKIE_NAME ||
+    "sid").toString();
+const IS_PROD = process.env.NODE_ENV === "production";
+const COOKIE_DOMAIN = (process.env.SESSION_COOKIE_DOMAIN || process.env.COOKIE_DOMAIN || "").toString().trim() || undefined;
+
+function cookieOptions() {
+  return {
+    httpOnly: true,
+    secure: IS_PROD, // must be true (HTTPS) for SameSite=None to be accepted in browsers
+    sameSite: IS_PROD ? ("none" as const) : ("lax" as const),
+    path: "/",
+    maxAge: Math.floor(SESSION_TTL_SECONDS * 1000), // milliseconds for res.cookie
+    ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
+  } as const;
 }
 
 /* ============================================================
@@ -376,12 +397,12 @@ export async function signupHandler(req: Request, res: Response) {
       } catch (_) {}
     })();
 
-    /* 10) SESSION COOKIE — CREATE SESSION (direct, robust) */
+    /* 10) SESSION COOKIE — CREATE SESSION (direct, robust using res.cookie) */
     try {
-      // create SID first (use node crypto)
+      // create SID
       const sid = crypto.randomUUID ? crypto.randomUUID() : require("crypto").randomUUID();
 
-      // Attempt direct DB insert using pool.query so we know it's the correct helper/signature
+      // Insert session row
       try {
         const insertSql = `
           INSERT INTO sessions (sid, user_id, tenant_id, company_id, created_at, last_seen, absolute_expiry)
@@ -399,10 +420,18 @@ export async function signupHandler(req: Request, res: Response) {
         return res.status(500).json({ error: "session_insert_failed", detail: String(dbErr?.message || dbErr) });
       }
 
-      // Now build cookie header and explicitly clear old cookie then set new one so browsers will overwrite
-      // First clear (helps in some old-cookie edge cases)
-      // Set both clear and set headers to be robust
-      res.setHeader("Set-Cookie", [buildClearSessionCookie(), buildSessionCookie(sid)]);
+      // set cookie via express helper (more reliable than raw Set-Cookie header)
+      try {
+        res.cookie(COOKIE_NAME, sid, cookieOptions());
+
+        // helpful debug header in non-prod so you can see cookie details in the response headers
+        if (!IS_PROD) {
+          res.setHeader("X-Debug-Set-Cookie", `${COOKIE_NAME}=${sid}; domain=${COOKIE_DOMAIN || "host-only"}; samesite=${IS_PROD ? "None" : "Lax"}`);
+        }
+      } catch (cErr) {
+        console.error("[signup] failed to set cookie via res.cookie:", cErr);
+        return res.status(500).json({ error: "session_cookie_failed", detail: String(cErr?.message || cErr) });
+      }
 
       // Confirm readback (sanity)
       try {
@@ -413,7 +442,7 @@ export async function signupHandler(req: Request, res: Response) {
         return res.status(500).json({ error: "session_readback_failed", detail: String(rbErr?.message || rbErr) });
       }
 
-      // return sid so client has authoritative session if cookie doesn't land
+      // return sid in JSON as a fallback for clients that can't accept cookies
       return res.status(201).json({
         ok: true,
         tenantId,
