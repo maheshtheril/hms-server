@@ -168,27 +168,6 @@ async function resolveCurrencyForCountry(client: any, countryId: string): Promis
   return null;
 }
 
-/* ------------------ Cookie helpers (express res.cookie) ------------------ */
-// Keep name consistent with other auth routes
-const COOKIE_NAME =
-  (process.env.SESSION_COOKIE_NAME ||
-    process.env.COOKIE_NAME_SID ||
-    process.env.COOKIE_NAME ||
-    "sid").toString();
-const IS_PROD = process.env.NODE_ENV === "production";
-const COOKIE_DOMAIN = (process.env.SESSION_COOKIE_DOMAIN || process.env.COOKIE_DOMAIN || "").toString().trim() || undefined;
-
-function cookieOptions() {
-  return {
-    httpOnly: true,
-    secure: IS_PROD, // must be true (HTTPS) for SameSite=None to be accepted in browsers
-    sameSite: IS_PROD ? ("none" as const) : ("lax" as const),
-    path: "/",
-    maxAge: Math.floor(SESSION_TTL_SECONDS * 1000), // milliseconds for res.cookie
-    ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
-  } as const;
-}
-
 /* ============================================================
    SIGNUP HANDLER
 ============================================================ */
@@ -418,7 +397,7 @@ export async function signupHandler(req: Request, res: Response) {
       res.setHeader("Set-Cookie", setCookieValue);
 
       // helpful debug header in non-prod so you can see cookie details in the response headers
-      if (!IS_PROD) {
+      if (process.env.NODE_ENV !== "production") {
         res.setHeader("X-Debug-Set-Cookie", `${setCookieValue}`);
       }
 
