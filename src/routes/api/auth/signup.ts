@@ -17,7 +17,12 @@ async function q(client: any, text: string, params: any[] = []) {
     return await client.query(text, params);
   } catch (err: any) {
     try {
-      console.error("[pg][query_error]", text, params, JSON.stringify(err, Object.getOwnPropertyNames(err)));
+      console.error(
+        "[pg][query_error]",
+        text,
+        params,
+        JSON.stringify(err, Object.getOwnPropertyNames(err))
+      );
     } catch (e) {
       console.error("[pg][query_error] fallback", text, params, err);
     }
@@ -372,23 +377,50 @@ export async function signupHandler(req: Request, res: Response) {
 
     /* 10) SESSION COOKIE — USE buildSessionCookie */
     try {
-      const sid = await createSession({ userId, tenantId, companyId });
+      // call createSession using the canonical camelCase keys expected by lib/session.ts
+      const sid = await createSession({
+        userId,
+        tenantId,
+        companyId,
+      });
+
+      console.info("[signup] created session sid:", sid);
+
+      // read back session row to ensure tenant/company were persisted
+      try {
+        const s = await pool.query(
+          "SELECT sid, tenant_id, company_id, user_id, created_at FROM sessions WHERE sid = $1",
+          [sid]
+        );
+        console.info("[signup] session row readback:", s.rows[0]);
+      } catch (e) {
+        console.error("[signup] session readback failed:", e);
+      }
 
       // single source of truth (uses SESSION_COOKIE_DOMAIN, NODE_ENV, etc.)
       const cookieHeader = buildSessionCookie(sid);
       res.setHeader("Set-Cookie", cookieHeader);
+
+      // return sid so client has authoritative session if cookie doesn't land
+      return res.status(201).json({
+        ok: true,
+        tenantId,
+        companyId,
+        userId,
+        sid,
+        redirect: "/tenant/onboarding/hms",
+      });
     } catch (err) {
       console.error("session cookie error:", err);
+      // as a fallback, return success without sid (logs will show the issue)
+      return res.status(201).json({
+        ok: true,
+        tenantId,
+        companyId,
+        userId,
+        redirect: "/tenant/onboarding/hms",
+      });
     }
-
-    /* 11) success → onboarding */
-    return res.status(201).json({
-      ok: true,
-      tenantId,
-      companyId,
-      userId,
-      redirect: "/tenant/onboarding/hms",
-    });
   } catch (err) {
     console.error("[signup] handler error:", err);
     return res.status(500).json({ error: "server_error" });
