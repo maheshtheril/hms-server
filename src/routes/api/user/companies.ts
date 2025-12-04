@@ -1,26 +1,21 @@
 // src/routes/api/user/companies.ts
 import { Router } from "express";
 import { q } from "../../../db";
-import { requireAuth } from "../../../middleware/requireAuth";
+import requireAuth from "../../../middleware/requireAuth";
 
 const router = Router();
 
-router.get("/user/companies", requireAuth, async (req: any, res) => {
+// IMPORTANT: This route is mounted at /api/user/companies
+// So the path HERE must be "/" NOT "/user/companies"
+router.get("/", requireAuth, async (req: any, res) => {
   try {
-    // tolerate multiple middleware shapes (requireSession, requireAuth, etc.)
-    const authSession = (req as any).authSession || (req as any).session || (req as any).company || null;
-    const userId = authSession?.user_id || (req as any).session?.user_id;
-    if (!userId) return res.status(401).json({ error: "unauthenticated" });
+    const auth = req.authSession;
+    if (!auth) return res.status(401).json({ error: "unauthenticated" });
 
-    const tenantId = authSession?.tenant_id || (req as any).session?.tenant_id;
-    // prefer active_company_id from resolved company/session shape
-    const userCompanyId =
-      authSession?.company_id ||
-      (req as any).session?.active_company_id ||
-      (req as any).company?.active_company_id ||
-      null;
+    const tenantId = auth.tenant_id;
+    const companyId = auth.company_id;
 
-    let rows: Array<any> = [];
+    let rows: any[] = [];
 
     if (tenantId) {
       const r = await q(
@@ -32,13 +27,13 @@ router.get("/user/companies", requireAuth, async (req: any, res) => {
         [tenantId]
       );
       rows = r.rows ?? [];
-    } else if (userCompanyId) {
+    } else if (companyId) {
       const r = await q(
         `SELECT id, name, COALESCE(logo_url, '') AS logo_url, tenant_id
          FROM public.company
          WHERE id = $1
          LIMIT 1`,
-        [userCompanyId]
+        [companyId]
       );
       rows = r.rows ?? [];
     }
@@ -46,11 +41,10 @@ router.get("/user/companies", requireAuth, async (req: any, res) => {
     return res.json({ companies: rows });
   } catch (err: any) {
     console.error("GET /api/user/companies error:", err);
-    // temporary: include stack in non-production for triage
     return res.status(500).json({
       error: "server_error",
-      message: String(err?.message || err),
-      stack: process.env.NODE_ENV === "production" ? undefined : String(err?.stack || "")
+      message: err?.message || String(err),
+      stack: process.env.NODE_ENV === "production" ? undefined : err?.stack,
     });
   }
 });
