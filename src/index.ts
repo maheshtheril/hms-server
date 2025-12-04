@@ -3,6 +3,8 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
+import { sessionLoader } from "./middleware/sessionLoader";
+import sessionRouter from "./routes/session";
 import path from "path";
 
 /* ───────────────────────────── Routers ───────────────────────────── */
@@ -46,10 +48,10 @@ import leadPipelinesRouter from "./routes/leads/pipelines";
 import leadStagesRouter from "./routes/leads/stages";
 import leadIndustriesRouter from "./routes/leads/industries";
 import { leadsNewRouter } from "./routes/new/leads-new";
-import { sessionLoader } from "./middleware/sessionLoader";
+
 
 /* ---- NEW imports added ---- */
-import sessionRouter from "./routes/session";
+
 import companiesRouter from "./routes/hms/companies";
 import productsRouter from "./routes/hms/products";
 import settingsRouter from "./routes/settings";
