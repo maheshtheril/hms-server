@@ -1,35 +1,38 @@
-// src/lib/cookies.ts
+// server/src/lib/cookies.ts
 import type { Response } from "express";
 
-export const COOKIE_NAME = process.env.COOKIE_NAME_SID || "sid";
+const COOKIE_NAME = process.env.COOKIE_NAME_SID || "sid";
+
+function isProd() {
+  return process.env.NODE_ENV === "production";
+}
 
 /**
- * IMPORTANT:
- * For Render multi-subdomain setups, you MUST set:
- *   COOKIE_DOMAIN=.onrender.com
- *
- * Otherwise cookies will be host-only and never reach frontend.
+ * setCookie - sets a session cookie with safe defaults for prod/dev.
  */
-const COOKIE_DOMAIN =
-  process.env.COOKIE_DOMAIN?.trim() || ".onrender.com"; // <-- FIXED
-
 export function setCookie(res: Response, name: string, value: string) {
-  res.cookie(name || COOKIE_NAME, value, {
+  const cookieName = name || COOKIE_NAME;
+  const domain = (process.env.COOKIE_DOMAIN || "").trim() || undefined;
+
+  res.cookie(cookieName, value, {
     httpOnly: true,
-    secure: true,        // Always true on HTTPS (Render)
-    sameSite: "none",    // Required for cross-site cookies
-    domain: COOKIE_DOMAIN,
+    secure: isProd(),                       // only require https in production
+    sameSite: isProd() ? "none" : "lax",    // none for cross-site in prod, lax locally
     path: "/",
-    maxAge: 30 * 24 * 3600 * 1000, // 30 days
+    maxAge: 30 * 24 * 3600 * 1000,          // 30 days
+    ...(domain ? { domain } : {}),
   });
 }
 
 export function clearCookie(res: Response, name: string) {
-  res.clearCookie(name || COOKIE_NAME, {
+  const cookieName = name || COOKIE_NAME;
+  const domain = (process.env.COOKIE_DOMAIN || "").trim() || undefined;
+
+  res.clearCookie(cookieName, {
     httpOnly: true,
-    secure: true,
-    sameSite: "none",
-    domain: COOKIE_DOMAIN,
+    secure: isProd(),
+    sameSite: isProd() ? "none" : "lax",
     path: "/",
+    ...(domain ? { domain } : {}),
   });
 }

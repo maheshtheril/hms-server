@@ -11,6 +11,9 @@ const router = Router();
  */
 const COOKIE_NAME = process.env.COOKIE_NAME_SID || "sid";
 const isProd = process.env.NODE_ENV === "production";
+const COOKIE_DOMAIN = (process.env.COOKIE_DOMAIN || "").trim() || undefined;
+
+
 function cookieOptions() {
   return {
     httpOnly: true,
@@ -18,7 +21,9 @@ function cookieOptions() {
     sameSite: isProd ? "none" : "lax",
     path: "/",
     maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
   } as const;
+
 }
 
 /**

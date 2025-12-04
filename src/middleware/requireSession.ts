@@ -182,14 +182,18 @@ const requireSession: RequestHandler = (req, res, next) => {
       r.session.active_company_id = active ?? null;
 
       // Use environment-aware cookie options so mobile / cross-origin works correctly
-      const isProd = process.env.NODE_ENV === "production";
+      const COOKIE_DOMAIN = (process.env.COOKIE_DOMAIN || "").trim() || undefined;
+const isProd = process.env.NODE_ENV === "production";
+
       res.cookie("active_company_id", active ?? "", {
-        httpOnly: true,
-        sameSite: isProd ? "none" : "lax",
-        secure: isProd,
-        path: "/",
-        maxAge: 30 * 24 * 60 * 60 * 1000,
-      });
+  httpOnly: true,               // probably okay to be httpOnly
+  sameSite: isProd ? "none" : "lax",
+  secure: isProd,
+  path: "/",
+  maxAge: 30 * 24 * 60 * 60 * 1000,
+  ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
+});
+
     } finally {
       cx.release();
     }
