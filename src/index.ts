@@ -9,6 +9,7 @@ import path from "path";
 import adminCustomFieldsRouter from "./routes/admin/custom-fields";
 import leadCustomFieldsRouter from "./routes/leads/custom-fields";
 import auth from "./routes/auth";
+
 import me from "./routes/me";
 import leads from "./routes/leads";
 import pipelines from "./routes/pipelines";
@@ -62,6 +63,7 @@ import globalCompanyTaxesRouter from "./routes/global/company-taxes";
 import { requireTenant } from "./middleware/tenant"; 
 import accountingRoutes from "./routes/accounting.routes";
 import signupRouter from "./routes/api/auth/signup";
+import loginRoute from "./routes/api/auth/login";
 import coreRouter from "./routes/core";
 import userCompaniesRouter from "./routes/api/user/companies";
 import invoiceRoutes from "./routes/invoiceRoutes";
@@ -172,6 +174,8 @@ app.options("*", (req, res) => {
   );
   return res.sendStatus(200);
 });
+app.use("/login", loginRoute);
+
 app.use("/api/kpis", kpisRouter); 
 
 app.use("/api/tenant/dashboard", tenantDashboardRouter);
@@ -278,7 +282,7 @@ app.use("/api/global/tax-types", globalTaxTypesRouter);
 app.use("/api/global/tax-rates", globalTaxRatesRouter);
 app.use("/api/global/company-settings", globalCompanySettingsRouter);
 app.use("/api/global/company-taxes", globalCompanyTaxesRouter);
-app.use("/api", userCompaniesRouter);
+app.use("/api/user/companies", userCompaniesRouter);
 app.use("/api/onboarding/hms", hmsOnboardingRouter);
 
 

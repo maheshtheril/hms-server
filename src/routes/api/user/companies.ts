@@ -1,12 +1,10 @@
-// src/routes/api/user/companies.ts
 import { Router } from "express";
 import { q } from "../../../db";
-import requireAuth from "../../../middleware/requireAuth";
+import { requireAuth } from "../../../middleware/requireAuth"; // <- named import
 
 const router = Router();
 
-// IMPORTANT: This route is mounted at /api/user/companies
-// So the path HERE must be "/" NOT "/user/companies"
+// mounted at /api/user/companies -> path here must be "/"
 router.get("/", requireAuth, async (req: any, res) => {
   try {
     const auth = req.authSession;
