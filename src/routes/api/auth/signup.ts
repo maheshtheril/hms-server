@@ -3,7 +3,12 @@ import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import { pool } from "../../../db";
-import { buildSessionCookie, buildClearSessionCookie, SESSION_TTL_SECONDS } from "../../../lib/session";
+import {
+  createSession,
+  buildSessionCookie,
+  buildClearSessionCookie,
+  SESSION_TTL_SECONDS,
+} from "../../../lib/session";
 import rateLimitSignup from "../../../middleware/rateLimitSignup";
 import domainTenantPolicy from "../../../lib/domainTenantPolicy";
 import { createVerificationToken, sendVerificationEmail } from "../../../lib/emailVerification";
@@ -397,49 +402,35 @@ export async function signupHandler(req: Request, res: Response) {
       } catch (_) {}
     })();
 
-    /* 10) SESSION COOKIE — CREATE SESSION (direct, robust using res.cookie) */
+    /* 10) SESSION COOKIE — CREATE SESSION (canonical: createSession + buildSessionCookie) */
     try {
-      // create SID
-      const sid = crypto.randomUUID ? crypto.randomUUID() : require("crypto").randomUUID();
+      // create session using canonical helper (keeps session creation logic in lib/session.ts)
+      const sid = await createSession({
+        userId,
+        tenantId: tenantId ?? null,
+        companyId: companyId ?? null,
+      });
 
-      // Insert session row
-      try {
-        const insertSql = `
-          INSERT INTO sessions (sid, user_id, tenant_id, company_id, created_at, last_seen, absolute_expiry)
-          VALUES ($1, $2, $3, $4, now(), now(), now() + make_interval(secs => $5))
-          RETURNING sid, tenant_id, company_id, user_id, created_at
-        `;
-        const insertRes = await pool.query(insertSql, [sid, userId, tenantId ?? null, companyId ?? null, SESSION_TTL_SECONDS]);
-        if (!insertRes || !insertRes.rows || insertRes.rowCount !== 1) {
-          console.error("[signup] session insert did not return row", insertRes);
-          return res.status(500).json({ error: "session_insert_failed" });
-        }
-        console.info("[signup] session inserted (direct):", insertRes.rows[0]);
-      } catch (dbErr) {
-        console.error("[signup] direct session insert failed:", dbErr);
-        return res.status(500).json({ error: "session_insert_failed", detail: String(dbErr?.message || dbErr) });
+      // Build cookie header value using canonical builder
+      const setCookieValue = buildSessionCookie(sid);
+
+      // Use Set-Cookie header (explicit and consistent)
+      res.setHeader("Set-Cookie", setCookieValue);
+
+      // helpful debug header in non-prod so you can see cookie details in the response headers
+      if (!IS_PROD) {
+        res.setHeader("X-Debug-Set-Cookie", `${setCookieValue}`);
       }
 
-      // set cookie via express helper (more reliable than raw Set-Cookie header)
+      // sanity readback for debug (log, but don't fail the request if this readback fails)
       try {
-        res.cookie(COOKIE_NAME, sid, cookieOptions());
-
-        // helpful debug header in non-prod so you can see cookie details in the response headers
-        if (!IS_PROD) {
-          res.setHeader("X-Debug-Set-Cookie", `${COOKIE_NAME}=${sid}; domain=${COOKIE_DOMAIN || "host-only"}; samesite=${IS_PROD ? "None" : "Lax"}`);
-        }
-      } catch (cErr) {
-        console.error("[signup] failed to set cookie via res.cookie:", cErr);
-        return res.status(500).json({ error: "session_cookie_failed", detail: String(cErr?.message || cErr) });
-      }
-
-      // Confirm readback (sanity)
-      try {
-        const sBack = await pool.query("SELECT sid, tenant_id, company_id, user_id, created_at FROM sessions WHERE sid = $1", [sid]);
+        const sBack = await pool.query(
+          "SELECT sid, tenant_id, company_id, user_id, created_at FROM sessions WHERE sid = $1",
+          [sid]
+        );
         console.info("[signup] session readback after insert:", sBack.rows[0]);
       } catch (rbErr) {
-        console.error("[signup] session readback failed after insert:", rbErr);
-        return res.status(500).json({ error: "session_readback_failed", detail: String(rbErr?.message || rbErr) });
+        console.error("[signup] session readback failed after insert (non-fatal):", rbErr);
       }
 
       // return sid in JSON as a fallback for clients that can't accept cookies
