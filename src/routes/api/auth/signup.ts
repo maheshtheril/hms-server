@@ -1,4 +1,5 @@
 // server/src/routes/api/auth/signup.ts
+// test-123
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
