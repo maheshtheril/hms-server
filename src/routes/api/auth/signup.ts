@@ -192,6 +192,13 @@ function cookieOptions() {
 
 /* ============================================================
    SIGNUP HANDLER
+   Behavior change: only include "redirect" in JSON when an
+   incoming cookie for the canonical name is already present.
+   If the request did not contain a cookie (fresh browser),
+   server STILL calls res.cookie(...) to set the session, but
+   will NOT include redirect in the payload. This prevents an
+   automatic client-side navigation before the browser stores
+   the Set-Cookie header.
 ============================================================ */
 export async function signupHandler(req: Request, res: Response) {
   console.info("[signup] invoked");
@@ -403,7 +410,11 @@ export async function signupHandler(req: Request, res: Response) {
       } catch (_) {}
     })();
 
-    /* 10) SESSION COOKIE — CREATE SESSION (match login behavior: issueSession + res.cookie) */
+    /* 10) SESSION COOKIE — CREATE SESSION (match login behavior: issueSession + res.cookie)
+       IMPORTANT: Only include `redirect` in JSON if the incoming request already had a valid cookie
+       for the canonical cookie name. This prevents client-side redirects when browser hasn't stored
+       the Set-Cookie header yet.
+    */
     try {
       // create SID via canonical DB helper (issueSession keeps logic centralized)
       const sid = await issueSession(userId, tenantId ?? null, companyId ?? null);
@@ -422,17 +433,6 @@ export async function signupHandler(req: Request, res: Response) {
 
         res.cookie(COOKIE_NAME, sid, cookieOpts);
 
-        // ADDED: explicit debug log so you can see exactly what will be sent
-        console.info("[signup] res will set cookie:", {
-          COOKIE_NAME,
-          sid,
-          cookieOpts,
-          debugHeader:
-            process.env.NODE_ENV !== "production"
-              ? `${COOKIE_NAME}=${sid}; domain=${COOKIE_DOMAIN || "host-only"}; samesite=${IS_PROD ? "None" : "Lax"}`
-              : undefined,
-        });
-
         // helpful debug header in non-prod so you can see cookie details in the response headers
         if (process.env.NODE_ENV !== "production") {
           res.setHeader("X-Debug-Set-Cookie", `${COOKIE_NAME}=${sid}; domain=${COOKIE_DOMAIN || "host-only"}; samesite=${IS_PROD ? "None" : "Lax"}`);
@@ -450,15 +450,25 @@ export async function signupHandler(req: Request, res: Response) {
         console.error("[signup] session readback failed after insert (non-fatal):", rbErr);
       }
 
-      // return sid in JSON as a fallback for clients that can't accept cookies
-      return res.status(201).json({
+      // Determine whether incoming request already contained the cookie.
+      // If it did, it's safe to include `redirect` because the browser already had cookies enabled.
+      const incomingCookiePresent = Boolean((req as any).cookies && (req as any).cookies[COOKIE_NAME]);
+
+      // prepare base payload
+      const basePayload: any = {
         ok: true,
         tenantId,
         companyId,
         userId,
         sid,
-        redirect: "/tenant/onboarding/hms",
-      });
+      };
+
+      // only include redirect when incoming cookie was present
+      if (incomingCookiePresent) {
+        basePayload.redirect = "/tenant/onboarding/hms";
+      }
+
+      return res.status(201).json(basePayload);
     } catch (err) {
       console.error("session cookie error (unexpected):", err);
       return res.status(500).json({ error: "session_error", detail: String(err?.message || err) });
