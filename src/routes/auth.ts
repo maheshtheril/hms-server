@@ -66,19 +66,36 @@ router.post("/login", async (req, res) => {
 /**
  * POST /auth/logout
  */
+// POST /api/auth/logout
 router.post("/logout", async (req, res) => {
   const sid = req.cookies?.[COOKIE_NAME];
-  if (sid) await revokeSession(sid);
 
-  // Clear cookie using same path / sameSite settings — important for some browsers
-  res.clearCookie(COOKIE_NAME, {
-    path: "/",
-    sameSite: isProd ? "none" : "lax",
+  try {
+    if (sid) {
+      // ensure your revokeSession function is called
+      await revokeSession(sid);
+    }
+  } catch (err) {
+    console.error("revokeSession error during logout:", err);
+    // continue to clear cookie even when revoke fails
+  }
+
+  // Clear cookie with same attributes used when setting it
+  const clearOpts: Record<string, any> = {
+    httpOnly: true,
     secure: isProd,
-  });
+    sameSite: isProd ? "none" : "lax",
+    path: "/",
+    maxAge: 0,
+  };
+  if (COOKIE_DOMAIN) clearOpts.domain = COOKIE_DOMAIN;
 
-  res.json({ ok: true });
+  res.clearCookie(COOKIE_NAME, clearOpts);
+
+  // 204 No Content is conventional for logout
+  return res.status(204).end();
 });
+
 
 /**
  * GET /auth/session
