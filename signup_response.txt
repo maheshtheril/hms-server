@@ -1,0 +1,22 @@
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0100   115    0     0  100   115      0     90  0:00:01  0:00:01 --:--:--    90100   115    0     0  100   115      0     50  0:00:02  0:00:02 --:--:--    50100   356    0   241  100   115     85     40  0:00:02  0:00:02 --:--:--   126HTTP/1.1 201 Created
+Date: Fri, 05 Dec 2025 03:03:48 GMT
+Content-Type: application/json; charset=utf-8
+Transfer-Encoding: chunked
+Connection: keep-alive
+CF-RAY: 9a904fed88369373-MAA
+access-control-allow-credentials: true
+access-control-allow-origin: https://hmsweb.onrender.com
+etag: W/"f1-QFBOZ8CMVnYzHXYJfkQDOOtm0ys"
+rndr-id: 48eca233-6f67-44da
+Set-Cookie: sid=fdfc0e87-ec6d-47f1-9467-d10dd4e08d7c; Max-Age=1209600; Path=/; Expires=Fri, 19 Dec 2025 03:03:48 GMT; HttpOnly; Secure; SameSite=None
+vary: Origin
+vary: Accept-Encoding
+x-powered-by: Express
+x-render-origin-server: Render
+cf-cache-status: DYNAMIC
+Server: cloudflare
+alt-svc: h3=":443"; ma=86400
+
+{"ok":true,"tenantId":"c2eef95a-c986-4d7a-94b3-d158edaf17fb","companyId":"8bee9f62-4f47-49ef-a0ee-4e357c2a1167","userId":"9d288658-bb37-45f5-b761-3c4f9481541d","sid":"fdfc0e87-ec6d-47f1-9467-d10dd4e08d7c","redirect":"/tenant/onboarding/hms"}
