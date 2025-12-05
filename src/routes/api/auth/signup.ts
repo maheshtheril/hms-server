@@ -410,7 +410,17 @@ export async function signupHandler(req: Request, res: Response) {
 
       // set cookie via express helper (matches your /login path)
       try {
-        res.cookie(COOKIE_NAME, sid, cookieOptions());
+        // set cookie explicitly WITHOUT domain (host-only) to avoid cross-tenant .onrender.com problem
+        const cookieOpts = {
+          httpOnly: true,
+          secure: IS_PROD || ((req as any) && ((req as any).secure || (req as any).headers["x-forwarded-proto"] === "https")),
+          sameSite: IS_PROD ? ("none" as const) : ("lax" as const),
+          path: "/",
+          maxAge: Math.floor(SESSION_TTL_SECONDS * 1000),
+          // Intentionally DO NOT set domain here to avoid .onrender.com being emitted
+        } as const;
+
+        res.cookie(COOKIE_NAME, sid, cookieOpts);
 
         // helpful debug header in non-prod so you can see cookie details in the response headers
         if (process.env.NODE_ENV !== "production") {
