@@ -4,8 +4,8 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import { pool } from "../../../db";
 import {
-  createSession,
-  buildSessionCookie,
+  issueSession,
+  // keep other exports if you need them elsewhere in this file
   buildClearSessionCookie,
   SESSION_TTL_SECONDS,
 } from "../../../lib/session";
@@ -166,6 +166,27 @@ async function resolveCurrencyForCountry(client: any, countryId: string): Promis
   }
 
   return null;
+}
+
+/* ------------------ Cookie helpers (express res.cookie) ------------------ */
+// Keep name consistent with other auth routes
+const COOKIE_NAME =
+  (process.env.SESSION_COOKIE_NAME ||
+    process.env.COOKIE_NAME_SID ||
+    process.env.COOKIE_NAME ||
+    "sid").toString();
+const IS_PROD = process.env.NODE_ENV === "production";
+const COOKIE_DOMAIN = (process.env.SESSION_COOKIE_DOMAIN || process.env.COOKIE_DOMAIN || "").toString().trim() || undefined;
+
+function cookieOptions() {
+  return {
+    httpOnly: true,
+    secure: IS_PROD, // must be true (HTTPS) for SameSite=None to be accepted in browsers
+    sameSite: IS_PROD ? ("none" as const) : ("lax" as const),
+    path: "/",
+    maxAge: Math.floor(SESSION_TTL_SECONDS * 1000), // milliseconds for res.cookie
+    ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
+  } as const;
 }
 
 /* ============================================================
@@ -381,32 +402,27 @@ export async function signupHandler(req: Request, res: Response) {
       } catch (_) {}
     })();
 
-    /* 10) SESSION COOKIE — CREATE SESSION (canonical: createSession + buildSessionCookie) */
+    /* 10) SESSION COOKIE — CREATE SESSION (match login behavior: issueSession + res.cookie) */
     try {
-      // create session using canonical helper (keeps session creation logic in lib/session.ts)
-      const sid = await createSession({
-        userId,
-        tenantId: tenantId ?? null,
-        companyId: companyId ?? null,
-      });
+      // create SID via canonical DB helper (issueSession keeps logic centralized)
+      const sid = await issueSession(userId, tenantId ?? null, companyId ?? null);
 
-      // Build cookie header value using canonical builder
-      const setCookieValue = buildSessionCookie(sid);
+      // set cookie via express helper (matches your /login path)
+      try {
+        res.cookie(COOKIE_NAME, sid, cookieOptions());
 
-      // Use Set-Cookie header (explicit and consistent)
-      res.setHeader("Set-Cookie", setCookieValue);
-
-      // helpful debug header in non-prod so you can see cookie details in the response headers
-      if (process.env.NODE_ENV !== "production") {
-        res.setHeader("X-Debug-Set-Cookie", `${setCookieValue}`);
+        // helpful debug header in non-prod so you can see cookie details in the response headers
+        if (process.env.NODE_ENV !== "production") {
+          res.setHeader("X-Debug-Set-Cookie", `${COOKIE_NAME}=${sid}; domain=${COOKIE_DOMAIN || "host-only"}; samesite=${IS_PROD ? "None" : "Lax"}`);
+        }
+      } catch (cErr) {
+        console.error("[signup] failed to set cookie via res.cookie:", cErr);
+        return res.status(500).json({ error: "session_cookie_failed", detail: String(cErr?.message || cErr) });
       }
 
       // sanity readback for debug (log, but don't fail the request if this readback fails)
       try {
-        const sBack = await pool.query(
-          "SELECT sid, tenant_id, company_id, user_id, created_at FROM sessions WHERE sid = $1",
-          [sid]
-        );
+        const sBack = await pool.query("SELECT sid, tenant_id, company_id, user_id, created_at FROM sessions WHERE sid = $1", [sid]);
         console.info("[signup] session readback after insert:", sBack.rows[0]);
       } catch (rbErr) {
         console.error("[signup] session readback failed after insert (non-fatal):", rbErr);
