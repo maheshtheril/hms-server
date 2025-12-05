@@ -422,6 +422,17 @@ export async function signupHandler(req: Request, res: Response) {
 
         res.cookie(COOKIE_NAME, sid, cookieOpts);
 
+        // ADDED: explicit debug log so you can see exactly what will be sent
+        console.info("[signup] res will set cookie:", {
+          COOKIE_NAME,
+          sid,
+          cookieOpts,
+          debugHeader:
+            process.env.NODE_ENV !== "production"
+              ? `${COOKIE_NAME}=${sid}; domain=${COOKIE_DOMAIN || "host-only"}; samesite=${IS_PROD ? "None" : "Lax"}`
+              : undefined,
+        });
+
         // helpful debug header in non-prod so you can see cookie details in the response headers
         if (process.env.NODE_ENV !== "production") {
           res.setHeader("X-Debug-Set-Cookie", `${COOKIE_NAME}=${sid}; domain=${COOKIE_DOMAIN || "host-only"}; samesite=${IS_PROD ? "None" : "Lax"}`);
