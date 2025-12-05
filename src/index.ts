@@ -185,6 +185,26 @@ app.use("/api/company/dashboard", companyDashboardRouter);
 
 /* ───────────────────────────── Parsers BEFORE routes ───────────────────────────── */
 app.use(cookieParser());
+// --- FIX: accept legacy cookie 'erp_session' as valid session cookie ---
+const CANONICAL_COOKIE_NAME =
+  process.env.SESSION_COOKIE_NAME ||
+  process.env.COOKIE_NAME_SID ||
+  process.env.COOKIE_NAME ||
+  "sid";
+
+app.use((req, res, next) => {
+  try {
+    if (req?.cookies) {
+      if (!req.cookies[CANONICAL_COOKIE_NAME] && req.cookies.erp_session) {
+        req.cookies[CANONICAL_COOKIE_NAME] = req.cookies.erp_session;
+      }
+    }
+  } catch (err) {
+    console.error("[cookie-compat]", err);
+  }
+  next();
+});
+
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
