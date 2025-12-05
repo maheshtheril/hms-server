@@ -96,7 +96,7 @@ import billingRulesRouter from "./routes/hms/billing/billing.rules";
 import aiTasksRouter from "./routes/hms/ai/ai.tasks";
 import tenantDashboardRouter from "./routes/tenant/dashboard";
 import companyDashboardRouter from "./routes/company/dashboard";
-
+import pharmacyBillingRouter from "./routes/hms/pharmacy/pharmacy.billing";
 
 /* -------------------------- */
 
@@ -227,6 +227,9 @@ app.use(
   "/uploads",
   express.static(path.join(process.cwd(), "uploads"), { maxAge: "1h", index: false })
 );
+
+app.use("/api/hms/pharmacy/billing", pharmacyBillingRouter);
+
 
 /* ───────────────────────────── PROBE endpoint ─────────────────────────────
    Use this to confirm rewrites/proxy/body parsing end-to-end.
