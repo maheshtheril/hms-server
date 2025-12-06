@@ -263,7 +263,7 @@ router.get("/me", async (req, res) => {
   });
 });
 
-// inside server/src/routes/auth.ts (add near other auth handlers)
+// inside server/src/routes/auth.ts (add near other auth handlers-)
 router.get("/last-login", async (req, res) => {
   try {
     const sid = req.cookies?.[COOKIE_NAME];
