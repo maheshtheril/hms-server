@@ -5,19 +5,41 @@ import { compare } from "../lib/crypto";
 import {
   issueSession,
   revokeSession,
-  buildSessionCookie,
+  // kept for compatibility where you might want to use the canonical builders elsewhere
   buildClearSessionCookie,
+  SESSION_TTL_SECONDS,
   COOKIE_NAME as SESSION_COOKIE_NAME,
 } from "../lib/session";
 
 const router = Router();
 
 /**
- * NOTE: We use the canonical COOKIE_NAME from lib/session to ensure
- * cookie attributes (Domain / SameSite / Secure / Max-Age / HttpOnly)
- * are consistent across signup/login/logout.
+ * NOTE: Use canonical COOKIE_NAME from lib/session so all handlers
+ * are consistent about the cookie name itself.
  */
 const COOKIE_NAME = SESSION_COOKIE_NAME;
+
+/**
+ * Utility to compute the same cookie options used in signup.
+ * Intentionally does NOT set `domain` — this creates a host-only cookie
+ * matching the behavior in your signup flow.
+ */
+function cookieOptionsForRequest(req: any) {
+  const IS_PROD = process.env.NODE_ENV === "production";
+  const secure =
+    IS_PROD ||
+    !!(req && ((req as any).secure || (req as any).headers["x-forwarded-proto"] === "https"));
+  const sameSite = IS_PROD ? ("none" as const) : ("lax" as const);
+
+  return {
+    httpOnly: true,
+    secure,
+    sameSite,
+    path: "/",
+    maxAge: Math.floor(SESSION_TTL_SECONDS * 1000),
+    // Intentionally DO NOT set domain to ensure host-only cookie (matches signup).
+  } as const;
+}
 
 /**
  * POST /auth/login
@@ -52,18 +74,17 @@ router.post("/login", async (req, res) => {
       return res.status(500).json({ error: "session_issue_failed" });
     }
 
-    // Set cookie using shared buildSessionCookie (ensures identical attributes to signup)
+    // SET COOKIE: mirror signup behaviour by using res.cookie with host-only options
     try {
-      const setCookieValue = buildSessionCookie(sid);
-      // Use Set-Cookie header directly to guarantee the exact string from lib/session
-      res.setHeader("Set-Cookie", setCookieValue);
+      const cookieOpts = cookieOptionsForRequest(req);
+      res.cookie(COOKIE_NAME, sid, cookieOpts);
 
-      // helpful debug header (optional)
+      // debug header in non-prod so you can inspect cookies in the client easily
       if (process.env.NODE_ENV !== "production") {
-        res.setHeader("X-Debug-Set-Cookie", `${COOKIE_NAME}=${sid}; debug=true`);
+        res.setHeader("X-Debug-Set-Cookie", `${COOKIE_NAME}=${sid}; host-only; samesite=${cookieOpts.sameSite}`);
       }
     } catch (cErr) {
-      console.error("[login] failed to set Set-Cookie header:", cErr);
+      console.error("[login] failed to set cookie via res.cookie:", cErr);
       return res.status(500).json({ error: "session_cookie_failed", detail: String(cErr?.message || cErr) });
     }
 
@@ -105,13 +126,28 @@ router.post("/logout", async (req, res) => {
     // continue to clear cookie even when revoke fails
   }
 
-  // Clear cookie using canonical builder so attributes match creation
+  // Clear cookie using the same host-only options (maxAge=0) so browser accepts the clear.
   try {
-    const clearValue = buildClearSessionCookie();
-    res.setHeader("Set-Cookie", clearValue);
+    const cookieOpts = {
+      ...cookieOptionsForRequest(req),
+      maxAge: 0,
+      expires: new Date(0),
+    } as any;
+    res.cookie(COOKIE_NAME, "", cookieOpts);
+
+    if (process.env.NODE_ENV !== "production") {
+      // also set debug header so you can inspect clearing behavior in dev
+      res.setHeader("X-Debug-Clear-Cookie", `${COOKIE_NAME}=; Max-Age=0; host-only`);
+    }
   } catch (cErr) {
-    console.error("[logout] failed to set clear cookie header:", cErr);
+    console.error("[logout] failed to clear cookie via res.cookie:", cErr);
     // best-effort continue
+    try {
+      // fallback to canonical clear string (non-fatal)
+      res.setHeader("Set-Cookie", buildClearSessionCookie());
+    } catch (e) {
+      console.error("[logout] fallback clear cookie also failed:", e);
+    }
   }
 
   // 204 No Content is conventional for logout
