@@ -103,6 +103,27 @@ import pharmacyBillingRouter from "./routes/hms/pharmacy/pharmacy.billing";
 
 /* ───────────────────────────── Express init ───────────────────────────── */
 const app = express();
+/* ───────────────────────────── Debug: temporary /api/me helper ─────────────────────────────
+   Purpose: load a small debug route that logs incoming SID cookie + a tolerant DB lookup.
+   This file is temporary — remove it after diagnosis.
+-------------------------------------------------------------------------------------------- */
+try {
+  // require a JS debug helper (server/src/routes/debug-me-patch.js)
+  // use require() to avoid TypeScript module resolution errors for a temporary JS helper
+  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-unsafe-assignment
+  const debugMe = require("./routes/debug-me-patch");
+  if (typeof debugMe === "function") {
+    // cast to any because the helper expects (app)
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+    debugMe(app as any);
+    console.info("[debug-me-patch] loaded /api/me debug route");
+  } else {
+    console.warn("[debug-me-patch] module loaded but is not a function");
+  }
+} catch (err: any) {
+  console.warn("[debug-me-patch] not loaded:", err && err.message ? err.message : err);
+}
+
 app.set("trust proxy", 1); // required for secure cookies on Render
 
 /* ───────────────────────────── CORS ───────────────────────────── */
