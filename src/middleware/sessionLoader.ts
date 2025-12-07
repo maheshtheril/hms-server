@@ -4,26 +4,19 @@ import { pool } from "../db"; // adjust if your db exports differently
 import { parse as parseCookie } from "cookie";
 import type { Request, Response, NextFunction } from "express";
 
-/**
- * sessionLoader middleware (type-compatible)
- *
- * Notes:
- * - This file intentionally matches the existing `Express.Request.user` type
- *   used elsewhere in your codebase (so TypeScript won't complain).
- * - If your db module exports default (db.pool), change the import above:
- *     import db from "../db"; const pool = db.pool;
- */
+/* env defaults (align with index.ts canonical names) */
+const COOKIE_NAME =
+  process.env.SESSION_COOKIE_NAME ||
+  process.env.COOKIE_NAME_SID ||
+  process.env.COOKIE_NAME ||
+  "sid";
 
-/* env defaults */
-const COOKIE_NAME = process.env.COOKIE_NAME_SID || process.env.SESSION_COOKIE_NAME || "sid";
 const SESSIONS_TABLE_ENV = process.env.SESSIONS_TABLE || "sessions";
 const SAFE_TABLE_NAME = /^[a-zA-Z0-9_]+$/.test(SESSIONS_TABLE_ENV) ? SESSIONS_TABLE_ENV : "sessions";
 
-/* ---- Make our Request.user match the existing project shape ---- */
 declare global {
   namespace Express {
     interface Request {
-      // Keep exact shape mentioned in your error
       user?: {
         id: string;
         email: string;
@@ -52,50 +45,30 @@ declare global {
   }
 }
 
-/* safe release helper */
 function safeRelease(client?: PoolClient | null) {
   try {
     if (client) client.release();
   } catch (_) {}
 }
 
-/**
- * Robust SID extraction helper
- * - uses cookie parser
- * - falls back to common legacy names (erp_session, session_id)
- * - accepts Bearer token
- * - also attempts raw header regex parse for edge cases
- */
 function extractSidFromRequest(req: Request): string | null {
   try {
     const rawCookieHeader = String(req.headers?.cookie || "");
-    // quick debug hint (not too noisy)
-    // console.debug("[sessionLoader] raw-cookie-header:", rawCookieHeader ? "(present)" : "(none)");
-
     const parsed = parseCookie(rawCookieHeader || "");
     const canonical = COOKIE_NAME;
 
-    // 1) canonical cookie name
-    if (parsed[canonical]) {
-      return String(parsed[canonical]);
-    }
+    if (parsed[canonical]) return String(parsed[canonical]);
 
-    // 2) fallback cookie names (legacy)
     const fallbacks = ["erp_session", "session_id", "SESSION_ID", "sid"];
-    for (const k of fallbacks) {
-      if (parsed[k]) return String(parsed[k]);
-    }
+    for (const k of fallbacks) if (parsed[k]) return String(parsed[k]);
 
-    // 3) Authorization: Bearer <sid>
     if (typeof req.headers.authorization === "string" && req.headers.authorization.startsWith("Bearer ")) {
       return req.headers.authorization.split(" ")[1];
     }
 
-    // 4) try regex on raw header (handles weird quoting or whitespace)
     if (rawCookieHeader) {
       const tryCanon = rawCookieHeader.match(new RegExp('(?:^|;\\s*)' + canonical + '=([^;\\s]+)'));
       if (tryCanon) return decodeURIComponent(tryCanon[1]);
-
       const tryErp = rawCookieHeader.match(/(?:^|;\s*)erp_session=([^;\\s]+)/);
       if (tryErp) return decodeURIComponent(tryErp[1]);
     }
@@ -118,17 +91,23 @@ export async function loadSessionOptional(req: Request, res: Response, next: Nex
     }
 
     const sid = extractSidFromRequest(req);
+    console.debug("[sessionLoader] sid:", sid ? `${sid.slice(0,12)}…` : "none");
 
     if (!sid) {
       req.authSession = undefined;
       return next();
     }
 
-    // Acquire DB client
+    // guard pool
+    if (!pool || typeof (pool as any).connect !== "function") {
+      console.error("[sessionLoader] DB pool is not available or malformed. Check ../db export.");
+      req.authSession = undefined;
+      return next();
+    }
+
     client = await (pool as any).connect();
     req.dbClient = client;
 
-    // Attach release hook (so long-running requests still release client)
     const releaseClient = () => {
       try {
         if (releaseHookAttached) {
@@ -140,6 +119,8 @@ export async function loadSessionOptional(req: Request, res: Response, next: Nex
         }
       } catch (_) {}
     };
+
+    // attach listeners immediately and then flip flag
     res.on("finish", releaseClient);
     res.on("close", releaseClient);
     releaseHookAttached = true;
@@ -151,12 +132,15 @@ export async function loadSessionOptional(req: Request, res: Response, next: Nex
              u.is_active, u.tenant_id AS user_tenant_id, u.company_id,
              s.last_seen, s.issued_at
       FROM ${SAFE_TABLE_NAME} s
-      JOIN app_user u ON u.id = s.user_id
+      LEFT JOIN app_user u ON u.id = s.user_id
       WHERE s.sid = $1
       LIMIT 1
     `;
-    const { rows } = await client.query(q, [sid]);
-    const row = rows?.[0];
+
+    console.debug("[sessionLoader] querying session table:", SAFE_TABLE_NAME);
+    const result = await client.query(q, [sid]);
+    const row = result?.rows?.[0];
+
     if (!row) {
       req.authSession = undefined;
       return next();
@@ -177,10 +161,9 @@ export async function loadSessionOptional(req: Request, res: Response, next: Nex
         [tenantId, companyId, userId]
       );
     } catch (err) {
-      console.warn("[sessionLoader] set_config failed:", err);
+      console.warn("[sessionLoader] set_config failed (non-fatal):", err);
     }
 
-    // Attach authSession (lightweight)
     req.authSession = {
       sid: row.sid,
       user_id: row.user_id,
@@ -195,7 +178,7 @@ export async function loadSessionOptional(req: Request, res: Response, next: Nex
       last_seen: row.last_seen,
     };
 
-    // IMPORTANT: set req.user with the exact expected shape (so TypeScript matches)
+    // Set req.user (expected shape)
     req.user = {
       id: String(row.user_id),
       email: row.email,
@@ -203,7 +186,6 @@ export async function loadSessionOptional(req: Request, res: Response, next: Nex
       is_admin: !!row.is_admin,
       is_platform_admin: !!row.is_platform_admin,
       is_tenant_admin: !!row.is_tenant_admin,
-      // roles and tenant_id are optional; keep tenant_id consistent with naming used elsewhere
       roles: undefined,
       tenant_id: tenantId ?? undefined,
     };
@@ -222,7 +204,8 @@ export async function loadSessionOptional(req: Request, res: Response, next: Nex
 
 export async function requireSession(req: Request, res: Response, next: NextFunction) {
   try {
-    await loadSessionOptional(req, res, () => Promise.resolve());
+    // simpler/clearer invocation
+    await loadSessionOptional(req, res, () => {});
     if (!req.authSession || !req.authSession.user_id) {
       return res.status(401).json({ error: "unauthenticated" });
     }
