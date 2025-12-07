@@ -6,66 +6,79 @@ import { requireAuth } from "../middleware/requireAuth";
 const router = Router();
 
 /**
- * Helper: safe first row
+ * Utility: safe first row
  */
-function firstRow(rows: any[]) {
+function firstRow(rows: any[] | null | undefined) {
   return Array.isArray(rows) && rows.length ? rows[0] : null;
 }
 
 /**
+ * Utility: normalise the shape returned by your db helper `q`
+ * - Some DB helpers return { rows } while others return the raw array.
+ */
+function normaliseRows(result: any): any[] {
+  if (!result) return [];
+  if (Array.isArray(result)) return result;
+  if (result.rows && Array.isArray(result.rows)) return result.rows;
+  // knex/raw sometimes returns [rows, ...] - handle that
+  if (Array.isArray(result[0])) return result[0];
+  return [];
+}
+
+/**
  * GET /me
- * Returns authenticated user info + resolved org context:
- * {
- *   user: { id, email, name, is_admin, tenant_id, company_id },
- *   companies: [{ id, name, logo_url, tenant_id, enabled }],
- *   locations: [{ id, name, company_id }]
- * }
+ * Returns authenticated user info + resolved org context.
+ *
+ * Response shape:
+ * { ok: true, user: {...}, companies: [...], locations: [...] }
  *
  * requireAuth must set req.authSession (with at least user_id; optional tenant_id, company_id)
- *
- * Behavior:
- * - If session has company_id, use it for locations and return that company + locations.
- * - Otherwise:
- *    1) return companies where user is member (user_companies)
- *    2) if none, fall back to companies for session.tenant_id (safe default)
  */
 router.get("/me", requireAuth, async (req: any, res) => {
   try {
     const authSession = req.authSession;
-    if (!authSession?.user_id) return res.status(401).json({ error: "unauthenticated" });
+    if (!authSession?.user_id) {
+      // Be explicit and consistent for the frontend
+      return res.status(401).json({ ok: false, error: "unauthenticated" });
+    }
 
-    // 1) load user
-    const { rows: userRows } = await q(
-      `SELECT id, email, name, is_admin, tenant_id, company_id, default_location_id
-         FROM public.app_user
-        WHERE id = $1
-        LIMIT 1`,
-      [authSession.user_id]
-    );
+    // If sessionLoader already loaded user-like fields, reuse them where possible.
+    // But we still need authoritative user fields like default_location_id so query app_user.
+    const USER_QUERY = `
+      SELECT id, email, name, is_admin, tenant_id, company_id, default_location_id, is_active
+      FROM public.app_user
+      WHERE id = $1
+      LIMIT 1
+    `;
 
+    const userResult = await q(USER_QUERY, [authSession.user_id]);
+    const userRows = normaliseRows(userResult);
     const user = firstRow(userRows);
-    if (!user) return res.status(404).json({ error: "user_not_found" });
 
-    // Prepare containers
+    if (!user) {
+      return res.status(404).json({ ok: false, error: "user_not_found" });
+    }
+
+    if (user.is_active === false) {
+      return res.status(403).json({ ok: false, error: "user_inactive" });
+    }
+
+    // Containers
     let companies: any[] = [];
     let locations: any[] = [];
-    let resolvedCompanyId: string | null = user.company_id || authSession.company_id || null;
+    // Prefer session company -> user.company_id -> unset
+    let resolvedCompanyId: string | null = authSession.company_id || user.company_id || null;
 
-    // 2) If authSession already has a company_id prefer that
+    // If session explicitly contains a company_id, fetch that single company
     if (authSession.company_id) {
-      // fetch that single company (safe read)
-      const { rows } = await q(
-        `SELECT id, name, logo_url, tenant_id, enabled
-           FROM public.company
-          WHERE id = $1
-          LIMIT 1`,
+      const compRes = await q(
+        `SELECT id, name, logo_url, tenant_id, enabled FROM public.company WHERE id = $1 LIMIT 1`,
         [authSession.company_id]
       );
-      const c = firstRow(rows);
-      if (c) companies = [c];
+      companies = normaliseRows(compRes);
     } else {
-      // 3) Try to find companies via user_companies membership
-      const { rows: membershipRows } = await q(
+      // Try membership via user_companies
+      const membershipRes = await q(
         `SELECT c.id, c.name, c.logo_url, c.tenant_id, c.enabled
            FROM public.company c
            JOIN public.user_companies uc ON uc.company_id = c.id
@@ -74,11 +87,12 @@ router.get("/me", requireAuth, async (req: any, res) => {
           LIMIT 200`,
         [authSession.user_id]
       );
+      const membershipRows = normaliseRows(membershipRes);
       if (membershipRows && membershipRows.length) {
         companies = membershipRows;
       } else if (user.tenant_id) {
-        // 4) Fallback to tenant-scoped companies
-        const { rows: tenantRows } = await q(
+        // Fallback to tenant-scoped companies
+        const tenantRowsRes = await q(
           `SELECT id, name, logo_url, tenant_id, enabled
              FROM public.company
             WHERE tenant_id = $1
@@ -87,22 +101,22 @@ router.get("/me", requireAuth, async (req: any, res) => {
             LIMIT 200`,
           [user.tenant_id]
         );
-        companies = tenantRows || [];
+        companies = normaliseRows(tenantRowsRes);
       } else {
         companies = [];
       }
     }
 
-    // Decide resolvedCompanyId if not already set:
+    // Choose resolvedCompanyId if still not set
     if (!resolvedCompanyId) {
       if (user.company_id) resolvedCompanyId = user.company_id;
       else if (companies.length) resolvedCompanyId = companies[0].id;
       else resolvedCompanyId = null;
     }
 
-    // 5) Fetch locations for the resolved company (if any)
+    // Fetch locations for resolved company if available
     if (resolvedCompanyId) {
-      const { rows: locRows } = await q(
+      const locRes = await q(
         `SELECT id, name, company_id
            FROM public.global_stock_location
           WHERE company_id = $1
@@ -110,18 +124,19 @@ router.get("/me", requireAuth, async (req: any, res) => {
           LIMIT 500`,
         [resolvedCompanyId]
       );
-      locations = locRows || [];
+      locations = normaliseRows(locRes);
     } else {
       locations = [];
     }
 
-    // Build response shape
+    // Build response
     const resp = {
+      ok: true,
       user: {
         id: user.id,
         email: user.email,
         name: user.name,
-        is_admin: user.is_admin || false,
+        is_admin: !!user.is_admin,
         tenant_id: user.tenant_id || null,
         company_id: resolvedCompanyId,
         default_location_id: user.default_location_id || null,
@@ -131,9 +146,20 @@ router.get("/me", requireAuth, async (req: any, res) => {
     };
 
     return res.json(resp);
-  } catch (err) {
-    console.error("GET /me error:", err);
-    return res.status(500).json({ error: "server_error" });
+  } catch (err: any) {
+    console.error("GET /me error:", err?.stack || err);
+
+    // Helpful detail in non-prod
+    if (process.env.NODE_ENV !== "production") {
+      return res.status(500).json({
+        ok: false,
+        error: "server_error",
+        detail: String(err?.message || err),
+        stack: err?.stack ? String(err.stack).split("\n") : undefined,
+      });
+    }
+
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -145,40 +171,37 @@ router.get("/me", requireAuth, async (req: any, res) => {
  * - If session has company_id, return that company (single-item array).
  * - Otherwise list enabled companies for the tenant_id (safe default).
  *
- * NOTE: We do NOT accept user_id from client. Server derives tenant/company from session.
+ * NOTE: Server derives tenant/company from session.
  */
 router.get("/user/companies", requireAuth, async (req: any, res) => {
   try {
     const authSession = req.authSession;
-    if (!authSession) return res.status(401).json({ error: "unauthenticated" });
+    if (!authSession?.user_id) return res.status(401).json({ ok: false, error: "unauthenticated" });
 
     // If session contains an explicit company_id, return only that company
     if (authSession.company_id) {
-      const { rows } = await q(
-        `SELECT id, name, logo_url, tenant_id, enabled
-           FROM public.company
-          WHERE id = $1
-          LIMIT 1`,
+      const { rows: rowsRaw } = await q(
+        `SELECT id, name, logo_url, tenant_id, enabled FROM public.company WHERE id = $1 LIMIT 1`,
         [authSession.company_id]
       );
-      return res.json({ companies: rows || [] });
+      const rows = normaliseRows(rowsRaw);
+      return res.json({ ok: true, companies: rows });
     }
 
     // Otherwise, fall back to tenant-based listing
-    const tenantId = authSession.tenant_id || null;
+    let effectiveTenantId = authSession.tenant_id || null;
 
-    // If tenant not present in session, try to fetch tenant from app_user as a last resort
-    let effectiveTenantId = tenantId;
     if (!effectiveTenantId) {
-      const { rows: userRows } = await q(`SELECT tenant_id FROM public.app_user WHERE id = $1 LIMIT 1`, [authSession.user_id]);
-      if (userRows && userRows.length) effectiveTenantId = userRows[0].tenant_id || null;
+      // last resort: try to read from app_user
+      const userTenantRes = await q(`SELECT tenant_id FROM public.app_user WHERE id = $1 LIMIT 1`, [authSession.user_id]);
+      const rows = normaliseRows(userTenantRes);
+      if (rows && rows.length) effectiveTenantId = rows[0].tenant_id || null;
     }
 
-    if (!effectiveTenantId) return res.status(400).json({ error: "no_tenant_in_session" });
+    if (!effectiveTenantId) return res.status(400).json({ ok: false, error: "no_tenant_in_session" });
 
-    // Pagination / safety limit
     const LIMIT = 200;
-    const { rows } = await q(
+    const compsRes = await q(
       `SELECT id, name, logo_url, tenant_id, enabled
          FROM public.company
         WHERE tenant_id = $1
@@ -187,11 +210,15 @@ router.get("/user/companies", requireAuth, async (req: any, res) => {
         LIMIT $2`,
       [effectiveTenantId, LIMIT]
     );
+    const comps = normaliseRows(compsRes);
 
-    return res.json({ companies: rows || [] });
-  } catch (err) {
-    console.error("GET /user/companies error:", err);
-    return res.status(500).json({ error: "server_error" });
+    return res.json({ ok: true, companies: comps });
+  } catch (err: any) {
+    console.error("GET /user/companies error:", err?.stack || err);
+    if (process.env.NODE_ENV !== "production") {
+      return res.status(500).json({ ok: false, error: "server_error", detail: String(err?.message || err) });
+    }
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
