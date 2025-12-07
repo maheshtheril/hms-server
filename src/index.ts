@@ -1,5 +1,5 @@
 // server/src/index.ts
-import debugMeRouter from "./routes/debugMe";
+
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -152,7 +152,7 @@ app.get("/api/_routes", (_req, res) => {
   }
 });
 // === end debug routes ===
-app.use("/api", debugMeRouter);
+
 
 app.use(
   cors({
@@ -212,6 +212,8 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+import debugMeRouter from "./routes/debugMe";   // top-of-file import ok
+app.use("/api", debugMeRouter);
 
 app.use(sessionLoader);
 
