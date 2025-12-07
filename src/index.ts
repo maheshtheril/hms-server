@@ -188,8 +188,11 @@ app.use("/api/kpis", kpisRouter);
 app.use("/api/tenant/dashboard", tenantDashboardRouter);
 app.use("/api/company/dashboard", companyDashboardRouter);
 
+
+
 /* ───────────────────────────── Parsers BEFORE routes ───────────────────────────── */
 app.use(cookieParser());
+
 // --- FIX: accept legacy cookie 'erp_session' as valid session cookie ---
 const CANONICAL_COOKIE_NAME =
   process.env.SESSION_COOKIE_NAME ||
@@ -212,10 +215,10 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+app.use(sessionLoader);
 import debugMeRouter from "./routes/debugMe";   // top-of-file import ok
 app.use("/api", debugMeRouter);
 
-app.use(sessionLoader);
 
 app.use("/api/auth/signup", signupRouter);
 app.use("/api", coreRouter);
