@@ -2,13 +2,12 @@
  * server/src/routes/hms/products.ts
  * Express router for hms_product (list, get, create, update, soft-delete)
  *
- * Matches DB schema for public.hms_product (see schema you provided).
+ * Improved POST /: idempotent create + optional initial_stock (batch + ledger) in one transaction.
  */
 
 import { Router, Request } from "express";
 import { pool } from "../../db";
 import sessionLoader from "../../middleware/sessionLoader";
-
 
 const router = Router();
 const DEBUG = true;
@@ -59,11 +58,6 @@ router.param("id", (req, res, next, id) => {
 
 /* -------------------------
  * GET /api/hms/products
- * Query params:
- *  - company_id (required by frontend)
- *  - q (search name or sku)
- *  - page (1), limit (default 100)
- *  - include_deleted=1
  */
 router.get("/", sessionLoader.requireSession, async (req, res) => {
   const r = req as any;
@@ -180,8 +174,10 @@ router.get("/:id", sessionLoader.requireSession, async (req, res) => {
 
 /* -------------------------
  * POST /api/hms/products
- * Body: sku, name, company_id, description?, price?, currency?, is_stockable?
- * requires session; tenant comes from session
+ * Idempotent create + optional initial_stock (single batch + ledger) in same transaction.
+ *
+ * Accepts optional Idempotency-Key header (preferred) or idempotency_key in body.
+ * Optional body.initial_stock = { qty, batch_no?, expiry?, cost?, mrp?, vendor_barcode?, internal_barcode?, location?, metadata? }
  */
 router.post("/", sessionLoader.requireSession, async (req, res) => {
   const r = req as any;
@@ -191,6 +187,9 @@ router.post("/", sessionLoader.requireSession, async (req, res) => {
   const userId = safeUUID(session?.user_id ?? user?.id) ?? null;
 
   if (!tenantId || !userId) return res.status(401).json({ error: "unauthenticated" });
+
+  // idempotency key: prefer header, fallback to body
+  const idempKey = (String(req.header("Idempotency-Key") || req.body?.idempotency_key || "").trim()) || null;
 
   const sku = (req.body?.sku ?? "").toString().trim();
   const name = (req.body?.name ?? "").toString().trim();
@@ -204,6 +203,7 @@ router.post("/", sessionLoader.requireSession, async (req, res) => {
   const currency = (req.body?.currency ?? "USD").toString();
   const default_cost = typeof req.body?.default_cost !== "undefined" ? Number(req.body.default_cost) : 0;
   const metadata = req.body?.metadata ?? {};
+  const initialStock = req.body?.initial_stock ?? null; // optional object
 
   if (!sku) return res.status(400).json({ error: "sku_required" });
   if (!name) return res.status(400).json({ error: "name_required" });
@@ -211,13 +211,77 @@ router.post("/", sessionLoader.requireSession, async (req, res) => {
 
   const cx = await pool.connect();
   try {
-    // ensure company belongs to tenant
+    // Verify company belongs to tenant
     const compCheck = await cx.query(
       `SELECT id FROM public.company WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
       [companyId, tenantId]
     );
     if (!compCheck.rows.length) return res.status(403).json({ error: "forbidden_company" });
 
+    // If idempotency key provided, check prior outcome before heavy work
+    if (idempKey) {
+      const ik = await cx.query(
+        `SELECT id, processed_at, response_status, response_body
+         FROM public.hms_idempotency_keys
+         WHERE tenant_id = $1 AND key_text = $2
+         LIMIT 1`,
+        [tenantId, idempKey]
+      );
+      if (ik.rows.length) {
+        const row = ik.rows[0];
+        if (row.processed_at) {
+          // replay stored response
+          const status = row.response_status ?? 200;
+          const body = row.response_body ?? { ok: true };
+          return res.status(status).json(body);
+        }
+        // key exists but not processed -> continue (we'll take locks inside transaction)
+      }
+    }
+
+    // Begin tx
+    await cx.query("BEGIN");
+
+    // Insert or lock idempotency row (if provided)
+    let idempRowId: string | null = null;
+    if (idempKey) {
+      // try insert; if conflict, SELECT FOR UPDATE to wait other concurrent worker
+      const ikInsSql = `
+        INSERT INTO public.hms_idempotency_keys
+          (tenant_id, key_text, created_by, created_at, request_method, request_path, request_body)
+        VALUES ($1,$2,$3, now(), $4, $5, $6)
+        ON CONFLICT (tenant_id, key_text) DO NOTHING
+        RETURNING id
+      `;
+      const ikRes = await cx.query(ikInsSql, [
+        tenantId,
+        idempKey,
+        userId,
+        String(req.method ?? "POST"),
+        String(req.path ?? req.url ?? "/api/hms/products"),
+        req.body ?? {},
+      ]);
+      if (ikRes.rows.length) {
+        idempRowId = ikRes.rows[0].id;
+      } else {
+        // existing row -> lock it so parallel requests wait here and then replay stored response
+        const locked = await cx.query(
+          `SELECT id, processed_at, response_status, response_body FROM public.hms_idempotency_keys WHERE tenant_id=$1 AND key_text=$2 LIMIT 1 FOR UPDATE`,
+          [tenantId, idempKey]
+        );
+        if (locked.rows.length) {
+          const lr = locked.rows[0];
+          if (lr.processed_at) {
+            // already processed by other worker -> commit and replay
+            await cx.query("COMMIT");
+            return res.status(lr.response_status ?? 200).json(lr.response_body ?? { ok: true });
+          }
+          idempRowId = lr.id;
+        }
+      }
+    }
+
+    // Insert product
     const insertSql = `
       INSERT INTO public.hms_product
         (tenant_id, company_id, sku, name, description, is_stockable, is_service, uom, valuation_method, price, currency, default_cost, metadata, created_at, created_by, is_active)
@@ -228,16 +292,109 @@ router.post("/", sessionLoader.requireSession, async (req, res) => {
     `;
     const params = [tenantId, companyId, sku, name, description, is_stockable, is_service, uom, valuation_method, price, currency, default_cost, metadata, userId];
 
+    let productRow;
     try {
       const { rows } = await cx.query(insertSql, params);
-      return res.status(201).json({ ok: true, data: rows[0] });
+      productRow = rows[0];
     } catch (e: any) {
-      if (e?.code === "23505") return res.status(409).json({ error: "duplicate_sku" });
+      if (e?.code === "23505") {
+        // duplicate SKU - rollback and return 409
+        await cx.query("ROLLBACK");
+        return res.status(409).json({ error: "duplicate_sku" });
+      }
       throw e;
     }
+
+    // Optionally seed initial stock (single batch + ledger) inside same tx
+    const insertedBatches: any[] = [];
+    if (is_stockable && initialStock && typeof initialStock.qty !== "undefined" && Number(initialStock.qty) > 0) {
+      const qty = Number(initialStock.qty);
+      const batchNo = (initialStock.batch_no ?? `INIT-${Date.now()}`).toString();
+      const expiry = initialStock.expiry ?? null;
+      const batchCost = typeof initialStock.cost !== "undefined" ? Number(initialStock.cost) : default_cost;
+      const mrp = typeof initialStock.mrp !== "undefined" ? Number(initialStock.mrp) : null;
+      const vendorBarcode = initialStock.vendor_barcode ?? null;
+      const internalBarcode = initialStock.internal_barcode ?? null;
+      const batchMetadata = initialStock.metadata ?? {};
+
+      const batchSql = `
+        INSERT INTO public.hms_product_batch
+          (tenant_id, company_id, product_id, batch_no, expiry_date, mrp, cost, qty_on_hand, vendor_barcode, internal_barcode, created_at, created_by, metadata)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now(), $11, $12)
+        RETURNING id, batch_no, qty_on_hand, cost
+      `;
+      const batchParams = [tenantId, companyId, productRow.id, batchNo, expiry, mrp, batchCost, qty, vendorBarcode, internalBarcode, userId, batchMetadata];
+      const bRes = await cx.query(batchSql, batchParams);
+      const batchRow = bRes.rows[0];
+      insertedBatches.push(batchRow);
+
+      // Compute running balance for product by summing change_qty in ledger
+      const balRes = await cx.query(
+        `SELECT COALESCE(SUM(change_qty),0)::numeric AS bal FROM public.hms_product_stock_ledger WHERE tenant_id=$1 AND company_id=$2 AND product_id=$3`,
+        [tenantId, companyId, productRow.id]
+      );
+      const previousBalance = Number(balRes.rows?.[0]?.bal ?? 0);
+      const newBalance = previousBalance + qty;
+
+      const ledgerSql = `
+        INSERT INTO public.hms_product_stock_ledger
+          (tenant_id, company_id, product_id, location, change_qty, balance_qty, movement_type, reference, cost, created_at, created_by, metadata, batch_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now(), $10, $11, $12)
+        RETURNING id
+      `;
+      const ledgerParams = [
+        tenantId,
+        companyId,
+        productRow.id,
+        initialStock.location ?? null,
+        qty,
+        newBalance,
+        "initial",
+        `initial_batch:${batchRow.batch_no}`,
+        batchCost,
+        userId,
+        { source: "product_create" },
+        batchRow.id,
+      ];
+      await cx.query(ledgerSql, ledgerParams);
+    }
+
+    // commit tx
+    await cx.query("COMMIT");
+
+    // Build response body including seeded batches (if any)
+    const responseBody = { ok: true, data: { ...productRow, batches: insertedBatches } };
+    const responseStatus = 201;
+
+    // Persist idempotency response (best-effort): update idempotency row to mark processed and store response
+    if (idempKey) {
+      try {
+        const scx = await pool.connect();
+        try {
+          await scx.query("BEGIN");
+          await scx.query(
+            `UPDATE public.hms_idempotency_keys
+             SET response_status = $1, response_body = $2, processed_at = now(), processed_by = $3
+             WHERE tenant_id = $4 AND key_text = $5`,
+            [responseStatus, responseBody, userId, tenantId, idempKey]
+          );
+          await scx.query("COMMIT");
+        } catch (e) {
+          try { await scx.query("ROLLBACK"); } catch {} // ignore
+          console.error("Failed to persist idempotency result:", e);
+        } finally {
+          scx.release();
+        }
+      } catch (e) {
+        console.error("Idempotency persistence outer error:", e);
+      }
+    }
+
+    return res.status(responseStatus).json(responseBody);
   } catch (err: any) {
-    console.error("[POST /api/hms/products] error:", err);
-    return res.status(500).json({ error: "internal_server_error" });
+    try { await cx.query("ROLLBACK"); } catch (e) { /* ignore */ }
+    console.error("[POST /api/hms/products] improved create error:", err);
+    return res.status(500).json({ error: "internal_server_error", detail: err?.message });
   } finally {
     cx.release();
   }
@@ -245,8 +402,7 @@ router.post("/", sessionLoader.requireSession, async (req, res) => {
 
 /* -------------------------
  * PUT /api/hms/products/:id
- * Body: mutable fields (sku, name, description, price, currency, is_stockable, is_service, metadata)
- * requireSession
+ * (unchanged update behavior)
  */
 router.put("/:id", sessionLoader.requireSession, async (req, res) => {
   const id = (req.params as any)._validatedId;
