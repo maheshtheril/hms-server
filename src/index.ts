@@ -31,6 +31,8 @@ import uploadsRouter from "./routes/uploads";
 import checkEmail from "./routes/check-email";
 import kpisTodaysRouter from "./routes/kpis_todays";
 import kpisRouter from "./routes/kpis";
+import taxCodesRouter from "./routes/taxCodes";
+
 import hmsDepartments from "./routes/hmsDepartments";
 import hmsSettingsRouter from "./routes/hmsSettings";
 import hmsPatientsRouter from "./routes/hmsPatients";
@@ -219,6 +221,7 @@ app.use(sessionLoader);
 import debugMeRouter from "./routes/debugMe";   // top-of-file import ok
 app.use("/api", debugMeRouter);
 
+app.use("/api/hms", taxCodesRouter);
 
 //app.use("/api/auth/signup", signupRouter);
 app.use("/api", coreRouter);
