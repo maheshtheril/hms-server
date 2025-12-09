@@ -13,6 +13,7 @@ import {
 import rateLimitSignup from "../../../middleware/rateLimitSignup";
 import domainTenantPolicy from "../../../lib/domainTenantPolicy";
 import { createVerificationToken, sendVerificationEmail } from "../../../lib/emailVerification";
+import { loadCompanyTaxesFromCountry } from "../../../lib/taxLoader"; // <-- NEW: tax auto-loader
 
 const router = Router();
 
@@ -360,6 +361,17 @@ export async function signupHandler(req: Request, res: Response) {
         `,
         [tenantId, companyId, currencyId, resolvedCountryId]
       );
+
+      // ---------- NEW: Attempt to auto-load taxes from country into company_tax_maps ----------
+      try {
+        // idempotent and non-fatal — uses same client/tx
+        await loadCompanyTaxesFromCountry(client, tenantId, companyId, resolvedCountryId, { setDefaults: true });
+        console.debug("[signup] loadCompanyTaxesFromCountry completed (if any mappings exist)");
+      } catch (e) {
+        console.error("[signup] tax auto-loader failed (non-fatal):", e?.message || e);
+        // continue — tax loader failure should not block signup
+      }
+      // -----------------------------------------------------------------------
 
       try {
         const u = await q(
