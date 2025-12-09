@@ -13,8 +13,9 @@ import {
 import rateLimitSignup from "../../../middleware/rateLimitSignup";
 import domainTenantPolicy from "../../../lib/domainTenantPolicy";
 import { createVerificationToken, sendVerificationEmail } from "../../../lib/emailVerification";
-import { loadCompanyTaxesFromCountry } from "../../../lib/taxLoader"; // <-- NEW: tax auto-loader
+import { loadCompanyTaxesFromCountry } from "../../../lib/taxLoader"; // <-- tax auto-loader (kept)
 
+// Router
 const router = Router();
 
 console.info("[signup.ts] module loaded");
@@ -25,12 +26,14 @@ async function q(client: any, text: string, params: any[] = []) {
     return await client.query(text, params);
   } catch (err: any) {
     try {
-      console.error(
-        "[pg][query_error]",
-        text,
+      const meta = {
+        sql: text,
         params,
-        JSON.stringify(err, Object.getOwnPropertyNames(err))
-      );
+        errMessage: err?.message,
+        errCode: err?.code,
+        stack: err?.stack,
+      };
+      console.error("[pg][query_error]", JSON.stringify(meta, Object.getOwnPropertyNames(meta)));
     } catch (e) {
       console.error("[pg][query_error] fallback", text, params, err);
     }
@@ -193,14 +196,10 @@ function cookieOptions() {
 
 /* ============================================================
    SIGNUP HANDLER
-   Behavior change: only include "redirect" in JSON when an
-   incoming cookie for the canonical name is already present.
-   If the request did not contain a cookie (fresh browser),
-   server STILL calls res.cookie(...) to set the session, but
-   will NOT include redirect in the payload. This prevents an
-   automatic client-side navigation before the browser stores
-   the Set-Cookie header.
-============================================================ */
+   Behavior: only include "redirect" in JSON when an incoming cookie
+   for the canonical name is already present (prevents client redirect
+   before browser stores Set-Cookie).
+ =========================================================== */
 export async function signupHandler(req: Request, res: Response) {
   console.info("[signup] invoked");
 
@@ -362,16 +361,9 @@ export async function signupHandler(req: Request, res: Response) {
         [tenantId, companyId, currencyId, resolvedCountryId]
       );
 
-      // ---------- NEW: Attempt to auto-load taxes from country into company_tax_maps ----------
-      try {
-        // idempotent and non-fatal — uses same client/tx
-        await loadCompanyTaxesFromCountry(client, tenantId, companyId, resolvedCountryId, { setDefaults: true });
-        console.debug("[signup] loadCompanyTaxesFromCountry completed (if any mappings exist)");
-      } catch (e) {
-        console.error("[signup] tax auto-loader failed (non-fatal):", e?.message || e);
-        // continue — tax loader failure should not block signup
-      }
-      // -----------------------------------------------------------------------
+      // NOTE: tax auto-loader used to run inside this transaction. That caused
+      // 'current transaction is aborted' when the autoloader failed. We no longer
+      // run it inside the signup TX. We'll trigger it post-commit (see below).
 
       try {
         const u = await q(
@@ -413,6 +405,57 @@ export async function signupHandler(req: Request, res: Response) {
       }
       return res.status(500).json({ error: "signup_failed" });
     }
+
+    // ------------------ POST-COMMIT: tax autoloader (separate client) ------------------
+    // Run asynchronously so it cannot affect the signup TX.
+    (async () => {
+      let tclient: any | null = null;
+      try {
+        tclient = await pool.connect();
+        await tclient.query("BEGIN");
+        // call loader using this dedicated client - loader should accept a client or use pool internally.
+        // If your loadCompanyTaxesFromCountry expects a client from calling site, prefer passing `tclient`.
+        // If it uses pool internally, the loader is still safe to call; here we attempt the client-based call.
+        if (typeof loadCompanyTaxesFromCountry === "function") {
+          // prefer client-aware API if available
+          try {
+            // If your loader signature is (client, tenantId, companyId, countryId, opts)
+            // change accordingly. We try to call with client first; fallback to pool-based call.
+            // @ts-ignore
+            const maybe = loadCompanyTaxesFromCountry.length >= 4;
+            if (maybe) {
+              // call with client
+              // @ts-ignore
+              await loadCompanyTaxesFromCountry(tclient, tenantId, companyId, resolvedCountryId, { setDefaults: true });
+            } else {
+              // fallback: call loader (which may use pool internally)
+              // @ts-ignore
+              await loadCompanyTaxesFromCountry(tenantId, companyId, resolvedCountryId, { setDefaults: true });
+            }
+          } catch (innerErr) {
+            // loader-specific error — log and rollback only the loader's client transaction
+            console.error("[signup][tax-autoloader] loader call error:", innerErr && (innerErr.stack || innerErr.message || innerErr));
+            await tclient.query("ROLLBACK").catch(()=>{});
+            return;
+          }
+        } else {
+          console.warn("[signup][tax-autoloader] loadCompanyTaxesFromCountry not a function");
+          await tclient.query("ROLLBACK").catch(()=>{});
+          return;
+        }
+
+        await tclient.query("COMMIT");
+        console.info("[signup] tax auto-loader: completed post-commit (company tax mappings seeded if any)");
+      } catch (tErr) {
+        try {
+          console.error("[signup] tax auto-loader failed (post-commit):", tErr && (tErr.stack || tErr.message || tErr));
+          await tclient?.query("ROLLBACK").catch(()=>{});
+        } catch (ignored) {}
+      } finally {
+        if (tclient) tclient.release();
+      }
+    })();
+    // -------------------------------------------------------------------------
 
     /* 9) async verification email */
     (async () => {
