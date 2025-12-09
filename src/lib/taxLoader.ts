@@ -1,24 +1,20 @@
 // server/src/lib/taxLoader.ts
 import { PoolClient } from "pg";
 
-/**
- * Loader adapted to your schema:
- * - inserts into company_tax_maps (tenant_id, company_id, country_id, tax_type_id, tax_rate_id)
- * - is idempotent: if company_tax_maps rows exist for the company, returns them unchanged
- * - sets company_settings.default_tax_type_id/default_tax_rate_id if empty (first mapping)
- */
-
 export type CompanyTaxMapRow = {
   id: string;
   tenant_id: string;
   company_id: string;
   country_id: string | null;
   tax_type_id: string;
-  tax_rate_id: string;
+  tax_rate_id: string | null;
   is_default: boolean;
   created_at: string | null;
 };
 
+/**
+ * Return existing company tax maps (ordered).
+ */
 export async function getCompanyTaxMaps(client: PoolClient, companyId: string): Promise<CompanyTaxMapRow[]> {
   const q = `
     SELECT ctm.id, ctm.tenant_id, ctm.company_id, ctm.country_id,
@@ -32,74 +28,57 @@ export async function getCompanyTaxMaps(client: PoolClient, companyId: string): 
 }
 
 /**
- * Load company tax maps from country-level/global tax tables.
- * - client: PoolClient (use same connection/tx as signup)
- * - tenantId: tenant UUID (used when inserting company_tax_maps)
- * - companyId: company UUID
- * - countryId: address_country_id from company_settings
- * - opts.setDefaults: if true, attempt to populate company_settings.default_tax_type_id / default_tax_rate_id
+ * Robust loader:
+ * - If company already has maps -> return them (idempotent)
+ * - For each active tax_type, pick the first active tax_rate (lowest rate)
+ * - Insert into company_tax_maps (ignore duplicate key errors)
+ * - Optionally set company_settings defaults to first inserted mapping
  */
 export async function loadCompanyTaxesFromCountry(
   client: PoolClient,
   tenantId: string,
   companyId: string,
-  countryId: string,
+  countryId: string | null,
   opts?: { setDefaults?: boolean }
 ): Promise<CompanyTaxMapRow[]> {
-  // 1) if company already has maps, return them (idempotent)
+  // 1) idempotent check
   const existing = await getCompanyTaxMaps(client, companyId);
   if (existing.length > 0) return existing;
 
-  // 2) collect candidate tax_type_id/tax_rate_id pairs
+  // 2) collect tax types + one rate each (country-agnostic to avoid schema assumptions)
+  // For each tax_type, pick one active tax_rate if any (lowest rate)
   const candidates: Array<{ tax_type_id: string; tax_rate_id: string | null }> = [];
 
-  // Strategy A: tax_rates that link to tax_types — prefer those where tax_rates/tax_types mention the country (if your schema has country_id on them)
   try {
     const r = await client.query(
       `
-      SELECT tt.id AS tax_type_id, tr.id AS tax_rate_id
+      SELECT tt.id AS tax_type_id,
+             (SELECT id FROM tax_rates tr
+                WHERE tr.tax_type_id = tt.id
+                  AND (tr.is_active IS TRUE OR tr.is_active IS NULL)
+                ORDER BY tr.rate ASC
+                LIMIT 1) AS tax_rate_id
       FROM tax_types tt
-      LEFT JOIN tax_rates tr ON tr.tax_type_id = tt.id
-      WHERE (tt.is_active IS TRUE OR tt.is_active IS NULL)
-        AND (tr.is_active IS TRUE OR tr.is_active IS NULL)
-        AND (tr.country_id = $1 OR tt.country_id = $1)
-      ORDER BY tt.name, tr.rate
-      LIMIT 20
-    `,
-      [countryId]
-    );
-    if (r.rowCount > 0) {
-      for (const row of r.rows) candidates.push({ tax_type_id: row.tax_type_id, tax_rate_id: row.tax_rate_id || null });
-    }
-  } catch (err) {
-    // If columns like country_id don't exist on tax_rates/tax_types, query will error — ignore and continue
-    // console.warn("[taxLoader] strategyA failed:", err?.message || err);
-  }
-
-  // Strategy B: if nothing found, try any tax_types + their first active rate
-  if (candidates.length === 0) {
-    const r2 = await client.query(
-      `
-      SELECT tt.id AS tax_type_id, tr.id AS tax_rate_id
-      FROM tax_types tt
-      LEFT JOIN LATERAL (
-        SELECT id FROM tax_rates tr2
-        WHERE tr2.tax_type_id = tt.id AND (tr2.is_active IS TRUE OR tr2.is_active IS NULL)
-        ORDER BY tr2.rate LIMIT 1
-      ) tr ON true
       WHERE (tt.is_active IS TRUE OR tt.is_active IS NULL)
       ORDER BY tt.name
-      LIMIT 10
+      LIMIT 20
     `
     );
-    for (const row of r2.rows) {
-      candidates.push({ tax_type_id: row.tax_type_id, tax_rate_id: row.tax_rate_id || null });
+
+    for (const row of r.rows) {
+      if (row.tax_type_id) {
+        candidates.push({ tax_type_id: row.tax_type_id, tax_rate_id: row.tax_rate_id || null });
+      }
     }
+  } catch (err) {
+    console.error("[taxLoader] failed to fetch tax_types/tax_rates:", err && (err.stack || err.message || err));
+    // If this fails for unexpected reasons, return empty (do not throw).
+    return [];
   }
 
   if (candidates.length === 0) return [];
 
-  // Deduplicate by tax_type_id
+  // Deduplicate by tax_type_id just in case
   const seen = new Set<string>();
   const dedup = candidates.filter((c) => {
     if (!c.tax_type_id) return false;
@@ -120,18 +99,19 @@ export async function loadCompanyTaxesFromCountry(
           (gen_random_uuid(), $1, $2, $3, $4, $5, $6, true, now(), now())
         RETURNING id, tenant_id, company_id, country_id, tax_type_id, tax_rate_id, is_default, created_at
       `,
-        [tenantId, companyId, countryId || null, cand.tax_type_id, cand.tax_rate_id || cand.tax_rate_id, i === 0] // mark first inserted as default
+        [tenantId, companyId, countryId || null, cand.tax_type_id, cand.tax_rate_id, i === 0]
       );
       if (res.rowCount > 0) {
         inserted.push(res.rows[0]);
       }
-    } catch (err) {
-      console.error("[taxLoader] insert company_tax_maps failed:", err?.message || err);
-      // continue with other inserts
+    } catch (err: any) {
+      // Unique constraint or FK issues may happen; log and continue.
+      console.warn("[taxLoader] insert company_tax_maps skipped/failed for tax_type:", cand.tax_type_id, "err:", err && (err.message || err));
+      // continue with others
     }
   }
 
-  // Optionally set company_settings defaults (if not already set)
+  // Optionally set defaults in company_settings (only if inserted something)
   if (opts?.setDefaults && inserted.length > 0) {
     try {
       const first = inserted[0];
@@ -146,11 +126,10 @@ export async function loadCompanyTaxesFromCountry(
         [first.tax_type_id, first.tax_rate_id || null, companyId]
       );
     } catch (err) {
-      console.error("[taxLoader] setting company_settings defaults failed:", err?.message || err);
+      console.warn("[taxLoader] failed to set company_settings defaults:", err && (err.message || err));
     }
   }
 
-  // return the inserted rows (or any now-existing maps)
   return await getCompanyTaxMaps(client, companyId);
 }
 

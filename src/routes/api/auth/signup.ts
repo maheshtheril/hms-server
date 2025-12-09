@@ -1,21 +1,19 @@
 // server/src/routes/api/auth/signup.ts
-// test-123
+// full updated signup handler (post-commit tax autoloader, robust logging)
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import { pool } from "../../../db";
 import {
   issueSession,
-  // keep other exports if you need them elsewhere in this file
   buildClearSessionCookie,
   SESSION_TTL_SECONDS,
 } from "../../../lib/session";
 import rateLimitSignup from "../../../middleware/rateLimitSignup";
 import domainTenantPolicy from "../../../lib/domainTenantPolicy";
 import { createVerificationToken, sendVerificationEmail } from "../../../lib/emailVerification";
-import { loadCompanyTaxesFromCountry } from "../../../lib/taxLoader"; // <-- tax auto-loader (kept)
+import { loadCompanyTaxesFromCountry } from "../../../lib/taxLoader";
 
-// Router
 const router = Router();
 
 console.info("[signup.ts] module loaded");
@@ -88,6 +86,7 @@ async function tryInsertTenantWithUniqueSlug(client: any, baseSlug: string, name
       );
       return { id: r.rows[0].id, slug: candidate };
     } catch (err: any) {
+      // unique violation -> try next candidate
       if (err && err.code === "23505") continue;
       throw err;
     }
@@ -174,7 +173,6 @@ async function resolveCurrencyForCountry(client: any, countryId: string): Promis
 }
 
 /* ------------------ Cookie helpers (express res.cookie) ------------------ */
-// Keep name consistent with other auth routes
 const COOKIE_NAME =
   (process.env.SESSION_COOKIE_NAME ||
     process.env.COOKIE_NAME_SID ||
@@ -186,20 +184,20 @@ const COOKIE_DOMAIN = (process.env.SESSION_COOKIE_DOMAIN || process.env.COOKIE_D
 function cookieOptions() {
   return {
     httpOnly: true,
-    secure: IS_PROD, // must be true (HTTPS) for SameSite=None to be accepted in browsers
+    secure: IS_PROD,
     sameSite: IS_PROD ? ("none" as const) : ("lax" as const),
     path: "/",
-    maxAge: Math.floor(SESSION_TTL_SECONDS * 1000), // milliseconds for res.cookie
+    maxAge: Math.floor(SESSION_TTL_SECONDS * 1000),
     ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
   } as const;
 }
 
-/* ============================================================
+/* ===========================================================
    SIGNUP HANDLER
-   Behavior: only include "redirect" in JSON when an incoming cookie
-   for the canonical name is already present (prevents client redirect
-   before browser stores Set-Cookie).
- =========================================================== */
+   - main signup DB work runs inside a TX.
+   - tax autoloader runs POST-COMMIT on a separate client so it cannot
+     abort the signup transaction.
+=========================================================== */
 export async function signupHandler(req: Request, res: Response) {
   console.info("[signup] invoked");
 
@@ -272,6 +270,7 @@ export async function signupHandler(req: Request, res: Response) {
     let tenantId: string;
     let companyId: string;
     let userId: string;
+    let resolvedCountryId: string;
 
     try {
       await q(client, "BEGIN");
@@ -281,7 +280,6 @@ export async function signupHandler(req: Request, res: Response) {
       tenantId = tenantRow.id;
 
       console.debug("[signup] resolveCountryUUID input countryId:", countryId);
-      let resolvedCountryId: string;
       try {
         resolvedCountryId = await resolveCountryUUID(client, countryId);
       } catch (err: any) {
@@ -361,10 +359,7 @@ export async function signupHandler(req: Request, res: Response) {
         [tenantId, companyId, currencyId, resolvedCountryId]
       );
 
-      // NOTE: tax auto-loader used to run inside this transaction. That caused
-      // 'current transaction is aborted' when the autoloader failed. We no longer
-      // run it inside the signup TX. We'll trigger it post-commit (see below).
-
+      // create primary admin user
       try {
         const u = await q(
           client,
@@ -407,43 +402,36 @@ export async function signupHandler(req: Request, res: Response) {
     }
 
     // ------------------ POST-COMMIT: tax autoloader (separate client) ------------------
-    // Run asynchronously so it cannot affect the signup TX.
+    // Run asynchronously so it cannot affect the signup TX. This uses a dedicated client and its own tx.
     (async () => {
       let tclient: any | null = null;
       try {
         tclient = await pool.connect();
+        // run loader in its own transaction so it either fully applies or rolls back local changes
         await tclient.query("BEGIN");
-        // call loader using this dedicated client - loader should accept a client or use pool internally.
-        // If your loadCompanyTaxesFromCountry expects a client from calling site, prefer passing `tclient`.
-        // If it uses pool internally, the loader is still safe to call; here we attempt the client-based call.
         if (typeof loadCompanyTaxesFromCountry === "function") {
-          // prefer client-aware API if available
           try {
-            // If your loader signature is (client, tenantId, companyId, countryId, opts)
-            // change accordingly. We try to call with client first; fallback to pool-based call.
-            // @ts-ignore
-            const maybe = loadCompanyTaxesFromCountry.length >= 4;
-            if (maybe) {
-              // call with client
-              // @ts-ignore
-              await loadCompanyTaxesFromCountry(tclient, tenantId, companyId, resolvedCountryId, { setDefaults: true });
+            // Prefer client-aware loader signature (client, tenantId, companyId, countryId, opts)
+            // If loader expects (tenantId, companyId, countryId, opts) it should still work as fallback.
+            // We'll attempt client-first, then fallback to pool-based call.
+            const fn = loadCompanyTaxesFromCountry as any;
+            if (fn.length >= 4) {
+              // client-aware
+              await fn(tclient, tenantId, companyId, resolvedCountryId, { setDefaults: true });
             } else {
-              // fallback: call loader (which may use pool internally)
-              // @ts-ignore
-              await loadCompanyTaxesFromCountry(tenantId, companyId, resolvedCountryId, { setDefaults: true });
+              // pool-based fallback
+              await fn(tenantId, companyId, resolvedCountryId, { setDefaults: true });
             }
           } catch (innerErr) {
-            // loader-specific error — log and rollback only the loader's client transaction
             console.error("[signup][tax-autoloader] loader call error:", innerErr && (innerErr.stack || innerErr.message || innerErr));
             await tclient.query("ROLLBACK").catch(()=>{});
             return;
           }
         } else {
-          console.warn("[signup][tax-autoloader] loadCompanyTaxesFromCountry not a function");
+          console.warn("[signup][tax-autoloader] loadCompanyTaxesFromCountry not available");
           await tclient.query("ROLLBACK").catch(()=>{});
           return;
         }
-
         await tclient.query("COMMIT");
         console.info("[signup] tax auto-loader: completed post-commit (company tax mappings seeded if any)");
       } catch (tErr) {
@@ -465,18 +453,11 @@ export async function signupHandler(req: Request, res: Response) {
       } catch (_) {}
     })();
 
-    /* 10) SESSION COOKIE — CREATE SESSION (match login behavior: issueSession + res.cookie)
-       IMPORTANT: Only include `redirect` in JSON if the incoming request already had a valid cookie
-       for the canonical cookie name. This prevents client-side redirects when browser hasn't stored
-       the Set-Cookie header yet.
-    */
+    /* 10) SESSION COOKIE — CREATE SESSION + response */
     try {
-      // create SID via canonical DB helper (issueSession keeps logic centralized)
       const sid = await issueSession(userId, tenantId ?? null, companyId ?? null);
 
-      // set cookie via express helper (matches your /login path)
       try {
-        // set cookie explicitly WITHOUT domain (host-only) to avoid cross-tenant .onrender.com problem
         const cookieOpts = {
           httpOnly: true,
           secure: IS_PROD || ((req as any) && ((req as any).secure || (req as any).headers["x-forwarded-proto"] === "https")),
@@ -488,7 +469,6 @@ export async function signupHandler(req: Request, res: Response) {
 
         res.cookie(COOKIE_NAME, sid, cookieOpts);
 
-        // helpful debug header in non-prod so you can see cookie details in the response headers
         if (process.env.NODE_ENV !== "production") {
           res.setHeader("X-Debug-Set-Cookie", `${COOKIE_NAME}=${sid}; domain=${COOKIE_DOMAIN || "host-only"}; samesite=${IS_PROD ? "None" : "Lax"}`);
         }
@@ -497,7 +477,6 @@ export async function signupHandler(req: Request, res: Response) {
         return res.status(500).json({ error: "session_cookie_failed", detail: String(cErr?.message || cErr) });
       }
 
-      // sanity readback for debug (log, but don't fail the request if this readback fails)
       try {
         const sBack = await pool.query("SELECT sid, tenant_id, company_id, user_id, created_at FROM sessions WHERE sid = $1", [sid]);
         console.info("[signup] session readback after insert:", sBack.rows[0]);
@@ -505,11 +484,8 @@ export async function signupHandler(req: Request, res: Response) {
         console.error("[signup] session readback failed after insert (non-fatal):", rbErr);
       }
 
-      // Determine whether incoming request already contained the cookie.
-      // If it did, it's safe to include `redirect` because the browser already had cookies enabled.
       const incomingCookiePresent = Boolean((req as any).cookies && (req as any).cookies[COOKIE_NAME]);
 
-      // prepare base payload
       const basePayload: any = {
         ok: true,
         tenantId,
@@ -518,7 +494,6 @@ export async function signupHandler(req: Request, res: Response) {
         sid,
       };
 
-      // only include redirect when incoming cookie was present
       if (incomingCookiePresent) {
         basePayload.redirect = "/tenant/onboarding/hms";
       }
