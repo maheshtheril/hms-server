@@ -12,7 +12,7 @@ import {
 import rateLimitSignup from "../../../middleware/rateLimitSignup";
 import domainTenantPolicy from "../../../lib/domainTenantPolicy";
 import { createVerificationToken, sendVerificationEmail } from "../../../lib/emailVerification";
-import { loadCompanyTaxesFromCountry } from "../../../lib/taxLoader";
+import { loadCompanyTaxesFromCountry as importedLoadCompanyTaxesFromCountry } from "../../../lib/taxLoader";
 
 const router = Router();
 
@@ -402,36 +402,106 @@ export async function signupHandler(req: Request, res: Response) {
     }
 
     // ------------------ POST-COMMIT: tax autoloader (separate client) ------------------
-    // Run asynchronously so it cannot affect the signup TX. This uses a dedicated client and its own tx.
     (async () => {
       let tclient: any | null = null;
       try {
         tclient = await pool.connect();
+
+        // ensure the tenant/company/country context is visible and check the auto-load flag
+        let shouldAutoLoad = true;
+        try {
+          const s = await q(
+            tclient,
+            `SELECT auto_load_taxes_from_country FROM company_settings WHERE company_id = $1 LIMIT 1`,
+            [companyId]
+          );
+          if (s.rowCount > 0) {
+            shouldAutoLoad = !!s.rows[0].auto_load_taxes_from_country;
+            console.debug(`[signup][tax-autoloader] company_settings.auto_load_taxes_from_country = ${shouldAutoLoad}`);
+          } else {
+            // no explicit company_settings row found (shouldn't happen because we inserted above),
+            // keep shouldAutoLoad = true as a conservative default so we attempt loader.
+            console.warn("[signup][tax-autoloader] no company_settings row found for company_id:", companyId);
+          }
+        } catch (flagErr) {
+          console.error("[signup][tax-autoloader] failed to read company_settings flag:", flagErr);
+          // fallthrough: allow loader attempt (defensive)
+        }
+
+        if (!shouldAutoLoad) {
+          console.info("[signup][tax-autoloader] skipping autoload because flag disabled for company:", companyId);
+          return;
+        }
+
         // run loader in its own transaction so it either fully applies or rolls back local changes
         await tclient.query("BEGIN");
-        if (typeof loadCompanyTaxesFromCountry === "function") {
+
+        // find the loader function robustly: prefer imported symbol, fallback to dynamic require/import
+        let fn: any = importedLoadCompanyTaxesFromCountry;
+        if (!fn) {
           try {
-            // Prefer client-aware loader signature (client, tenantId, companyId, countryId, opts)
-            // If loader expects (tenantId, companyId, countryId, opts) it should still work as fallback.
-            // We'll attempt client-first, then fallback to pool-based call.
-            const fn = loadCompanyTaxesFromCountry as any;
-            if (fn.length >= 4) {
-              // client-aware
-              await fn(tclient, tenantId, companyId, resolvedCountryId, { setDefaults: true });
-            } else {
-              // pool-based fallback
-              await fn(tenantId, companyId, resolvedCountryId, { setDefaults: true });
+            // Try require (CommonJS)
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const reqMod = require("../../../lib/taxLoader");
+            fn = reqMod && reqMod.loadCompanyTaxesFromCountry;
+            console.debug("[signup][tax-autoloader] loader discovered via require fallback");
+          } catch (reqErr) {
+            try {
+              // dynamic import fallback (ESM)
+              const imp = await import("../../../lib/taxLoader");
+              fn = imp && imp.loadCompanyTaxesFromCountry;
+              console.debug("[signup][tax-autoloader] loader discovered via dynamic import fallback");
+            } catch (impErr) {
+              // no loader available
+              console.warn("[signup][tax-autoloader] loadCompanyTaxesFromCountry not found via import/require");
             }
-          } catch (innerErr) {
-            console.error("[signup][tax-autoloader] loader call error:", innerErr && (innerErr.stack || innerErr.message || innerErr));
-            await tclient.query("ROLLBACK").catch(()=>{});
-            return;
           }
-        } else {
-          console.warn("[signup][tax-autoloader] loadCompanyTaxesFromCountry not available");
+        }
+
+        if (typeof fn !== "function") {
+          console.warn("[signup][tax-autoloader] loadCompanyTaxesFromCountry not available; skipping autoload");
           await tclient.query("ROLLBACK").catch(()=>{});
           return;
         }
+
+        // Log the context clearly for easier debugging in logs
+        console.info("[signup][tax-autoloader] START (tenant,company,country):", {
+          tenantId,
+          companyId,
+          resolvedCountryId,
+        });
+
+        // Attempt client-aware first; if the function signature is shorter, attempt fallback signatures.
+        const attemptLoader = async () => {
+          // Try the client-aware call if the function expects >=4 args
+          if (fn.length >= 4) {
+            return await fn(tclient, tenantId, companyId, resolvedCountryId, { setDefaults: true });
+          }
+          // else try pool/client-agnostic signatures
+          try {
+            return await fn(tenantId, companyId, resolvedCountryId, { setDefaults: true });
+          } catch (e) {
+            // as last fallback allow (tenantId, companyId, countryId) without opts
+            return await fn(tenantId, companyId, resolvedCountryId);
+          }
+        };
+
+        // Try loader with a single retry to handle transient issues (locks, race)
+        try {
+          await attemptLoader();
+        } catch (firstErr) {
+          console.error("[signup][tax-autoloader] first loader attempt failed:", firstErr && (firstErr.stack || firstErr.message || firstErr));
+          // retry once
+          try {
+            console.info("[signup][tax-autoloader] retrying loader once...");
+            await attemptLoader();
+          } catch (secondErr) {
+            console.error("[signup][tax-autoloader] second loader attempt FAILED:", secondErr && (secondErr.stack || secondErr.message || secondErr));
+            await tclient.query("ROLLBACK").catch(()=>{});
+            return;
+          }
+        }
+
         await tclient.query("COMMIT");
         console.info("[signup] tax auto-loader: completed post-commit (company tax mappings seeded if any)");
       } catch (tErr) {
@@ -440,7 +510,11 @@ export async function signupHandler(req: Request, res: Response) {
           await tclient?.query("ROLLBACK").catch(()=>{});
         } catch (ignored) {}
       } finally {
-        if (tclient) tclient.release();
+        try {
+          if (tclient) tclient.release();
+        } catch (releaseErr) {
+          console.error("[signup][tax-autoloader] failed to release tclient:", releaseErr);
+        }
       }
     })();
     // -------------------------------------------------------------------------
