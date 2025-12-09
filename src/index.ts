@@ -220,7 +220,7 @@ import debugMeRouter from "./routes/debugMe";   // top-of-file import ok
 app.use("/api", debugMeRouter);
 
 
-app.use("/api/auth/signup", signupRouter);
+//app.use("/api/auth/signup", signupRouter);
 app.use("/api", coreRouter);
 /* ───────────────────────────── Request logger ───────────────────────────── */
 app.use((req, _res, next) => {
@@ -252,6 +252,7 @@ app.post("/api/leads/__probe", (req, res) => {
 /* ───────────────────────────── Auth + Core APIs ───────────────────────────── */
 // Note: auth is NOT under /api by design (web rewrite maps /api/auth → /auth)
 app.use("/auth", auth);
+app.use("/auth/signup", signupRouter);
 app.use("/api/check-email", checkEmail);
 
 app.use("/api", kpisTodaysRouter);
