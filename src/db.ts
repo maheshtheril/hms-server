@@ -3,63 +3,49 @@ import { Pool, PoolClient, QueryResult } from "pg";
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // you can add ssl or other pool options here if required
-  // ssl: { rejectUnauthorized: false },
+  // add ssl or other pool options if needed
 });
 
-// Basic typed query wrapper
-async function query<T = any>(text: string, params?: any[]): Promise<QueryResult<T>> {
+// Basic typed query wrapper (pg style)
+export async function query<T = any>(text: string, params?: any[]): Promise<QueryResult<T>> {
   return pool.query<T>(text, params);
 }
 
-// alias for some code that expects db.q(...)
-const q = query;
+// alias used in some files
+export const q = query;
 
-// pg-promise-like helpers
+// pg-promise-like helpers as named exports
 
-/**
- * any(sql, params) -> returns rows[]
- */
-async function any<T = any>(text: string, params?: any[]): Promise<T[]> {
+export async function any<T = any>(text: string, params?: any[]): Promise<T[]> {
   const res = await query<T>(text, params);
   return res.rows;
 }
 
-/**
- * one(sql, params) -> returns single row or throws if none
- */
-async function one<T = any>(text: string, params?: any[]): Promise<T> {
+export async function one<T = any>(text: string, params?: any[]): Promise<T> {
   const res = await query<T>(text, params);
   if (!res.rows || res.rows.length === 0) {
     throw new Error("No data returned (one) for query: " + text);
   }
-  return res.rows[0];
+  return res.rows[0] as T;
 }
 
-/**
- * oneOrNone(sql, params) -> returns single row or null
- */
-async function oneOrNone<T = any>(text: string, params?: any[]): Promise<T | null> {
+export async function oneOrNone<T = any>(text: string, params?: any[]): Promise<T | null> {
   const res = await query<T>(text, params);
   if (!res.rows || res.rows.length === 0) return null;
-  return res.rows[0];
+  return res.rows[0] as T;
 }
 
-/**
- * none(sql, params) -> execute and return void
- */
-async function none(text: string, params?: any[]): Promise<void> {
+export async function none(text: string, params?: any[]): Promise<void> {
   await query(text, params);
   return;
 }
 
 /**
- * Transaction helper: tx(async (t) => { await t.none(...); const r = await t.one(...); })
- *
- * The callback receives a lightweight client object with the same helper methods:
- * { query, any, one, oneOrNone, none, rawClient }
+ * tx(fn) -> run a transaction and provide a client-bound helper object
+ * Usage:
+ *   await tx(async (t) => { const row = await t.one(...); await t.none(...); });
  */
-async function tx<T = any>(fn: (t: {
+export async function tx<T = any>(fn: (t: {
   query: typeof query;
   q: typeof q;
   any: typeof any;
@@ -71,10 +57,10 @@ async function tx<T = any>(fn: (t: {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    // create wrapper bound to this client
+
     const boundQuery = async <R = any>(text: string, params?: any[]) => client.query<R>(text, params);
 
-    const txHelpers = {
+    const helpers = {
       query: boundQuery,
       q: boundQuery,
       any: async <R = any>(text: string, params?: any[]) => {
@@ -99,7 +85,7 @@ async function tx<T = any>(fn: (t: {
       rawClient: client,
     };
 
-    const result = await fn(txHelpers);
+    const result = await fn(helpers);
     await client.query("COMMIT");
     return result;
   } catch (err) {
@@ -114,10 +100,10 @@ async function tx<T = any>(fn: (t: {
   }
 }
 
-// Export types for other modules that expect PoolClient
+// export PoolClient type and pool instance
 export { pool, PoolClient };
 
-// Default export — object with helpers (many files import default)
+// default export for modules doing `import db from "../db"`
 const db = {
   pool,
   query,
