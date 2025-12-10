@@ -1,109 +1,129 @@
 // server/src/db.ts
 import { Pool, PoolClient, QueryResult } from "pg";
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  // add ssl or other pool options if needed
+// -------------------------------
+// 1) SSL AUTO-DETECT LOGIC
+// -------------------------------
+const connectionString = process.env.DATABASE_URL || "";
+
+const needsSSL =
+  connectionString.includes("sslmode=require") ||
+  process.env.PGSSLMODE === "require" ||
+  process.env.NODE_ENV === "production";
+
+// -------------------------------
+// 2) CREATE POOL FIRST (IMPORTANT)
+// -------------------------------
+export const pool = new Pool({
+  connectionString,
+  ...(needsSSL
+    ? {
+        ssl: {
+          rejectUnauthorized: false,
+        },
+      }
+    : {}),
 });
 
-// Basic typed query wrapper (pg style)
-export async function query<T = any>(text: string, params?: any[]): Promise<QueryResult<T>> {
+// -------------------------------
+// 3) BASE QUERY HELPERS
+// -------------------------------
+export async function query<T = any>(
+  text: string,
+  params?: any[]
+): Promise<QueryResult<T>> {
   return pool.query<T>(text, params);
 }
 
-// alias used in some files
+// alias for older code
 export const q = query;
 
-// pg-promise-like helpers as named exports
-
-export async function any<T = any>(text: string, params?: any[]): Promise<T[]> {
-  const res = await query<T>(text, params);
+// -------------------------------
+// 4) PG-PROMISE-STYLE HELPERS
+// -------------------------------
+export async function any<T = any>(sql: string, params?: any[]): Promise<T[]> {
+  const res = await query<T>(sql, params);
   return res.rows;
 }
 
-export async function one<T = any>(text: string, params?: any[]): Promise<T> {
-  const res = await query<T>(text, params);
-  if (!res.rows || res.rows.length === 0) {
-    throw new Error("No data returned (one) for query: " + text);
-  }
-  return res.rows[0] as T;
+export async function one<T = any>(sql: string, params?: any[]): Promise<T> {
+  const res = await query<T>(sql, params);
+  if (!res.rows.length) throw new Error("one(): no rows returned");
+  return res.rows[0];
 }
 
-export async function oneOrNone<T = any>(text: string, params?: any[]): Promise<T | null> {
-  const res = await query<T>(text, params);
-  if (!res.rows || res.rows.length === 0) return null;
-  return res.rows[0] as T;
+export async function oneOrNone<T = any>(
+  sql: string,
+  params?: any[]
+): Promise<T | null> {
+  const res = await query<T>(sql, params);
+  return res.rows.length ? res.rows[0] : null;
 }
 
-export async function none(text: string, params?: any[]): Promise<void> {
-  await query(text, params);
-  return;
+export async function none(sql: string, params?: any[]): Promise<void> {
+  await query(sql, params);
 }
 
-/**
- * tx(fn) -> run a transaction and provide a client-bound helper object
- * Usage:
- *   await tx(async (t) => { const row = await t.one(...); await t.none(...); });
- */
-export async function tx<T = any>(fn: (t: {
-  query: typeof query;
-  q: typeof q;
-  any: typeof any;
-  one: typeof one;
-  oneOrNone: typeof oneOrNone;
-  none: typeof none;
-  rawClient: PoolClient;
-}) => Promise<T>): Promise<T> {
+// -------------------------------
+// 5) TRANSACTION WRAPPER (tx)
+// -------------------------------
+export async function tx<T = any>(
+  fn: (t: {
+    query: typeof query;
+    q: typeof q;
+    any: typeof any;
+    one: typeof one;
+    oneOrNone: typeof oneOrNone;
+    none: typeof none;
+    rawClient: PoolClient;
+  }) => Promise<T>
+): Promise<T> {
   const client = await pool.connect();
+
   try {
     await client.query("BEGIN");
 
-    const boundQuery = async <R = any>(text: string, params?: any[]) => client.query<R>(text, params);
+    const boundQuery = async <R = any>(sql: string, params?: any[]) =>
+      client.query<R>(sql, params);
 
     const helpers = {
       query: boundQuery,
       q: boundQuery,
-      any: async <R = any>(text: string, params?: any[]) => {
-        const r = await boundQuery<R>(text, params);
-        return r.rows;
+      any: async <R = any>(sql: string, params?: any[]) => {
+        const res = await boundQuery<R>(sql, params);
+        return res.rows;
       },
-      one: async <R = any>(text: string, params?: any[]) => {
-        const r = await boundQuery<R>(text, params);
-        if (!r.rows || r.rows.length === 0) {
-          throw new Error("No data returned (one) for query: " + text);
-        }
-        return r.rows[0] as R;
+      one: async <R = any>(sql: string, params?: any[]) => {
+        const res = await boundQuery<R>(sql, params);
+        if (!res.rows.length) throw new Error("tx.one(): no rows returned");
+        return res.rows[0];
       },
-      oneOrNone: async <R = any>(text: string, params?: any[]) => {
-        const r = await boundQuery<R>(text, params);
-        if (!r.rows || r.rows.length === 0) return null;
-        return r.rows[0] as R;
+      oneOrNone: async <R = any>(sql: string, params?: any[]) => {
+        const res = await boundQuery<R>(sql, params);
+        return res.rows.length ? res.rows[0] : null;
       },
-      none: async (text: string, params?: any[]) => {
-        await boundQuery(text, params);
+      none: async (sql: string, params?: any[]) => {
+        await boundQuery(sql, params);
       },
       rawClient: client,
     };
 
     const result = await fn(helpers);
+
     await client.query("COMMIT");
+
     return result;
   } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch (rbErr) {
-      console.error("Rollback error", rbErr);
-    }
+    await client.query("ROLLBACK");
     throw err;
   } finally {
     client.release();
   }
 }
 
-// export PoolClient type and pool instance
-export { pool, PoolClient };
-
-// default export for modules doing `import db from "../db"`
+// -------------------------------
+// 6) DEFAULT EXPORT (for old code)
+// -------------------------------
 const db = {
   pool,
   query,
@@ -116,3 +136,6 @@ const db = {
 };
 
 export default db;
+
+// Export PoolClient type
+export { PoolClient };
