@@ -52,12 +52,14 @@ import leadPipelinesRouter from "./routes/leads/pipelines";
 import leadStagesRouter from "./routes/leads/stages";
 import leadIndustriesRouter from "./routes/leads/industries";
 import { leadsNewRouter } from "./routes/new/leads-new";
+import notificationsRouter from "./routes/notifications";
+
 
 
 /* ---- NEW imports added ---- */
 
 import companiesRouter from "./routes/hms/companies";
-import productsRouter from "./routes/hms/products";
+import productsRouter from "./routes/products";
 import settingsRouter from "./routes/settings";
 import globalCurrenciesRouter from "./routes/global/currencies";
 import globalTaxTypesRouter from "./routes/global/tax-types";
@@ -272,7 +274,7 @@ app.use("/api", kanban);
 /* ---- Mount session + HMS companies/products routers ---- */
 app.use("/api/session", sessionRouter);                 // GET /api/session
 app.use("/api/hms/companies", companiesRouter);         // GET /api/hms/companies
-app.use("/api/hms/products", productsRouter);           // GET /api/hms/products
+app.use("/api/products", productsRouter);           // GET /api/hms/products
 
 app.use("/api/settings", settingsRouter);
 
@@ -359,13 +361,14 @@ app.use("/api/hms/ai/tasks", aiTasksRouter); // AI task enqueue / status
 
 // ---- Existing mounts you already have (for reference)
 app.use("/api/hms/companies", companiesRouter);
-app.use("/api/hms/products", productsRouter);
+
 app.use("/api/hms/settings", hmsSettingsRouter);
 app.use("/api/hms/patients", hmsPatientsRouter);
 app.use("/api/hms/clinicians", hmsClinicians);
 app.use("/api/hms/clinicians", hmsCliniciansRouter);
 app.use("/api/hms/roles", rolesRouter);
 app.use("/api/hms/specializations", specsRouter);
+app.use("/api", notificationsRouter);
 
 
 /* ───────────────────────────── Leads custom fields ───────────────────────────── */
