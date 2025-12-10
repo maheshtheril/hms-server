@@ -274,7 +274,7 @@ app.use("/api", kanban);
 /* ---- Mount session + HMS companies/products routers ---- */
 app.use("/api/session", sessionRouter);                 // GET /api/session
 app.use("/api/hms/companies", companiesRouter);         // GET /api/hms/companies
-app.use("/api/products", productsRouter);           // GET /api/hms/products
+app.use("/api", productsRouter);           // GET /api/hms/products
 
 app.use("/api/settings", settingsRouter);
 
