@@ -29,12 +29,13 @@
     "libphonenumber-js": "^1.12.26",
     "multer": "^2.0.2",
     "nodemailer": "^7.0.10",
+    "openai": "^6.10.0",
     "pg": "^8.16.3",
+    "rimraf": "^5.0.10",
     "socket.io": "^4.8.1",
     "uuid": "^13.0.0",
     "yjs": "^13.6.27",
-    "zod": "^4.1.12",
-    "rimraf": "^5.0.10"
+    "zod": "^4.1.12"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
